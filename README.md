@@ -186,16 +186,29 @@ git commit && git push
 
 ## Releasing
 
-GitHub Actions automatically builds and publishes wheels to PyPI on git tags:
+GitHub Actions automatically builds wheels and publishes to PyPI when you push a tag:
 
 ```bash
 # 1. Update version in pyproject.toml and Cargo.toml
-# 2. Create and push tag
-git tag v0.1.0 && git push origin v0.1.0
-# 3. Wheels auto-build for all platforms and publish to PyPI
+# 2. Commit changes
+git add pyproject.toml Cargo.toml
+git commit -m "Bump version to 0.1.0"
+
+# 3. Create and push tag
+git tag v0.1.0
+git push origin main --tags
+
+# 4. GitHub Actions will:
+#    - Build wheels for all platforms
+#    - Create GitHub Release with wheels attached
+#    - Publish to PyPI (with skip-existing for safety)
 ```
 
-See [.github/RELEASE.md](.github/RELEASE.md) for detailed release instructions and required secrets setup.
+**What happens:**
+- Wheels are built for Linux, Windows, macOS (Apple Silicon)
+- All wheels are uploaded to the GitHub Release (downloadable)
+- Wheels are published to PyPI
+- If some wheels already exist on PyPI, they're skipped (no error)
 
 ## License
 
