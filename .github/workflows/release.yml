@@ -8,6 +8,7 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# Default permissions for all jobs (can be overridden per job)
 permissions:
   contents: read
 
@@ -100,7 +101,8 @@ jobs:
       name: pypi
       url: https://pypi.org/p/kohakuvault
     permissions:
-      id-token: write  # For trusted publishing
+      contents: read
+      id-token: write  # IMPORTANT: mandatory for trusted publishing
 
     steps:
       - name: Download all artifacts
@@ -125,6 +127,9 @@ jobs:
     environment:
       name: testpypi
       url: https://test.pypi.org/p/kohakuvault
+    permissions:
+      contents: read
+      id-token: write  # IMPORTANT: mandatory for trusted publishing
 
     steps:
       - name: Download all artifacts
