@@ -3,6 +3,9 @@
 A high-performance, SQLite-backed key-value store for large media files. Rust core with a Pythonic dict-like interface.
 
 ## Quick Start
+```bash
+pip install kohakuvault
+```
 
 ```python
 from kohakuvault import KVault
