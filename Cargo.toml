@@ -1,0 +1,15 @@
+[package]
+name = "kohakuvault"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_kvault"     # == python module path: kohakuvault/_kvault
+crate-type = ["cdylib"]
+path = "src/kvault-rust/lib.rs"
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+rusqlite = { version = "0.31", features = ["bundled", "blob", "unlock_notify"] }
+parking_lot = "0.12"
+thiserror = "1.0"
