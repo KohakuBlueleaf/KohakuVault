@@ -244,8 +244,16 @@ class KVault(Mapping):
         """Get value by key. Raises KeyError if not found."""
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
+
+        k = _to_bytes_key(key)
+
+        def call():
+            return self._inner.get(k)
+
         try:
-            return self.get(key)
+            return _with_retries(
+                call, attempts=self._retries, backoff_base=self._backoff, key_for_error=k
+            )
         except E.NotFound:
             raise KeyError(key)
 

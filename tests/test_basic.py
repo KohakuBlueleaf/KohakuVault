@@ -57,11 +57,18 @@ def test_dict_interface():
 
 
 def test_not_found():
-    """Test NotFound exception."""
+    """Test KeyError for missing keys (dict-like behavior)."""
     vault = KVault(":memory:")
 
-    with pytest.raises(NotFound):
+    # Dict-like interface raises KeyError (standard Python behavior)
+    with pytest.raises(KeyError):
         _ = vault["missing_key"]
+
+    # get() with default returns default (doesn't raise)
+    assert vault.get("missing_key", b"default") == b"default"
+
+    # get() without default returns None
+    assert vault.get("missing_key") is None
 
     vault.close()
 
@@ -105,5 +112,30 @@ def test_binary_keys():
 
     vault[key] = value
     assert vault[key] == value
+
+    vault.close()
+
+
+def test_delete_operations():
+    """Test various delete operations."""
+    vault = KVault(":memory:")
+
+    # Setup
+    vault["key1"] = b"value1"
+
+    # Delete existing key
+    del vault["key1"]
+    assert "key1" not in vault
+
+    # Delete non-existent key raises KeyError
+    with pytest.raises(KeyError):
+        del vault["missing"]
+
+    # delete() method returns True for existing key
+    vault["key2"] = b"value2"
+    assert vault.delete("key2") is True
+
+    # delete() returns False for non-existent key (doesn't raise)
+    assert vault.delete("missing") is False
 
     vault.close()
