@@ -114,13 +114,6 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          # Use API token authentication
-          password: ${{ secrets.PYPI_API_TOKEN }}
-          # Uncomment below to use trusted publishing instead (recommended)
-          # In that case, remove the password line and configure trusted publishing on PyPI
-          # More info: https://docs.pypi.org/trusted-publishers/
-          # No additional config needed when using id-token: write permission
 
   publish-to-test-pypi:
     name: Publish to Test PyPI
@@ -145,6 +138,3 @@ jobs:
 
       - name: Publish to Test PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
