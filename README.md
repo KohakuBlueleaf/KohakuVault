@@ -178,6 +178,19 @@ git commit && git push
 # Open PR
 ```
 
+## Releasing
+
+GitHub Actions automatically builds and publishes wheels to PyPI on git tags:
+
+```bash
+# 1. Update version in pyproject.toml and Cargo.toml
+# 2. Create and push tag
+git tag v0.1.0 && git push origin v0.1.0
+# 3. Wheels auto-build for all platforms and publish to PyPI
+```
+
+See [.github/RELEASE.md](.github/RELEASE.md) for detailed release instructions and required secrets setup.
+
 ## License
 
 MIT - see [LICENSE](LICENSE)
