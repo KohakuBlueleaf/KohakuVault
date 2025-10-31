@@ -34,8 +34,15 @@ jobs:
       - name: Install maturin
         run: python -m pip install --upgrade pip maturin
 
-      - name: Build wheel
+      - name: Build wheel (Linux/Windows)
+        if: matrix.os != 'macos-latest'
         run: maturin build --release
+
+      - name: Build wheel (macOS - Apple Silicon)
+        if: matrix.os == 'macos-latest'
+        run: |
+          rustup target add aarch64-apple-darwin
+          maturin build --release --target aarch64-apple-darwin
 
       - name: Install built wheel with test dependencies
         shell: bash

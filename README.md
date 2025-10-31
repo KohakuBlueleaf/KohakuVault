@@ -37,6 +37,12 @@ pip install kohakuvault  # When published to PyPI
 pip install .            # From source
 ```
 
+**Platform Support**:
+- ✅ Linux (x86_64)
+- ✅ Windows (x86_64)
+- ✅ macOS (Apple Silicon M1/M2/M3/M4 only - ARM64)
+- ❌ macOS Intel (x86_64) - not supported
+
 ## Development
 
 **Prerequisites**: Python 3.10+, Rust ([rustup.rs](https://rustup.rs/))

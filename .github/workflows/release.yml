@@ -54,8 +54,9 @@ jobs:
       - name: Build wheels (macOS)
         if: matrix.os == 'macos-latest'
         run: |
-          # Build universal2 wheels for macOS (Intel + Apple Silicon)
-          maturin build --release --interpreter python3.10 python3.11 python3.12 python3.13 --target universal2-apple-darwin
+          # Build for Apple Silicon only (M1/M2/M3)
+          rustup target add aarch64-apple-darwin
+          maturin build --release --interpreter python3.10 python3.11 python3.12 python3.13 --target aarch64-apple-darwin
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
