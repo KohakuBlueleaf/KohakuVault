@@ -1,6 +1,6 @@
 # KohakuVault
 
-A high-performance, SQLite-backed key-value store for large media files. Rust core with a Pythonic dict-like interface.
+High-performance, SQLite-backed storage with dual interfaces: **dict-like for blobs** (key-value) and **list-like for sequences** (columnar). Rust core with Pythonic APIs.
 
 ## Quick Start
 ```bash
@@ -8,30 +8,37 @@ pip install kohakuvault
 ```
 
 ```python
-from kohakuvault import KVault
+from kohakuvault import KVault, ColumnVault
 
-# Dict-like interface for binary data
-vault = KVault("media.db")
-vault["thumbnail:123"] = image_bytes
-vault["video:456"] = video_bytes
+# Key-Value: Store binary blobs (images, files, etc.)
+kv = KVault("data.db")
+kv["image:123"] = image_bytes
+kv["video:456"] = video_bytes
 
-# Stream large files without loading into memory
-with open("large_video.mp4", "rb") as f:
-    vault.put_file("video:789", f)
+# Columnar: Store typed sequences (timeseries, logs, events)
+cv = ColumnVault(kv)  # Shares same database
+cv.create_column("temperatures", "f64")
+cv.create_column("log_messages", "bytes")  # Variable-size strings
 
-# Write-back cache for bulk operations
-vault.enable_cache(cap_bytes=64*1024*1024)
-for i in range(1000):
-    vault[f"frame:{i}"] = frame_data
-vault.flush_cache()  # Batch commit to disk
+temps = cv["temperatures"]
+temps.extend([23.5, 24.1, 25.0])  # Like a list
+
+logs = cv["log_messages"]
+logs.append(b"Server started")
+logs.append(b"Request processed in 5.2ms")
+
+# Access
+print(temps[0])      # 23.5
+print(list(logs))    # [b'Server started', b'Request processed in 5.2ms']
 ```
 
-## Why KohakuVault?
+## Features
 
-- **No external services**: Single-file SQLite database, no Redis/memcached needed
-- **Memory efficient**: Stream multi-GB files without loading into RAM
-- **Fast**: Rust implementation with optional write-back caching
-- **Pythonic**: Feels like a dict, works like a database
+- **Dual interfaces**: Dict for blobs (KVault), List for sequences (ColumnVault)
+- **Zero external dependencies**: Single SQLite file, no services required
+- **Memory efficient**: Stream multi-GB files, dynamic chunk growth
+- **Type-safe columnar**: Fixed-size (i64, f64, bytes:N) and variable-size (bytes)
+- **Rust performance**: Native speed with Pythonic ergonomics
 
 ## Installation
 
@@ -129,6 +136,45 @@ vault = KVault(
     cache_kb=20000,            # SQLite cache size
 )
 ```
+
+### Columnar Storage (NEW!)
+
+List-like interface for typed sequences (timeseries, logs, events):
+
+```python
+from kohakuvault import ColumnVault
+
+cv = ColumnVault("data.db")
+
+# Fixed-size types: i64, f64, bytes:N
+cv.create_column("sensor_temps", "f64")
+cv.create_column("timestamps", "i64")
+cv.create_column("hashes", "bytes:32")  # 32-byte fixed
+
+temps = cv["sensor_temps"]
+temps.append(23.5)
+temps.extend([24.1, 25.0, 25.3])
+print(temps[0], temps[-1], len(temps))  # 23.5, 25.3, 4
+
+# Variable-size bytes (for strings, JSON, etc.)
+cv.create_column("log_messages", "bytes")  # No size = variable!
+logs = cv["log_messages"]
+logs.append(b"Short message")
+logs.append(b"This is a much longer log entry with details...")
+print(logs[0])  # Exact bytes, no padding
+
+# Iterate
+for temp in temps:
+    print(temp)
+```
+
+**Why columnar?**
+- Append-heavy workloads (O(1) amortized)
+- Typed data (int/float/bytes)
+- Efficient iteration and random access
+- Dynamic chunk growth (128KB → 16MB per chunk)
+
+See `docs/COLUMNAR_GUIDE.md` and `examples/columnar_demo.py` for complete guide.
 
 ## API Reference
 

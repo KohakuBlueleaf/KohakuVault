@@ -1,0 +1,752 @@
+# ColumnVault API Reference
+
+Complete API documentation for KohakuVault's columnar storage.
+
+## Overview
+
+**ColumnVault** provides list-like interfaces for storing typed sequences (timeseries, logs, arrays) with efficient append operations and dynamic chunk growth.
+
+## ColumnVault (Container)
+
+### Constructor
+
+```python
+ColumnVault(
+    kvault_or_path,                 # KVault instance or path string
+    chunk_bytes=1048576,            # Default chunk size (1 MiB)
+    min_chunk_bytes=131072,         # Min chunk size (128KB)
+    max_chunk_bytes=16777216        # Max chunk size (16MB)
+)
+```
+
+**Parameters:**
+- **kvault_or_path**: Either a KVault instance (to share DB) or database path string
+- **chunk_bytes**: Default initial chunk size for columns (deprecated, use min/max)
+- **min_chunk_bytes**: Minimum chunk size - new chunks start here (default 128KB)
+- **max_chunk_bytes**: Maximum chunk size - chunks don't grow beyond this (default 16MB)
+
+**Examples:**
+
+```python
+# Share database with KVault
+kv = KVault("data.db")
+cv = ColumnVault(kv)
+
+# Or standalone
+cv = ColumnVault("data.db")
+
+# Custom chunk sizing
+cv = ColumnVault(
+    "large_data.db",
+    min_chunk_bytes=512*1024,     # 512KB start
+    max_chunk_bytes=64*1024*1024  # 64MB max
+)
+```
+
+### Methods
+
+#### create_column(name, dtype, chunk_bytes=None)
+
+Create a new column.
+
+```python
+cv.create_column("temperatures", "f64")
+cv.create_column("timestamps", "i64")
+cv.create_column("hashes", "bytes:32")      # Fixed 32 bytes
+cv.create_column("log_messages", "bytes")    # Variable size
+```
+
+**Parameters:**
+- **name** (str): Column name (must be unique in database)
+- **dtype** (str): Data type (see Data Types section)
+- **chunk_bytes** (int, optional): Override default chunk size (rarely needed)
+
+**Returns:** Column or VarSizeColumn instance
+
+**Raises:**
+- `InvalidArgument`: Invalid dtype
+- `RuntimeError`: Column name already exists
+
+#### cv[name]
+
+Get column by name.
+
+```python
+temps = cv["temperatures"]
+temps.append(23.5)
+```
+
+**Parameters:**
+- **name** (str): Column name
+
+**Returns:** Column or VarSizeColumn
+
+**Raises:**
+- `NotFound`: Column doesn't exist
+
+#### ensure(name, dtype, chunk_bytes=None)
+
+Get existing column or create if doesn't exist (idempotent).
+
+```python
+temps = cv.ensure("temperatures", "f64")
+temps.append(23.5)
+
+# Safe to call again (returns existing)
+temps = cv.ensure("temperatures", "f64")
+```
+
+**Parameters:**
+- **name** (str): Column name
+- **dtype** (str): Data type (only used if creating)
+- **chunk_bytes** (int, optional): Chunk size (only used if creating)
+
+**Returns:** Column or VarSizeColumn
+
+#### list_columns()
+
+List all columns with metadata.
+
+```python
+cols = cv.list_columns()
+for name, dtype, length in cols:
+    print(f"{name}: {dtype} ({length} elements)")
+```
+
+**Returns:** List[(str, str, int)] - (name, dtype, length) tuples
+
+#### delete_column(name)
+
+Delete column and all its data.
+
+```python
+deleted = cv.delete_column("old_data")
+if deleted:
+    print("Column removed")
+```
+
+**Parameters:**
+- **name** (str): Column name
+
+**Returns:** bool - True if deleted, False if not found
+
+**Warning:** This is permanent and cascades to all chunks!
+
+## Column (Fixed-Size Types)
+
+List-like interface for fixed-size elements.
+
+**Supported types:** `i64`, `f64`, `bytes:N`
+
+### Indexing
+
+```python
+# Get element
+value = col[0]
+value = col[-1]        # Negative indexing supported
+
+# Set element
+col[0] = 42
+col[-1] = 99
+
+# Delete element (O(n) - shifts remaining)
+del col[0]
+```
+
+**Raises:**
+- `IndexError`: Index out of bounds
+- `TypeError`: Invalid index type or value type
+
+### Methods
+
+#### append(value)
+
+Append element to end. **O(1) amortized** - most efficient operation.
+
+```python
+col.append(42)
+```
+
+**Parameters:**
+- **value**: Must match column dtype (int for i64, float for f64, bytes for bytes:N)
+
+#### extend(values)
+
+Append multiple elements efficiently.
+
+```python
+col.extend([1, 2, 3, 4, 5])
+```
+
+**Parameters:**
+- **values** (list): List of values matching column dtype
+
+**Complexity:** O(k) where k = len(values)
+
+#### insert(idx, value)
+
+Insert element at index. **O(n) - shifts elements after idx**.
+
+```python
+col.insert(0, value)  # Insert at beginning
+col.insert(5, value)  # Insert at position 5
+```
+
+**Warning:** Slow for large columns. Use `append()` when possible.
+
+#### clear()
+
+Remove all elements.
+
+```python
+col.clear()
+assert len(col) == 0
+```
+
+### Query Methods
+
+```python
+# Length
+count = len(col)
+
+# Iteration
+for value in col:
+    print(value)
+
+# Convert to list
+all_values = list(col)
+
+# Membership (slow - O(n) scan)
+if 42 in col:
+    print("Found")
+```
+
+## VarSizeColumn (Variable-Size Bytes)
+
+List-like interface for variable-length byte strings.
+
+**Type:** `bytes` (no size suffix)
+
+### Differences from Column
+
+**Supported:**
+- ✅ `col[i]` get (O(1))
+- ✅ `len(col)` (O(1))
+- ✅ `append(value)` (O(1))
+- ✅ `extend(values)` (O(k))
+- ✅ Iteration (O(n))
+- ✅ `clear()` (O(1))
+
+**Not supported:**
+- ❌ `col[i] = value` (can't resize in-place)
+- ❌ `del col[i]` (would shift all data)
+- ❌ `insert(i, value)` (same reason)
+
+### Usage
+
+```python
+cv.create_column("messages", "bytes")  # Variable-size
+msgs = cv["messages"]
+
+# Append different-size strings
+msgs.append(b"short")
+msgs.append(b"this is a much longer message")
+msgs.append(b"x")
+
+# Access
+print(msgs[0])   # b'short' (exact size, no padding)
+print(msgs[1])   # b'this is a much longer message'
+print(msgs[-1])  # b'x'
+
+# Iterate
+for msg in msgs:
+    print(msg.decode())
+```
+
+### How It Works
+
+**Two internal columns:**
+```python
+# Creating "messages" (dtype="bytes") creates:
+messages_data: Column[bytes:1]  # Packed bytes (all concatenated)
+messages_idx: Column[i64]       # Prefix sum of byte offsets
+```
+
+**Storage layout:**
+```
+Data column: [s][h][o][r][t][l][o][n][g][e][r][x]
+             └─────┘└──────────┘└┘
+               "short"  "longer"  "x"
+
+Index column: [5, 11, 12]  ← Cumulative byte offsets
+```
+
+**Access algorithm:**
+```python
+def __getitem__(self, i):
+    if i == 0:
+        start = 0
+    else:
+        start = index[i-1]
+    end = index[i]
+    return data[start:end]
+```
+
+**Space overhead:** 8 bytes per element (i64 offset)
+
+## Data Types
+
+### Fixed-Size Types
+
+| Type | Size | Python Type | Packing | Example |
+|------|------|-------------|---------|---------|
+| `i64` | 8 bytes | int | Little-endian | `col.append(123)` |
+| `f64` | 8 bytes | float | IEEE 754 double | `col.append(3.14)` |
+| `bytes:N` | N bytes | bytes | Zero-padded | `col.append(b"hello")` → `b"hello\x00\x00\x00"` |
+
+**Fixed-size pros:**
+- Predictable storage (N elements = N × elem_size bytes)
+- Simple indexing (byte_offset = index × elem_size)
+- Can update elements in-place
+- Can delete elements (shifts data)
+
+**Fixed-size cons:**
+- Wastes space if data varies in size (e.g., strings)
+- Must know max size upfront for `bytes:N`
+
+### Variable-Size Types
+
+| Type | Size | Python Type | Storage Method | Example |
+|------|------|-------------|----------------|---------|
+| `bytes` | Variable | bytes | Prefix sum index | `col.append(b"any length")` |
+
+**Variable-size pros:**
+- No wasted space (stores exact bytes)
+- Perfect for strings, JSON, variable-length data
+- Still O(1) random access (via index)
+
+**Variable-size cons:**
+- 8-byte overhead per element (index)
+- Can't update elements (size may change)
+- Can't delete elements (would need index rebuild)
+
+## Dynamic Chunk Growth
+
+### How It Works
+
+**Like C++ std::vector** - start small, grow exponentially:
+
+1. **Create**: First chunk at `min_chunk_bytes` (128KB)
+2. **Fill**: Append elements until chunk full
+3. **Grow**: Double chunk size (128KB → 256KB → 512KB → ...)
+4. **Cap**: Stop growing at `max_chunk_bytes` (16MB)
+5. **Overflow**: Create new chunk at `min_chunk_bytes`
+
+### Example Growth
+
+**For i64 column (8 bytes/element):**
+
+```
+Chunk 0:
+- Created: 128KB capacity (16,384 elements)
+- Full → Grow to 256KB (32,768 elements)
+- Full → Grow to 512KB (65,536 elements)
+- Full → Grow to 1MB (131,072 elements)
+- Full → Grow to 2MB
+- Full → Grow to 4MB
+- Full → Grow to 8MB
+- Full → Grow to 16MB (max, 2,097,152 elements)
+- Full → Create Chunk 1 at 128KB
+
+Chunk 1:
+- Created: 128KB (starts over)
+- (Growth repeats...)
+```
+
+### Performance Analysis
+
+**Amortized O(1) append:**
+
+When appending N elements:
+- Total copies during growth: ~N (geometric series)
+- Amortized cost per element: O(1)
+- Same as Python list or C++ vector
+
+**Space efficiency:**
+
+| N elements | Fixed chunks (1MB each) | Dynamic chunks (128KB-16MB) |
+|------------|------------------------|----------------------------|
+| 10K (80KB) | 1MB (92% waste) | 128KB (38% waste) |
+| 100K (800KB) | 1MB (20% waste) | 1MB (20% waste) |
+| 1M (8MB) | 8MB (0% waste) | 8MB (0% waste) |
+| 10M (80MB) | 80MB | 80MB |
+
+**Key insight:** Dynamic growth wastes less space for small columns while maintaining good performance for large columns.
+
+### Configuration
+
+```python
+# Small columns (reduce overhead)
+cv = ColumnVault(
+    "small.db",
+    min_chunk_bytes=32*1024,    # 32KB start
+    max_chunk_bytes=1*1024*1024 # 1MB max
+)
+
+# Large columns (fewer chunks)
+cv = ColumnVault(
+    "large.db",
+    min_chunk_bytes=1*1024*1024,  # 1MB start
+    max_chunk_bytes=128*1024*1024 # 128MB max
+)
+```
+
+## Underlying Implementation
+
+### Schema
+
+```sql
+CREATE TABLE col_meta (
+    col_id INTEGER PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    dtype TEXT NOT NULL,
+    elem_size INTEGER NOT NULL,          -- Bytes per element
+    length INTEGER NOT NULL,              -- Total elements
+    chunk_bytes INTEGER NOT NULL,         -- (Deprecated)
+    min_chunk_bytes INTEGER DEFAULT 131072,    -- 128KB
+    max_chunk_bytes INTEGER DEFAULT 16777216   -- 16MB
+);
+
+CREATE TABLE col_chunks (
+    col_id INTEGER NOT NULL,
+    chunk_idx INTEGER NOT NULL,
+    data BLOB NOT NULL,                  -- Packed elements
+    actual_size INTEGER NOT NULL,        -- Current chunk size
+    PRIMARY KEY (col_id, chunk_idx),
+    FOREIGN KEY (col_id) REFERENCES col_meta(col_id) ON DELETE CASCADE
+);
+```
+
+### Indexing Algorithm
+
+**For fixed-size columns:**
+
+```python
+# Given: index i, elem_size, chunks with varying actual_size
+
+# Step 1: Convert element index → byte offset
+byte_offset = i * elem_size
+
+# Step 2: Find which chunk contains this byte
+# (Requires summing actual_size of previous chunks)
+chunk_idx, offset_in_chunk = find_chunk(byte_offset)
+
+# Step 3: Read from chunk
+data = chunks[chunk_idx][offset_in_chunk:offset_in_chunk+elem_size]
+
+# Step 4: Unpack
+value = struct.unpack("<q", data)[0]  # For i64
+```
+
+**Rust handles:** Steps 2-3 (efficient SQL queries, BLOB access)
+**Python handles:** Steps 1, 4 (type awareness, packing)
+
+### Append Algorithm
+
+**Python:**
+```python
+def append(self, value):
+    packed = pack_i64(value)  # 8 bytes
+    self._inner.append_raw(col_id, packed, elem_size=8, current_length)
+```
+
+**Rust:**
+```rust
+fn append_raw(...) {
+    // 1. Find last chunk
+    // 2. Check if space available
+    // 3. If no space:
+    //    - Try double chunk size (up to max)
+    //    - If can't grow, create new chunk at min
+    // 4. Write data to chunk
+    // 5. Update col_meta.length
+}
+```
+
+**Growth decision tree:**
+```
+Append request
+  ↓
+Last chunk exists?
+  No → Create chunk 0 at min_chunk_bytes
+  Yes ↓
+  ↓
+Has space?
+  Yes → Write to chunk
+  No ↓
+  ↓
+Current size < max?
+  Yes → Double chunk size, write
+  No → Create next chunk at min, write
+```
+
+## Performance Characteristics
+
+### Complexity
+
+| Operation | Fixed-Size | Variable-Size | Implementation |
+|-----------|------------|---------------|----------------|
+| `col[i]` get | O(log C) | O(1) | C = num chunks, find via byte offset |
+| `col[i]` set | O(log C) | ❌ Not supported | Find chunk + write |
+| `append()` | O(1) amortized | O(1) amortized | Rare chunk allocation/growth |
+| `extend(k)` | O(k) | O(k) | Batch processing |
+| `insert(i, v)` | O(n) | ❌ Not supported | Shift n-i elements |
+| `del col[i]` | O(n) | ❌ Not supported | Shift n-i elements |
+| Iteration | O(n) | O(n) | Chunked reads (batch 1000) |
+| `len()` | O(1) | O(1) | Read from col_meta |
+| `clear()` | O(1) | O(1) | Update col_meta.length |
+
+**Key:**
+- n = number of elements
+- k = number of items in extend()
+- C = number of chunks (typically log(n) for dynamic growth)
+
+### Growth Cost Analysis
+
+**For appending N elements with dynamic growth:**
+
+```
+Chunk growths: 128KB → 256KB → 512KB → 1MB → 2MB → 4MB → 8MB → 16MB
+
+Total elements before max:
+  16K + 32K + 64K + 128K + 256K + 512K + 1M + 2M ≈ 4M elements (for i64)
+
+Copy cost:
+  Growth 1: Copy 16K elements
+  Growth 2: Copy 32K elements
+  ...
+  Growth 8: Copy 2M elements
+  Total: ~4M copies for storing 2M elements → Amortized 2 copies/element
+```
+
+**Amortized append cost:** O(1) with factor ≈ 2
+
+### Memory Usage
+
+**Python-side:**
+- Column objects: ~200 bytes each
+- Cache: Minimal (length cached)
+
+**Rust-side:**
+- Minimal per-column overhead
+- No data cached (read from SQLite)
+
+**SQLite-side:**
+- Page cache: Configurable (see KVault `cache_kb`)
+- WAL buffer: Automatic
+
+**Disk usage:**
+- Column data: elem_size × length
+- Index (varsize): 8 × length
+- Chunk overhead: Negligible (metadata only)
+- Wasted space: At most 50% of last chunk (on average 25%)
+
+## Type Packing Details
+
+### i64 (Signed Integer)
+
+```python
+# Pack (Python → bytes)
+struct.pack("<q", value)  # Little-endian signed long long
+
+# Unpack (bytes → Python)
+struct.unpack("<q", data)[0]
+```
+
+**Range:** -2^63 to 2^63-1
+**Storage:** 8 bytes, two's complement
+
+### f64 (Float)
+
+```python
+# Pack
+struct.pack("<d", value)  # Little-endian double
+
+# Unpack
+struct.unpack("<d", data)[0]
+```
+
+**Format:** IEEE 754 double precision
+**Range:** ±1.7e308, 15-17 decimal digits precision
+**Storage:** 8 bytes
+
+### bytes:N (Fixed-Size Bytes)
+
+```python
+# Pack (pad with zeros)
+value.ljust(N, b"\x00")
+
+# Unpack
+data[offset:offset+N]  # May contain trailing zeros
+```
+
+**Example:**
+```python
+col = cv.create_column("names", "bytes:20")
+col.append(b"Alice")
+# Stored as: b'Alice\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+
+name = col[0].rstrip(b'\x00')  # Remove padding
+```
+
+### bytes (Variable-Size)
+
+**Storage strategy:**
+- Data column: All bytes concatenated
+- Index column: Cumulative byte offsets (prefix sum)
+
+**Example:**
+```python
+col = cv.create_column("messages", "bytes")
+col.append(b"hello")        # 5 bytes
+col.append(b"world!")       # 6 bytes
+col.append(b"x")            # 1 byte
+
+# Stored as:
+# messages_data: b"helloworld!x"  (12 bytes total)
+# messages_idx:  [5, 11, 12]      (prefix sums)
+
+# Retrieval:
+col[0]  # data[0:5] = b"hello"
+col[1]  # data[5:11] = b"world!"
+col[2]  # data[11:12] = b"x"
+```
+
+## Limitations & Workarounds
+
+### No Slicing
+
+```python
+# Not supported
+subset = col[10:20]
+
+# Workaround: Iterate
+subset = [col[i] for i in range(10, 20)]
+
+# Or: Read full list and slice
+all_values = list(col)
+subset = all_values[10:20]
+```
+
+### VarSize Element Updates
+
+```python
+col = cv.ensure("strings", "bytes")
+col.append(b"hello")
+
+# Can't do this (different size)
+col[0] = b"world!"  # NotImplementedError
+
+# Workaround 1: Clear and rebuild
+values = list(col)
+values[0] = b"world!"
+col.clear()
+col.extend(values)
+
+# Workaround 2: Use fixed-size if updates needed
+col = cv.create_column("strings", "bytes:100")  # Fixed
+col[0] = b"world!"  # OK (padded to 100)
+```
+
+### Large Element Inserts
+
+```python
+# Slow (O(n) each)
+for i in range(1000):
+    col.insert(0, value)  # Prepend = shift everything
+
+# Fast (O(1) each)
+values = []
+for i in range(1000):
+    values.append(value)
+col.extend(values)
+```
+
+### Multi-Column Transactions
+
+```python
+# Not atomic across columns
+col1.append(1)
+col2.append(2)  # If this fails, col1 change persists
+
+# Workaround: Use SQLite transactions (advanced)
+# Or: Design schema to minimize need
+```
+
+## Best Practices
+
+### Choosing Data Types
+
+**For integers:**
+```python
+# Small range (-2B to 2B): Use i64 (no i32 type yet)
+cv.create_column("counters", "i64")
+
+# Large integers: Use bytes (pack manually)
+import struct
+col = cv.create_column("bigint", "bytes:16")
+col.append(struct.pack("<QQ", low_64bits, high_64bits))
+```
+
+**For floats:**
+```python
+# Precision needed: Use f64
+cv.create_column("prices", "f64")
+
+# Lower precision OK: Use bytes:4 + manual packing
+col = cv.create_column("approx", "bytes:4")
+col.append(struct.pack("<f", value))  # 32-bit float
+```
+
+**For strings:**
+```python
+# Known max length: Use bytes:N (faster)
+cv.create_column("usernames", "bytes:50")
+
+# Unknown length: Use bytes (variable)
+cv.create_column("descriptions", "bytes")
+```
+
+### Choosing Chunk Sizes
+
+**General rule:**
+- **min_chunk_bytes**: ~1000-10000 elements worth
+- **max_chunk_bytes**: Based on RAM and access pattern
+
+**Examples:**
+```python
+# Tiny columns (< 1K elements expected)
+min=16*1024,  max=256*1024    # 16KB-256KB
+
+# Small columns (1K-100K elements)
+min=128*1024, max=16*1024*1024  # 128KB-16MB (default)
+
+# Large columns (millions of elements)
+min=1*1024*1024, max=128*1024*1024  # 1MB-128MB
+```
+
+## Examples
+
+See `examples/columnar_demo.py` for complete examples:
+- Time-series sensor data
+- Application logs with variable messages
+- ML feature vectors
+- User activity tracking
+- Chunk growth demonstration
+
+## See Also
+
+- `docs/arch.md` - Overall architecture
+- `docs/kv.md` - Key-value API
+- `docs/COLUMNAR_GUIDE.md` - Columnar usage guide
+- `examples/columnar_demo.py` - Working examples
