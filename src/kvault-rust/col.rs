@@ -112,13 +112,13 @@ impl _ColumnVault {
     /// Get column metadata by name.
     ///
     /// Returns:
-    ///     (col_id, elem_size, length, chunk_bytes)
+    ///     (col_id, elem_size, length, max_chunk_bytes)
     fn get_column_info(&self, name: &str) -> PyResult<(i64, i64, i64, i64)> {
         let conn = self.conn.lock().unwrap();
 
         let result = conn.query_row(
             "
-            SELECT col_id, elem_size, length, chunk_bytes
+            SELECT col_id, elem_size, length, max_chunk_bytes
             FROM col_meta
             WHERE name = ?1
             ",
@@ -157,50 +157,49 @@ impl _ColumnVault {
     ) -> PyResult<Py<PyBytes>> {
         let conn = self.conn.lock().unwrap();
 
-        let elems_per_chunk = chunk_bytes / elem_size;
-        let start_chunk = start_idx / elems_per_chunk;
-        let end_idx = start_idx + count;
-        let end_chunk = (end_idx - 1) / elems_per_chunk;
-
+        // CRITICAL: Use BYTE offsets for chunk addressing, not element counts!
+        let start_byte = start_idx * elem_size;
         let total_bytes = (count * elem_size) as usize;
+        let end_byte = start_byte + total_bytes as i64;
+
+        // Calculate which chunks contain our byte range
+        let start_chunk = start_byte / chunk_bytes;
+        let end_chunk = (end_byte - 1) / chunk_bytes;
+
         let mut result = vec![0u8; total_bytes];
-        let mut bytes_written = 0usize;
+        let mut result_offset = 0usize;
 
         for chunk_idx in start_chunk..=end_chunk {
-            // Calculate which elements from this chunk we need
-            let chunk_start_elem = chunk_idx * elems_per_chunk;
-            let chunk_end_elem = chunk_start_elem + elems_per_chunk;
+            // Calculate byte range for this chunk
+            let chunk_start_byte = chunk_idx * chunk_bytes;
+            let chunk_end_byte = chunk_start_byte + chunk_bytes;
 
-            let read_start = std::cmp::max(start_idx, chunk_start_elem);
-            let read_end = std::cmp::min(end_idx, chunk_end_elem);
-            let read_count = read_end - read_start;
+            // Calculate overlap between our range and this chunk
+            let read_start_byte = std::cmp::max(start_byte, chunk_start_byte);
+            let read_end_byte = std::cmp::min(end_byte, chunk_end_byte);
+            let bytes_to_read = (read_end_byte - read_start_byte) as usize;
 
-            if read_count <= 0 {
+            if bytes_to_read == 0 {
                 continue;
             }
 
-            // Offset within chunk
-            let offset_in_chunk = ((read_start - chunk_start_elem) * elem_size) as usize;
-            let bytes_to_read = (read_count * elem_size) as usize;
+            // Offset within chunk (in bytes)
+            let offset_in_chunk = (read_start_byte - chunk_start_byte) as usize;
 
-            // Read from chunk
+            // Read chunk data
             let chunk_data: Vec<u8> = conn
                 .query_row(
-                    "
-                    SELECT data
-                    FROM col_chunks
-                    WHERE col_id = ?1 AND chunk_idx = ?2
-                    ",
+                    "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
                     params![col_id, chunk_idx],
                     |row| row.get(0),
                 )
                 .map_err(ColError::from)?;
 
-            // Copy relevant portion
-            result[bytes_written..bytes_written + bytes_to_read]
+            // Copy the portion we need
+            result[result_offset..result_offset + bytes_to_read]
                 .copy_from_slice(&chunk_data[offset_in_chunk..offset_in_chunk + bytes_to_read]);
 
-            bytes_written += bytes_to_read;
+            result_offset += bytes_to_read;
         }
 
         Ok(PyBytes::new_bound(py, &result).unbind())
@@ -224,32 +223,37 @@ impl _ColumnVault {
     ) -> PyResult<()> {
         let conn = self.conn.lock().unwrap();
         let data_bytes = data.as_bytes();
-        let count = (data_bytes.len() as i64) / elem_size;
 
-        let elems_per_chunk = chunk_bytes / elem_size;
-        let start_chunk = start_idx / elems_per_chunk;
-        let end_idx = start_idx + count;
-        let end_chunk = (end_idx - 1) / elems_per_chunk;
+        // CRITICAL: Use BYTE offsets for chunk addressing, not element counts!
+        let start_byte = start_idx * elem_size;
+        let total_bytes = data_bytes.len();
+        let end_byte = start_byte + total_bytes as i64;
 
-        let mut bytes_read = 0usize;
+        // Calculate which chunks contain our byte range
+        let start_chunk = start_byte / chunk_bytes;
+        let end_chunk = (end_byte - 1) / chunk_bytes;
+
+        let mut data_offset = 0usize;
 
         for chunk_idx in start_chunk..=end_chunk {
-            let chunk_start_elem = chunk_idx * elems_per_chunk;
-            let chunk_end_elem = chunk_start_elem + elems_per_chunk;
+            // Calculate byte range for this chunk
+            let chunk_start_byte = chunk_idx * chunk_bytes;
+            let chunk_end_byte = chunk_start_byte + chunk_bytes;
 
-            let write_start = std::cmp::max(start_idx, chunk_start_elem);
-            let write_end = std::cmp::min(end_idx, chunk_end_elem);
-            let write_count = write_end - write_start;
+            // Calculate overlap between our range and this chunk
+            let write_start_byte = std::cmp::max(start_byte, chunk_start_byte);
+            let write_end_byte = std::cmp::min(end_byte, chunk_end_byte);
+            let bytes_to_write = (write_end_byte - write_start_byte) as usize;
 
-            if write_count <= 0 {
+            if bytes_to_write == 0 {
                 continue;
             }
 
-            let offset_in_chunk = ((write_start - chunk_start_elem) * elem_size) as usize;
-            let bytes_to_write = (write_count * elem_size) as usize;
+            // Offset within chunk (in bytes)
+            let offset_in_chunk = (write_start_byte - chunk_start_byte) as usize;
 
-            // Ensure chunk exists
-            self.ensure_chunk(&conn, col_id, chunk_idx, chunk_bytes as usize)?;
+            // Ensure chunk exists (create at max size for random access)
+            self.ensure_chunk(&conn, col_id, chunk_idx, false)?;
 
             // Update chunk data
             let mut chunk_data: Vec<u8> = conn
@@ -261,7 +265,7 @@ impl _ColumnVault {
                 .map_err(ColError::from)?;
 
             chunk_data[offset_in_chunk..offset_in_chunk + bytes_to_write]
-                .copy_from_slice(&data_bytes[bytes_read..bytes_read + bytes_to_write]);
+                .copy_from_slice(&data_bytes[data_offset..data_offset + bytes_to_write]);
 
             conn.execute(
                 "UPDATE col_chunks SET data = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
@@ -269,7 +273,7 @@ impl _ColumnVault {
             )
             .map_err(ColError::from)?;
 
-            bytes_read += bytes_to_write;
+            data_offset += bytes_to_write;
         }
 
         Ok(())
@@ -278,10 +282,11 @@ impl _ColumnVault {
     /// Append raw bytes to the end of a column with dynamic chunk growth.
     /// Most performance-critical operation.
     ///
-    /// Strategy:
-    /// - Append to last chunk if there's space
-    /// - If full, grow chunk 2x (up to max_chunk_bytes)
-    /// - If already at max, create new chunk at min_chunk_bytes
+    /// Strategy for large appends that span multiple chunks:
+    /// 1. Fill current last chunk (grow to max if needed)
+    /// 2. Create new chunks with exponential growth: 2^k * min_chunk_bytes
+    /// 3. Each new chunk size is capped by: min(max_chunk_bytes, remaining_data_size)
+    /// 4. Maintains invariant: all chunks 0..k-1 are at max_chunk_bytes
     ///
     /// Args:
     ///     col_id: Column ID
@@ -299,7 +304,7 @@ impl _ColumnVault {
     ) -> PyResult<()> {
         let conn = self.conn.lock().unwrap();
         let data_bytes = data.as_bytes();
-        let bytes_to_append = data_bytes.len();
+        let total_bytes_to_append = data_bytes.len();
 
         // For raw bytes (elem_size=1), current_length is in bytes
         // For typed data, current_length is in elements
@@ -309,34 +314,65 @@ impl _ColumnVault {
             current_length * elem_size
         };
 
-        // Find or create chunk with space
-        let (target_chunk_idx, offset_in_chunk) =
-            self.find_append_chunk(&conn, col_id, current_byte_offset, bytes_to_append)?;
-
-        // Read chunk data
-        let mut chunk_data: Vec<u8> = conn
+        // Get chunk size settings
+        let (min_chunk, max_chunk): (i64, i64) = conn
             .query_row(
-                "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
-                params![col_id, target_chunk_idx],
-                |row| row.get(0),
+                "SELECT min_chunk_bytes, max_chunk_bytes FROM col_meta WHERE col_id = ?1",
+                params![col_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(ColError::from)?;
 
-        // Write data to chunk
-        let end_offset = offset_in_chunk + bytes_to_append;
-        chunk_data[offset_in_chunk..end_offset].copy_from_slice(data_bytes);
+        let mut bytes_written = 0;
+        let mut current_offset = current_byte_offset;
 
-        conn.execute(
-            "UPDATE col_chunks SET data = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
-            params![chunk_data, col_id, target_chunk_idx],
-        )
-        .map_err(ColError::from)?;
+        while bytes_written < total_bytes_to_append {
+            let remaining_bytes = total_bytes_to_append - bytes_written;
+
+            // Get or create chunk to write to
+            let (chunk_idx, offset_in_chunk, chunk_capacity) = self.prepare_append_chunk(
+                &conn,
+                col_id,
+                current_offset,
+                remaining_bytes,
+                min_chunk,
+                max_chunk,
+            )?;
+
+            // Calculate how much to write to this chunk
+            let space_available = chunk_capacity - offset_in_chunk;
+            let bytes_to_write = std::cmp::min(remaining_bytes, space_available);
+
+            // Get rowid for incremental blob I/O
+            let rowid: i64 = conn
+                .query_row(
+                    "SELECT rowid FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![col_id, chunk_idx],
+                    |row| row.get(0),
+                )
+                .map_err(ColError::from)?;
+
+            // Use incremental BLOB I/O to write directly without reading entire blob
+            // CRITICAL: Last parameter must be TRUE for write access!
+            let mut blob = conn
+                .blob_open(rusqlite::DatabaseName::Main, "col_chunks", "data", rowid, false)
+                .map_err(ColError::from)?;
+
+            blob.write_at(
+                &data_bytes[bytes_written..bytes_written + bytes_to_write],
+                offset_in_chunk,
+            )
+            .map_err(ColError::from)?;
+
+            bytes_written += bytes_to_write;
+            current_offset += bytes_to_write as i64;
+        }
 
         // Update length
         let new_length = if elem_size == 1 {
-            current_length + bytes_to_append as i64
+            current_length + total_bytes_to_append as i64
         } else {
-            current_length + (bytes_to_append as i64 / elem_size)
+            current_length + (total_bytes_to_append as i64 / elem_size)
         };
 
         conn.execute(
@@ -400,118 +436,25 @@ impl _ColumnVault {
 
 // Helper methods (not exposed to Python)
 impl _ColumnVault {
-    /// Get or create a chunk, starting with min size.
-    /// New chunks always start at min_chunk_bytes.
-    fn ensure_chunk(
-        &self,
-        conn: &Connection,
-        col_id: i64,
-        chunk_idx: i64,
-        _default_chunk_bytes: usize,
-    ) -> PyResult<()> {
-        let exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
-                params![col_id, chunk_idx],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if !exists {
-            // Get min chunk size for this column
-            let min_chunk: i64 = conn
-                .query_row(
-                    "SELECT min_chunk_bytes FROM col_meta WHERE col_id = ?1",
-                    params![col_id],
-                    |row| row.get(0),
-                )
-                .map_err(ColError::from)?;
-
-            // Create new chunk at min size
-            let zeroblob = vec![0u8; min_chunk as usize];
-            conn.execute(
-                "
-                INSERT INTO col_chunks (col_id, chunk_idx, data, actual_size)
-                VALUES (?1, ?2, ?3, ?4)
-                ",
-                params![col_id, chunk_idx, zeroblob, min_chunk],
-            )
-            .map_err(ColError::from)?;
-        }
-
-        Ok(())
-    }
-
-    /// Grow a chunk in-place by doubling its size (up to max).
-    /// Returns true if grown, false if already at max.
-    fn try_grow_chunk(&self, conn: &Connection, col_id: i64, chunk_idx: i64) -> PyResult<bool> {
-        // Get current size and max size
-        let (current_size, max_chunk): (i64, i64) = conn
-            .query_row(
-                "
-                SELECT c.actual_size, m.max_chunk_bytes
-                FROM col_chunks c
-                JOIN col_meta m ON c.col_id = m.col_id
-                WHERE c.col_id = ?1 AND c.chunk_idx = ?2
-                ",
-                params![col_id, chunk_idx],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(ColError::from)?;
-
-        if current_size >= max_chunk {
-            // Already at max size, can't grow
-            return Ok(false);
-        }
-
-        // Double the size, capped at max
-        let new_size = std::cmp::min(current_size * 2, max_chunk);
-
-        // Read existing data
-        let old_data: Vec<u8> = conn
-            .query_row(
-                "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
-                params![col_id, chunk_idx],
-                |row| row.get(0),
-            )
-            .map_err(ColError::from)?;
-
-        // Create new blob with doubled size (preserving old data)
-        let mut new_data = vec![0u8; new_size as usize];
-        new_data[..old_data.len()].copy_from_slice(&old_data);
-
-        // Update chunk with new blob
-        conn.execute(
-            "
-            UPDATE col_chunks
-            SET data = ?1, actual_size = ?2
-            WHERE col_id = ?3 AND chunk_idx = ?4
-            ",
-            params![new_data, new_size, col_id, chunk_idx],
-        )
-        .map_err(ColError::from)?;
-
-        Ok(true)
-    }
-
-    /// Find which chunk to append to, growing or creating as needed.
-    /// Returns (chunk_idx, offset_in_chunk).
-    fn find_append_chunk(
+    /// Prepare a chunk for appending data.
+    /// Returns (chunk_idx, offset_in_chunk, chunk_capacity).
+    ///
+    /// Strategy:
+    /// 1. Check if current chunk has space → return it
+    /// 2. If not, try to DOUBLE current chunk (if < max)
+    /// 3. If need new chunk: grow current to MAX, create new with nearest size
+    fn prepare_append_chunk(
         &self,
         conn: &Connection,
         col_id: i64,
         current_byte_offset: i64,
-        bytes_needed: usize,
-    ) -> PyResult<(i64, usize)> {
+        remaining_bytes: usize,
+        min_chunk_bytes: i64,
+        max_chunk_bytes: i64,
+    ) -> PyResult<(i64, usize, usize)> {
         // Get last chunk if exists
         let last_chunk: Result<(i64, i64), _> = conn.query_row(
-            "
-            SELECT chunk_idx, actual_size
-            FROM col_chunks
-            WHERE col_id = ?1
-            ORDER BY chunk_idx DESC
-            LIMIT 1
-            ",
+            "SELECT chunk_idx, actual_size FROM col_chunks WHERE col_id = ?1 ORDER BY chunk_idx DESC LIMIT 1",
             params![col_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         );
@@ -523,28 +466,189 @@ impl _ColumnVault {
                 let bytes_in_chunk = current_byte_offset - bytes_before_chunk;
                 let space_left = (actual_size - bytes_in_chunk) as usize;
 
-                if space_left >= bytes_needed {
-                    // Enough space in current chunk
-                    return Ok((chunk_idx, bytes_in_chunk as usize));
+                // Step 1: If current chunk has enough space, use it
+                if space_left >= remaining_bytes {
+                    return Ok((chunk_idx, bytes_in_chunk as usize, actual_size as usize));
                 }
 
-                // Try to grow current chunk
-                if self.try_grow_chunk(conn, col_id, chunk_idx)? {
-                    // Successfully grew, try again
-                    return self.find_append_chunk(conn, col_id, current_byte_offset, bytes_needed);
+                // Step 2: Not enough space, try to grow current chunk
+                if actual_size < max_chunk_bytes {
+                    // Try to DOUBLE the size (not jump to max)
+                    let new_size = std::cmp::min(actual_size * 2, max_chunk_bytes);
+                    self.grow_chunk_to_size(conn, col_id, chunk_idx, new_size)?;
+                    let new_space = (new_size - bytes_in_chunk) as usize;
+
+                    // After doubling, check if enough space
+                    if new_space >= remaining_bytes {
+                        return Ok((chunk_idx, bytes_in_chunk as usize, new_size as usize));
+                    }
+
+                    // Still not enough, grow to MAX before creating new chunk
+                    if new_size < max_chunk_bytes {
+                        self.grow_chunk_to_size(conn, col_id, chunk_idx, max_chunk_bytes)?;
+                    }
+                    // After growing to max, return current chunk to fill it first
+                    let space_at_max = (max_chunk_bytes - bytes_in_chunk) as usize;
+                    if space_at_max > 0 {
+                        // CRITICAL: Fill remaining space in current chunk before moving to next
+                        return Ok((chunk_idx, bytes_in_chunk as usize, max_chunk_bytes as usize));
+                    }
+                    // Chunk is completely full, will create new chunk below
+                } else if space_left > 0 {
+                    // Chunk is at max but not completely full - fill it first!
+                    return Ok((chunk_idx, bytes_in_chunk as usize, actual_size as usize));
                 }
 
-                // Can't grow, create new chunk
+                // Step 3: Current chunk is at max and COMPLETELY full, create new chunk
+                // All previous chunks (0..chunk_idx) are now at max_chunk_bytes
                 let new_chunk_idx = chunk_idx + 1;
-                self.ensure_chunk(conn, col_id, new_chunk_idx, 0)?;
-                Ok((new_chunk_idx, 0))
+                let new_chunk_size = self.calculate_new_chunk_size(
+                    remaining_bytes,
+                    min_chunk_bytes,
+                    max_chunk_bytes,
+                );
+                self.create_chunk_with_size(conn, col_id, new_chunk_idx, new_chunk_size)?;
+                Ok((new_chunk_idx, 0, new_chunk_size as usize))
             }
             Err(_) => {
                 // No chunks yet, create first one
-                self.ensure_chunk(conn, col_id, 0, 0)?;
-                Ok((0, 0))
+                let chunk_size = self.calculate_new_chunk_size(
+                    remaining_bytes,
+                    min_chunk_bytes,
+                    max_chunk_bytes,
+                );
+                self.create_chunk_with_size(conn, col_id, 0, chunk_size)?;
+                Ok((0, 0, chunk_size as usize))
             }
         }
+    }
+
+    /// Calculate appropriate size for new chunk based on remaining data.
+    /// Uses exponential growth: 2^k * min_chunk_bytes, capped at max_chunk_bytes.
+    fn calculate_new_chunk_size(
+        &self,
+        remaining_bytes: usize,
+        min_chunk: i64,
+        max_chunk: i64,
+    ) -> i64 {
+        let remaining = remaining_bytes as i64;
+
+        // If remaining fits in max, find nearest power of 2
+        if remaining <= max_chunk {
+            let mut size = min_chunk;
+            while size < remaining && size < max_chunk {
+                size *= 2;
+            }
+            std::cmp::min(size, max_chunk)
+        } else {
+            // Remaining is larger than max, use max
+            max_chunk
+        }
+    }
+
+    /// Create a chunk with specific size.
+    fn create_chunk_with_size(
+        &self,
+        conn: &Connection,
+        col_id: i64,
+        chunk_idx: i64,
+        size: i64,
+    ) -> PyResult<()> {
+        let zeroblob = vec![0u8; size as usize];
+        conn.execute(
+            "INSERT INTO col_chunks (col_id, chunk_idx, data, actual_size) VALUES (?1, ?2, ?3, ?4)",
+            params![col_id, chunk_idx, zeroblob, size],
+        )
+        .map_err(ColError::from)?;
+        Ok(())
+    }
+
+    /// Grow a chunk to specified size (e.g., double, or to max).
+    /// CRITICAL: Check actual_size first to avoid unnecessary blob reads.
+    fn grow_chunk_to_size(
+        &self,
+        conn: &Connection,
+        col_id: i64,
+        chunk_idx: i64,
+        target_size: i64,
+    ) -> PyResult<()> {
+        // CRITICAL: Check actual_size FIRST to avoid reading large blobs unnecessarily
+        let actual_size: i64 = conn
+            .query_row(
+                "SELECT actual_size FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                params![col_id, chunk_idx],
+                |row| row.get(0),
+            )
+            .map_err(ColError::from)?;
+
+        // Already at or above target size, no need to grow
+        if actual_size >= target_size {
+            return Ok(());
+        }
+
+        // Read blob data for growing
+        let old_data: Vec<u8> = conn
+            .query_row(
+                "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                params![col_id, chunk_idx],
+                |row| row.get(0),
+            )
+            .map_err(ColError::from)?;
+
+        let mut new_data = vec![0u8; target_size as usize];
+        new_data[..old_data.len()].copy_from_slice(&old_data);
+
+        conn.execute(
+            "UPDATE col_chunks SET data = ?1, actual_size = ?2 WHERE col_id = ?3 AND chunk_idx = ?4",
+            params![new_data, target_size, col_id, chunk_idx],
+        )
+        .map_err(ColError::from)?;
+
+        Ok(())
+    }
+
+    /// Get or create a chunk.
+    /// For append operations (use_min_size=true): start with min_chunk_bytes
+    /// For random access (use_min_size=false): create at max_chunk_bytes for immediate use
+    fn ensure_chunk(
+        &self,
+        conn: &Connection,
+        col_id: i64,
+        chunk_idx: i64,
+        use_min_size: bool,
+    ) -> PyResult<()> {
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                params![col_id, chunk_idx],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !exists {
+            // Get chunk size settings for this column
+            let (min_chunk, max_chunk): (i64, i64) = conn
+                .query_row(
+                    "SELECT min_chunk_bytes, max_chunk_bytes FROM col_meta WHERE col_id = ?1",
+                    params![col_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(ColError::from)?;
+
+            // Create new chunk at min or max size depending on use case
+            let chunk_size = if use_min_size { min_chunk } else { max_chunk };
+            let zeroblob = vec![0u8; chunk_size as usize];
+            conn.execute(
+                "
+                INSERT INTO col_chunks (col_id, chunk_idx, data, actual_size)
+                VALUES (?1, ?2, ?3, ?4)
+                ",
+                params![col_id, chunk_idx, zeroblob, chunk_size],
+            )
+            .map_err(ColError::from)?;
+        }
+
+        Ok(())
     }
 
     /// Calculate total bytes stored before a given chunk.

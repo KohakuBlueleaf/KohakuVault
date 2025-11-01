@@ -146,14 +146,14 @@ class Column(MutableSequence):
         name: str,
         dtype: str,
         elem_size: int,
-        chunk_bytes: int,
+        chunk_bytes: int,  # This is now max_chunk_bytes from Rust
     ):
         self._inner = inner
         self._col_id = col_id
         self._name = name
         self._dtype = dtype
         self._elem_size = elem_size
-        self._chunk_bytes = chunk_bytes
+        self._chunk_bytes = chunk_bytes  # max_chunk_bytes for addressing
 
         # Get base type for packing/unpacking
         base_dtype, _, _ = parse_dtype(dtype)
@@ -193,7 +193,7 @@ class Column(MutableSequence):
 
         idx = self._normalize_index(idx)
 
-        # Read one element
+        # Read one element (use max_chunk_bytes for addressing)
         data = self._inner.read_range(self._col_id, idx, 1, self._elem_size, self._chunk_bytes)
 
         return self._unpack(data, 0)
@@ -362,14 +362,14 @@ class VarSizeColumn(MutableSequence):
         idx_col_id: int,
         name: str,
         dtype: str,
-        chunk_bytes: int,
+        chunk_bytes: int,  # This is now max_chunk_bytes from Rust
     ):
         self._inner = inner
         self._data_col_id = data_col_id
         self._idx_col_id = idx_col_id
         self._name = name
         self._dtype = dtype
-        self._chunk_bytes = chunk_bytes
+        self._chunk_bytes = chunk_bytes  # max_chunk_bytes for addressing
         self._length = None
 
     def _get_length(self) -> int:
@@ -607,7 +607,8 @@ class ColumnVault:
             name, dtype, elem_size, chunk_bytes, self._min_chunk_bytes, self._max_chunk_bytes
         )
 
-        col = Column(self._inner, col_id, name, dtype, elem_size, chunk_bytes)
+        # IMPORTANT: Pass max_chunk_bytes for addressing, not the default chunk_bytes
+        col = Column(self._inner, col_id, name, dtype, elem_size, self._max_chunk_bytes)
         self._columns[name] = col
         return col
 
@@ -623,7 +624,10 @@ class ColumnVault:
             f"{name}_idx", "i64", 8, chunk_bytes, self._min_chunk_bytes, self._max_chunk_bytes
         )
 
-        col = VarSizeColumn(self._inner, data_col_id, idx_col_id, name, dtype, chunk_bytes)
+        # IMPORTANT: Pass max_chunk_bytes for addressing
+        col = VarSizeColumn(
+            self._inner, data_col_id, idx_col_id, name, dtype, self._max_chunk_bytes
+        )
         self._columns[name] = col
         return col
 
