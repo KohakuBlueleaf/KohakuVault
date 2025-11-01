@@ -71,24 +71,29 @@ DTYPE_INFO = {
 }
 
 
-def parse_dtype(dtype: str) -> tuple[str, int]:
+def parse_dtype(dtype: str) -> tuple[str, int, bool]:
     """
-    Parse dtype string and return (base_type, elem_size).
+    Parse dtype string and return (base_type, elem_size, is_varsize).
 
     Supported:
-    - "i64" → ("i64", 8)
-    - "f64" → ("f64", 8)
-    - "bytes:N" → ("bytes", N)
+    - "i64" → ("i64", 8, False)
+    - "f64" → ("f64", 8, False)
+    - "bytes:N" → ("bytes", N, False) - fixed-size
+    - "bytes" → ("bytes", 0, True) - variable-size
     """
     if dtype in DTYPE_INFO:
-        return dtype, DTYPE_INFO[dtype]["elem_size"]
+        return dtype, DTYPE_INFO[dtype]["elem_size"], False
+
+    if dtype == "bytes":
+        # Variable-size bytes
+        return "bytes", 0, True
 
     if dtype.startswith("bytes:"):
         try:
             size = int(dtype.split(":")[1])
             if size <= 0:
                 raise ValueError("bytes size must be > 0")
-            return "bytes", size
+            return "bytes", size, False
         except (IndexError, ValueError) as e:
             raise E.InvalidArgument(f"Invalid bytes dtype: {dtype}") from e
 
@@ -151,7 +156,7 @@ class Column(MutableSequence):
         self._chunk_bytes = chunk_bytes
 
         # Get base type for packing/unpacking
-        base_dtype, _ = parse_dtype(dtype)
+        base_dtype, _, _ = parse_dtype(dtype)
         self._pack = get_packer(base_dtype, elem_size)
         self._unpack = get_unpacker(base_dtype, elem_size)
 
@@ -335,6 +340,200 @@ class Column(MutableSequence):
 
 
 # ======================================================================================
+# VarSizeColumn Class (Variable-Size Bytes)
+# ======================================================================================
+
+
+class VarSizeColumn(MutableSequence):
+    """
+    Variable-size bytes column using prefix sum index.
+
+    Stores two underlying columns:
+    - {name}_data: Packed bytes (all elements concatenated)
+    - {name}_idx: Prefix sum of byte offsets (i64)
+
+    This allows O(1) random access to variable-length elements.
+    """
+
+    def __init__(
+        self,
+        inner: _ColumnVault,
+        data_col_id: int,
+        idx_col_id: int,
+        name: str,
+        dtype: str,
+        chunk_bytes: int,
+    ):
+        self._inner = inner
+        self._data_col_id = data_col_id
+        self._idx_col_id = idx_col_id
+        self._name = name
+        self._dtype = dtype
+        self._chunk_bytes = chunk_bytes
+        self._length = None
+
+    def _get_length(self) -> int:
+        """Get number of elements (from index column)."""
+        if self._length is None:
+            _, _, length, _ = self._inner.get_column_info(f"{self._name}_idx")
+            self._length = length
+        return self._length
+
+    def _get_offsets(self, start_idx: int, count: int) -> tuple[int, int]:
+        """
+        Get byte offsets for element range [start_idx, start_idx+count).
+
+        Returns:
+            (start_offset, end_offset) in bytes
+        """
+        # Read prefix sums from index column
+        offsets_data = self._inner.read_range(
+            self._idx_col_id, start_idx, count + 1, 8, self._chunk_bytes
+        )
+
+        # Unpack offsets
+        start_offset = unpack_i64(offsets_data, 0) if start_idx > 0 else 0
+        if start_idx == 0:
+            start_offset = 0
+            end_offset = unpack_i64(offsets_data, count * 8)
+        else:
+            start_offset = unpack_i64(offsets_data, 0)
+            end_offset = unpack_i64(offsets_data, count * 8)
+
+        return start_offset, end_offset
+
+    def __len__(self) -> int:
+        return self._get_length()
+
+    def __getitem__(self, idx: int) -> bytes:
+        """Get element at index."""
+        if not isinstance(idx, int):
+            raise TypeError("Column indices must be integers")
+
+        length = len(self)
+        if idx < 0:
+            idx += length
+        if idx < 0 or idx >= length:
+            raise IndexError(f"Column index out of range: {idx}")
+
+        # Get byte offsets for this element
+        if idx == 0:
+            start_offset = 0
+            # Read first offset
+            offset_data = self._inner.read_range(self._idx_col_id, 0, 1, 8, self._chunk_bytes)
+            end_offset = unpack_i64(offset_data, 0)
+        else:
+            # Read two offsets: [idx-1] and [idx]
+            offset_data = self._inner.read_range(self._idx_col_id, idx - 1, 2, 8, self._chunk_bytes)
+            start_offset = unpack_i64(offset_data, 0)
+            end_offset = unpack_i64(offset_data, 8)
+
+        # Read bytes from data column
+        byte_count = end_offset - start_offset
+        data = self._inner.read_range(
+            self._data_col_id, start_offset, byte_count, 1, self._chunk_bytes
+        )
+
+        return bytes(data)
+
+    def __setitem__(self, idx: int, value: bytes) -> None:
+        """Set element at index (must be same size as existing element)."""
+        raise NotImplementedError(
+            "Setting individual elements in variable-size columns not supported. "
+            "Delete and re-insert instead."
+        )
+
+    def __delitem__(self, idx: int) -> None:
+        """Delete element (expensive - O(n))."""
+        raise NotImplementedError(
+            "Deleting individual elements from variable-size columns not yet supported."
+        )
+
+    def __iter__(self) -> Iterator[bytes]:
+        """Iterate over all elements."""
+        length = len(self)
+        for i in range(length):
+            yield self[i]
+
+    def insert(self, idx: int, value: bytes) -> None:
+        """Insert not supported for variable-size columns."""
+        raise NotImplementedError(
+            "Insert not supported for variable-size columns. Use append instead."
+        )
+
+    def append(self, value: bytes) -> None:
+        """Append a variable-size bytes object."""
+        if not isinstance(value, bytes):
+            raise TypeError("Value must be bytes")
+
+        current_length = self._get_length()
+
+        # Get current total byte count
+        if current_length == 0:
+            current_bytes = 0
+        else:
+            # Read last offset
+            offset_data = self._inner.read_range(
+                self._idx_col_id, current_length - 1, 1, 8, self._chunk_bytes
+            )
+            current_bytes = unpack_i64(offset_data, 0)
+
+        # Append data
+        self._inner.append_raw(self._data_col_id, value, 1, self._chunk_bytes, current_bytes)
+
+        # Append new offset (prefix sum)
+        new_offset = current_bytes + len(value)
+        offset_bytes = pack_i64(new_offset)
+        self._inner.append_raw(self._idx_col_id, offset_bytes, 8, self._chunk_bytes, current_length)
+
+        self._length = current_length + 1
+
+    def extend(self, values: list[bytes]) -> None:
+        """Extend with multiple variable-size bytes."""
+        if not values:
+            return
+
+        current_length = self._get_length()
+
+        # Get current total byte count
+        if current_length == 0:
+            current_bytes = 0
+        else:
+            offset_data = self._inner.read_range(
+                self._idx_col_id, current_length - 1, 1, 8, self._chunk_bytes
+            )
+            current_bytes = unpack_i64(offset_data, 0)
+
+        # Pack all data
+        all_data = b"".join(values)
+
+        # Calculate prefix sums
+        offsets = []
+        running_sum = current_bytes
+        for v in values:
+            running_sum += len(v)
+            offsets.append(running_sum)
+
+        # Pack offsets
+        offset_data = b"".join(pack_i64(o) for o in offsets)
+
+        # Append data and offsets
+        self._inner.append_raw(self._data_col_id, all_data, 1, self._chunk_bytes, current_bytes)
+        self._inner.append_raw(self._idx_col_id, offset_data, 8, self._chunk_bytes, current_length)
+
+        self._length = current_length + len(values)
+
+    def clear(self) -> None:
+        """Remove all elements."""
+        self._inner.set_length(self._data_col_id, 0)
+        self._inner.set_length(self._idx_col_id, 0)
+        self._length = 0
+
+    def __repr__(self) -> str:
+        return f"VarSizeColumn(name={self._name!r}, length={len(self)})"
+
+
+# ======================================================================================
 # ColumnVault Class (Container)
 # ======================================================================================
 
@@ -370,35 +569,72 @@ class ColumnVault:
         self._inner = _ColumnVault(path)
         self._columns = {}  # Cache of Column instances
 
-    def create_column(self, name: str, dtype: str, chunk_bytes: int = None) -> "Column":
+    def create_column(
+        self, name: str, dtype: str, chunk_bytes: int = None
+    ) -> Union["Column", "VarSizeColumn"]:
         """
         Create a new column.
 
         Args:
             name: Column name (must be unique)
-            dtype: Data type ("i64", "f64", "bytes:N")
+            dtype: Data type ("i64", "f64", "bytes:N", "bytes")
             chunk_bytes: Chunk size (defaults to vault default)
 
         Returns:
-            Column instance
+            Column or VarSizeColumn instance
         """
-        _, elem_size = parse_dtype(dtype)
+        _, elem_size, is_varsize = parse_dtype(dtype)
 
         if chunk_bytes is None:
             chunk_bytes = self._default_chunk_bytes
 
+        if is_varsize:
+            # Create variable-size column (bytes without size)
+            return self._create_varsize_column(name, dtype, chunk_bytes)
+
+        # Create fixed-size column
         col_id = self._inner.create_column(name, dtype, elem_size, chunk_bytes)
 
         col = Column(self._inner, col_id, name, dtype, elem_size, chunk_bytes)
         self._columns[name] = col
         return col
 
-    def __getitem__(self, name: str) -> "Column":
+    def _create_varsize_column(self, name: str, dtype: str, chunk_bytes: int) -> "VarSizeColumn":
+        """Create a variable-size bytes column using two underlying columns."""
+        # Data column stores packed bytes (elem_size=1)
+        data_col_id = self._inner.create_column(f"{name}_data", "bytes:1", 1, chunk_bytes)
+
+        # Index column stores prefix sums (i64)
+        idx_col_id = self._inner.create_column(f"{name}_idx", "i64", 8, chunk_bytes)
+
+        col = VarSizeColumn(self._inner, data_col_id, idx_col_id, name, dtype, chunk_bytes)
+        self._columns[name] = col
+        return col
+
+    def __getitem__(self, name: str) -> Union["Column", "VarSizeColumn"]:
         """Get column by name."""
         if name in self._columns:
             return self._columns[name]
 
-        # Load from database
+        # Check if this is a variable-size column (has _data and _idx companions)
+        try:
+            data_col_id, data_elem_size, data_length, data_chunk_bytes = (
+                self._inner.get_column_info(f"{name}_data")
+            )
+            idx_col_id, idx_elem_size, idx_length, idx_chunk_bytes = self._inner.get_column_info(
+                f"{name}_idx"
+            )
+
+            # This is a varsize column
+            col = VarSizeColumn(
+                self._inner, data_col_id, idx_col_id, name, "bytes", data_chunk_bytes
+            )
+            self._columns[name] = col
+            return col
+        except RuntimeError:
+            pass  # Not a varsize column, try regular column
+
+        # Load regular column from database
         try:
             col_id, elem_size, length, chunk_bytes = self._inner.get_column_info(name)
         except RuntimeError as ex:
@@ -407,8 +643,7 @@ class ColumnVault:
                 raise E.NotFound(name) from ex
             raise
 
-        # Reconstruct dtype from name (stored in DB)
-        # We need to get it from metadata
+        # Reconstruct dtype from metadata
         cols = self._inner.list_columns()
         dtype = None
         for col_name, col_dtype, _ in cols:
@@ -423,7 +658,9 @@ class ColumnVault:
         self._columns[name] = col
         return col
 
-    def ensure(self, name: str, dtype: str, chunk_bytes: int = None) -> "Column":
+    def ensure(
+        self, name: str, dtype: str, chunk_bytes: int = None
+    ) -> Union["Column", "VarSizeColumn"]:
         """
         Get column if exists, create if not.
 

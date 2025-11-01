@@ -10,7 +10,7 @@ Features:
 """
 
 from .proxy import KVault
-from .column_proxy import Column, ColumnVault
+from .column_proxy import Column, ColumnVault, VarSizeColumn
 from .errors import (
     KohakuVaultError,
     NotFound,
@@ -24,6 +24,7 @@ __all__ = [
     "KVault",
     "Column",
     "ColumnVault",
+    "VarSizeColumn",
     "KohakuVaultError",
     "NotFound",
     "DatabaseBusy",

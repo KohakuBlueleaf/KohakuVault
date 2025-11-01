@@ -295,3 +295,119 @@ def test_columnar_column_not_found():
 
     with pytest.raises(NotFound):
         _ = cv["missing"]
+
+
+# =============================================================================
+# Variable-Size Bytes Tests
+# =============================================================================
+
+
+def test_varsize_bytes_basic():
+    """Test variable-size bytes column."""
+    cv = ColumnVault(":memory:")
+    cv.create_column("strings", "bytes")  # Variable-size
+    col = cv["strings"]
+
+    # Append different-size strings
+    col.append(b"hello")
+    col.append(b"world!")
+    col.append(b"x")
+    col.append(b"this is a longer string")
+
+    assert len(col) == 4
+    assert col[0] == b"hello"
+    assert col[1] == b"world!"
+    assert col[2] == b"x"
+    assert col[3] == b"this is a longer string"
+
+
+def test_varsize_bytes_extend():
+    """Test extending variable-size bytes column."""
+    cv = ColumnVault(":memory:")
+    cv.create_column("data", "bytes")
+    col = cv["data"]
+
+    col.extend([b"a", b"bb", b"ccc", b"dddd"])
+
+    assert len(col) == 4
+    assert col[0] == b"a"
+    assert col[1] == b"bb"
+    assert col[2] == b"ccc"
+    assert col[3] == b"dddd"
+
+
+def test_varsize_bytes_iteration():
+    """Test iterating over variable-size bytes."""
+    cv = ColumnVault(":memory:")
+    cv.create_column("items", "bytes")
+    col = cv["items"]
+
+    items = [b"first", b"second item", b"3rd", b"fourth element here"]
+    col.extend(items)
+
+    result = list(col)
+    assert result == items
+
+
+def test_varsize_bytes_negative_indexing():
+    """Test negative indexing for variable-size bytes."""
+    cv = ColumnVault(":memory:")
+    cv.create_column("data", "bytes")
+    col = cv["data"]
+
+    col.extend([b"a", b"bb", b"ccc"])
+
+    assert col[-1] == b"ccc"
+    assert col[-2] == b"bb"
+    assert col[-3] == b"a"
+
+
+def test_varsize_bytes_clear():
+    """Test clearing variable-size bytes column."""
+    cv = ColumnVault(":memory:")
+    cv.create_column("data", "bytes")
+    col = cv["data"]
+
+    col.extend([b"a", b"bb", b"ccc"])
+    assert len(col) == 3
+
+    col.clear()
+    assert len(col) == 0
+
+    # Can append after clear
+    col.append(b"new")
+    assert len(col) == 1
+    assert col[0] == b"new"
+
+
+def test_varsize_bytes_empty_strings():
+    """Test empty bytes in variable-size column."""
+    cv = ColumnVault(":memory:")
+    cv.create_column("data", "bytes")
+    col = cv["data"]
+
+    col.append(b"")
+    col.append(b"non-empty")
+    col.append(b"")
+
+    assert len(col) == 3
+    assert col[0] == b""
+    assert col[1] == b"non-empty"
+    assert col[2] == b""
+
+
+def test_varsize_vs_fixedsize():
+    """Compare variable-size and fixed-size bytes columns."""
+    cv = ColumnVault(":memory:")
+
+    # Fixed-size
+    cv.create_column("fixed", "bytes:10")
+    fixed = cv["fixed"]
+    fixed.append(b"hello")
+    assert fixed[0] == b"hello\x00\x00\x00\x00\x00"  # Padded to 10
+
+    # Variable-size
+    cv.create_column("var", "bytes")
+    var = cv["var"]
+    var.append(b"hello")
+    assert var[0] == b"hello"  # Exact size, no padding
