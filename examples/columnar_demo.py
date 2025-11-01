@@ -177,9 +177,7 @@ for i in range(100_000):
 print(f"Stored {len(col)} values")
 print(f"First value: {col[0]}")
 print(f"Last value: {col[-1]}")
-print(
-    "\nChunk growth pattern: 128KB → 256KB → 512KB → 1MB → 2MB → 4MB → 8MB → 16MB"
-)
+print("\nChunk growth pattern: 128KB → 256KB → 512KB → 1MB → 2MB → 4MB → 8MB → 16MB")
 print("(Each chunk doubles in size until reaching 16MB max)")
 
 print()
