@@ -8,6 +8,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use thiserror::Error;
 
+mod col;
+
 #[derive(Error, Debug)]
 enum KvError {
     #[error("SQLite error: {0}")]
@@ -521,5 +523,6 @@ impl _KVault {
 #[pymodule]
 fn _kvault(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<_KVault>()?;
+    m.add_class::<col::_ColumnVault>()?;
     Ok(())
 }
