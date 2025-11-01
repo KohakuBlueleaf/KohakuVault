@@ -1,5 +1,8 @@
 """Tests for columnar storage."""
 
+import os
+import tempfile
+
 import pytest
 from kohakuvault import KVault, ColumnVault, NotFound
 
@@ -224,31 +227,38 @@ def test_columnar_delete_column():
 
 def test_columnar_shared_database():
     """Test that columnar and KV can share same database."""
-    kv = KVault("test_shared.db")
-    cv = ColumnVault(kv)
+    # Use temp file with unique name
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
 
-    # Use both interfaces
-    kv["key1"] = b"value1"
-    cv.create_column("col1", "i64")
-    cv["col1"].extend([1, 2, 3])
+    try:
+        kv = KVault(db_path)
+        cv = ColumnVault(kv)
 
-    # Both should persist
-    kv2 = KVault("test_shared.db")
-    cv2 = ColumnVault(kv2)
+        # Use both interfaces
+        kv["key1"] = b"value1"
+        cv.create_column("col1", "i64")
+        cv["col1"].extend([1, 2, 3])
 
-    assert kv2["key1"] == b"value1"
-    assert list(cv2["col1"]) == [1, 2, 3]
+        # Close and reopen
+        kv.close()
 
-    # Cleanup
-    import os
+        # Both should persist
+        kv2 = KVault(db_path)
+        cv2 = ColumnVault(kv2)
 
-    kv.close()
-    kv2.close()
-    for ext in ["", "-wal", "-shm"]:
-        try:
-            os.remove(f"test_shared.db{ext}")
-        except FileNotFoundError:
-            pass
+        assert kv2["key1"] == b"value1"
+        assert list(cv2["col1"]) == [1, 2, 3]
+
+        kv2.close()
+
+    finally:
+        # Cleanup
+        for ext in ["", "-wal", "-shm"]:
+            try:
+                os.remove(f"{db_path}{ext}")
+            except (FileNotFoundError, PermissionError):
+                pass
 
 
 def test_columnar_large_data():

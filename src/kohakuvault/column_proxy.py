@@ -549,15 +549,25 @@ class ColumnVault:
         temps.append(23.5)
     """
 
-    def __init__(self, kvault_or_path: Union[Any, str], chunk_bytes: int = 1024 * 1024):
+    def __init__(
+        self,
+        kvault_or_path: Union[Any, str],
+        chunk_bytes: int = 1024 * 1024,
+        min_chunk_bytes: int = 128 * 1024,
+        max_chunk_bytes: int = 16 * 1024 * 1024,
+    ):
         """
         Initialize ColumnVault.
 
         Args:
             kvault_or_path: Either a KVault instance (to share DB) or a path string
-            chunk_bytes: Default chunk size for new columns (1 MiB)
+            chunk_bytes: Default chunk size for new columns (1 MiB, for compatibility)
+            min_chunk_bytes: Minimum chunk size (128KB, first chunk starts here)
+            max_chunk_bytes: Maximum chunk size (16MB, chunks don't grow beyond this)
         """
         self._default_chunk_bytes = chunk_bytes
+        self._min_chunk_bytes = min_chunk_bytes
+        self._max_chunk_bytes = max_chunk_bytes
 
         # Get path from KVault or use string directly
         if isinstance(kvault_or_path, str):
@@ -593,7 +603,9 @@ class ColumnVault:
             return self._create_varsize_column(name, dtype, chunk_bytes)
 
         # Create fixed-size column
-        col_id = self._inner.create_column(name, dtype, elem_size, chunk_bytes)
+        col_id = self._inner.create_column(
+            name, dtype, elem_size, chunk_bytes, self._min_chunk_bytes, self._max_chunk_bytes
+        )
 
         col = Column(self._inner, col_id, name, dtype, elem_size, chunk_bytes)
         self._columns[name] = col
@@ -602,10 +614,14 @@ class ColumnVault:
     def _create_varsize_column(self, name: str, dtype: str, chunk_bytes: int) -> "VarSizeColumn":
         """Create a variable-size bytes column using two underlying columns."""
         # Data column stores packed bytes (elem_size=1)
-        data_col_id = self._inner.create_column(f"{name}_data", "bytes:1", 1, chunk_bytes)
+        data_col_id = self._inner.create_column(
+            f"{name}_data", "bytes:1", 1, chunk_bytes, self._min_chunk_bytes, self._max_chunk_bytes
+        )
 
         # Index column stores prefix sums (i64)
-        idx_col_id = self._inner.create_column(f"{name}_idx", "i64", 8, chunk_bytes)
+        idx_col_id = self._inner.create_column(
+            f"{name}_idx", "i64", 8, chunk_bytes, self._min_chunk_bytes, self._max_chunk_bytes
+        )
 
         col = VarSizeColumn(self._inner, data_col_id, idx_col_id, name, dtype, chunk_bytes)
         self._columns[name] = col
