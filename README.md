@@ -3,33 +3,61 @@
 High-performance, SQLite-backed storage with dual interfaces: **dict-like for blobs** (key-value) and **list-like for sequences** (columnar). Rust core with Pythonic APIs.
 
 ## Quick Start
+
 ```bash
 pip install kohakuvault
 ```
 
+### 1. KV Store - Dict-like for Binary Blobs
+
 ```python
-from kohakuvault import KVault, ColumnVault
+from kohakuvault import KVault
 
-# Key-Value: Store binary blobs (images, files, etc.)
-kv = KVault("data.db")
-kv["image:123"] = image_bytes
-kv["video:456"] = video_bytes
+# Basic operations
+vault = KVault("data.db")
+vault["image:123"] = image_bytes
+vault["video:456"] = video_bytes
 
-# Columnar: Store typed sequences (timeseries, logs, events)
-cv = ColumnVault(kv)  # Shares same database
+# Dict-like interface
+if "image:123" in vault:
+    data = vault["image:123"]
+
+# Bulk operations with automatic caching
+with vault.cache(64*1024*1024):  # 64MB cache
+    for i in range(10000):
+        vault[f"thumb:{i}"] = thumbnail_data
+# Auto-flushes here!
+
+# Streaming large files
+with open("large_video.mp4", "rb") as f:
+    vault.put_file("video:789", f)
+```
+
+### 2. Columnar - List-like for Typed Sequences
+
+```python
+from kohakuvault import ColumnVault
+
+# Create columnar storage (can share DB with KVault)
+cv = ColumnVault("data.db")
+
+# Fixed-size types
 cv.create_column("temperatures", "f64")
-cv.create_column("log_messages", "bytes")  # Variable-size strings
+cv.create_column("timestamps", "i64")
 
 temps = cv["temperatures"]
-temps.extend([23.5, 24.1, 25.0])  # Like a list
+temps.extend([23.5, 24.1, 25.0])  # Like a Python list
+print(temps[0])      # 23.5
+print(temps[-1])     # 25.0
 
+# Variable-size bytes (strings, JSON, etc.)
+cv.create_column("log_messages", "bytes")
 logs = cv["log_messages"]
 logs.append(b"Server started")
 logs.append(b"Request processed in 5.2ms")
 
-# Access
-print(temps[0])      # 23.5
-print(list(logs))    # [b'Server started', b'Request processed in 5.2ms']
+for msg in logs:
+    print(msg.decode())
 ```
 
 ## Features
@@ -39,6 +67,56 @@ print(list(logs))    # [b'Server started', b'Request processed in 5.2ms']
 - **Memory efficient**: Stream multi-GB files, dynamic chunk growth
 - **Type-safe columnar**: Fixed-size (i64, f64, bytes:N) and variable-size (bytes)
 - **Rust performance**: Native speed with Pythonic ergonomics
+- **Smart caching**: Auto-flush context manager, daemon thread, capacity enforcement
+
+## Best Practices
+
+### Handling Many Large Binary Files
+
+**For thousands of large binaries (images, videos, documents), use a hybrid approach:**
+
+```python
+from kohakuvault import KVault, ColumnVault
+
+kv = KVault("media.db")
+cv = ColumnVault(kv)  # Share same database
+
+# Store metadata in columnar (efficient for large lists)
+cv.create_column("image_ids", "i64")
+cv.create_column("image_names", "bytes")
+cv.create_column("image_sizes", "i64")
+cv.create_column("upload_times", "i64")
+
+ids = cv["image_ids"]
+names = cv["image_names"]
+sizes = cv["image_sizes"]
+times = cv["upload_times"]
+
+# Store actual binaries in KV store
+for img_id, img_data, img_name in image_stream:
+    # Metadata in columnar (fast append, efficient iteration/filtering)
+    ids.append(img_id)
+    names.append(img_name)
+    sizes.append(len(img_data))
+    times.append(int(time.time()))
+
+    # Binary data in KV (optimized for large blobs)
+    kv[f"blob:{img_id}"] = img_data
+
+# Query metadata without loading binaries
+for i in range(len(ids)):
+    if sizes[i] > 1024 * 1024:  # Find images > 1MB
+        print(f"Large image: {names[i].decode()}")
+        # Load binary only when needed
+        data = kv[f"blob:{ids[i]}"]
+```
+
+**Why this pattern?**
+- ✅ Columnar optimized for append-heavy metadata (millions of entries)
+- ✅ KV optimized for large binary blobs (streaming, caching)
+- ✅ Can query/filter metadata without loading binaries
+- ✅ Both share same SQLite file (single-file deployment)
+- ✅ Efficient iteration over metadata, lazy loading of binaries
 
 ## Installation
 
@@ -113,16 +191,29 @@ with open("output.mp4", "wb") as f:
 
 ### Bulk Operations with Caching
 
+**Recommended: Use context manager for automatic flush**
+
 ```python
 vault = KVault("media.db")
-vault.enable_cache(cap_bytes=64*1024*1024, flush_threshold=16*1024*1024)
 
-# Writes batched in memory
+# Safest: Context manager auto-flushes
+with vault.cache(cap_bytes=64*1024*1024):
+    for i in range(1000):
+        vault[f"item:{i}"] = data
+# Auto-flushed here, guaranteed!
+
+# Long-running: Daemon thread auto-flushes every 5 seconds
+vault.enable_cache(cap_bytes=64*1024*1024, flush_interval=5.0)
+while True:
+    vault["sensor_data"] = read_sensor()
+# Daemon flushes automatically
+
+# Manual control (backward compatible)
+vault.enable_cache(cap_bytes=64*1024*1024)
 for i in range(1000):
     vault[f"item:{i}"] = data
-
-vault.flush_cache()  # Commit all at once
-vault.disable_cache()
+vault.flush_cache()  # Manual flush
+vault.disable_cache()  # Auto-flushes before disabling
 ```
 
 ### Configuration

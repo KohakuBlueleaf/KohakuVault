@@ -806,6 +806,81 @@ col2.append(2)  # If this fails, col1 change persists
 
 ## Best Practices
 
+### Hybrid Pattern: Columnar Metadata + KV Binaries
+
+**For applications with many large binary files (images, videos, documents):**
+
+```python
+from kohakuvault import KVault, ColumnVault
+
+kv = KVault("media_db.db")
+cv = ColumnVault(kv)  # Share database
+
+# Metadata in columnar storage (efficient for millions of entries)
+cv.create_column("file_ids", "i64")
+cv.create_column("filenames", "bytes")      # Variable-size strings
+cv.create_column("file_sizes", "i64")
+cv.create_column("content_types", "bytes:64")  # "image/jpeg", "video/mp4", etc.
+cv.create_column("timestamps", "i64")
+
+file_ids = cv["file_ids"]
+filenames = cv["filenames"]
+file_sizes = cv["file_sizes"]
+content_types = cv["content_types"]
+timestamps = cv["timestamps"]
+
+# Ingest loop
+for file_id, binary_data, filename, content_type in file_stream:
+    # Fast O(1) append to columnar
+    file_ids.append(file_id)
+    filenames.append(filename)
+    file_sizes.append(len(binary_data))
+    content_types.append(content_type.encode())
+    timestamps.append(int(time.time()))
+
+    # Store binary in KV (streaming support for large files)
+    kv[f"binary:{file_id}"] = binary_data
+
+# Query metadata efficiently (without loading binaries!)
+print(f"Total files: {len(file_ids)}")
+
+# Filter by metadata
+for i in range(len(file_ids)):
+    if file_sizes[i] > 10 * 1024 * 1024:  # Files > 10MB
+        print(f"Large file: {filenames[i].decode()} ({file_sizes[i]} bytes)")
+
+        # Load binary only when needed
+        if need_to_process(i):
+            binary = kv[f"binary:{file_ids[i]}"]
+            process(binary)
+
+# Efficient iteration over specific content types
+for i in range(len(file_ids)):
+    ctype = content_types[i].rstrip(b'\x00').decode()
+    if ctype.startswith("image/"):
+        # Process only images
+        image_data = kv[f"binary:{file_ids[i]}"]
+        generate_thumbnail(image_data)
+```
+
+**Benefits of this pattern:**
+- **Metadata queries** don't load binaries (fast filtering/scanning)
+- **Columnar append** is O(1) amortized, handles millions of entries
+- **KV streaming** handles multi-GB files without memory pressure
+- **Single file** deployment (both in same SQLite database)
+- **Flexible indexing** - add columns for new metadata without touching binaries
+- **Partial loading** - query metadata, load binaries on demand
+
+**Use this when:**
+- Storing 1,000+ binary files
+- Need to query/filter by metadata (size, type, date, etc.)
+- Want to iterate over file list without loading all binaries
+- Building media libraries, document stores, data lakes
+
+**Don't use when:**
+- Small number of binaries (< 100) - just use KV directly
+- Always need full binary with metadata - no filtering benefit
+
 ### Choosing Data Types
 
 **For integers:**

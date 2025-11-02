@@ -168,6 +168,42 @@ kv["blob"] = bytes    # Unstructured
 cv["sequence"][0]     # Structured
 ```
 
+**Recommended Pattern for Many Large Binaries:**
+
+For applications handling thousands/millions of large binary files (images, videos, documents):
+
+```python
+# DON'T: Store all binaries directly in KV
+for i in range(1000000):
+    vault[f"image:{i}"] = large_binary  # ❌ Inefficient for iteration/filtering
+
+# DO: Use hybrid approach
+cv.create_column("image_ids", "i64")
+cv.create_column("image_metadata", "bytes")  # JSON, names, etc.
+
+ids = cv["image_ids"]
+metadata = cv["image_metadata"]
+
+for img_id, binary, meta in stream:
+    ids.append(img_id)           # Columnar: Fast append, efficient scan
+    metadata.append(meta)
+    kv[f"blob:{img_id}"] = binary  # KV: Optimized for large blobs
+
+# Query metadata without loading binaries
+for i in range(len(ids)):
+    meta = json.loads(metadata[i])
+    if meta["size"] > threshold:
+        # Load binary only when needed
+        binary = kv[f"blob:{ids[i]}"]
+```
+
+**Benefits:**
+- Metadata operations (scan, filter) don't load binaries
+- Columnar append is O(1) amortized (dynamic chunks)
+- KV streaming handles multi-GB files efficiently
+- Single SQLite file for both
+- Can rebuild indexes/metadata without touching binaries
+
 ### 4. Why Chunked Storage for Columns?
 
 **Problem**: Storing millions of elements as one BLOB
@@ -270,26 +306,50 @@ struct _ColumnVault {
 
 ## Data Flow Examples
 
-### KVault Write Path
+### KVault Write Path (with Smart Caching)
 
 ```
 Python: vault["key"] = b"value"
   ↓
 proxy.py: __setitem__ → put()
   ↓
-  Check cache enabled?
-  ├─ Yes → Add to write-back cache (in-memory HashMap)
-  │         Auto-flush if threshold reached
-  └─ No → Rust call
-      ↓
 lib.rs: _KVault.put()
   ↓
-SQL: INSERT ... ON CONFLICT DO UPDATE
+Cache enabled?
+  ├─ No → Direct write to SQLite
+  └─ Yes ↓
+      ↓
+      Try cache.insert(key, value)
+      ├─ Ok → Cached successfully
+      │   ↓
+      │   Threshold reached?
+      │   └─ Yes → Auto-flush cache
+      │
+      ├─ ValueTooLarge (value > cap_bytes)
+      │   ↓
+      │   flush_cache()  // Flush existing
+      │   write_direct(key, value)  // Bypass cache
+      │
+      └─ NeedFlush (would exceed cap_bytes)
+          ↓
+          flush_cache()  // Make space
+          cache.insert(key, value)  // Retry (succeeds)
+  ↓
+SQL: Batched INSERT (on flush) or direct INSERT
   ↓
 SQLite: Write to WAL
   ↓
 Disk: app.db-wal
 ```
+
+**Cache Safety Features:**
+- ✅ Never exceeds capacity (pre-checks before insert)
+- ✅ Large values handled (auto-bypass)
+- ✅ Auto-flush at threshold
+- ✅ Auto-flush on disable_cache()
+- ✅ Auto-flush on vault.close()
+- ✅ Context manager ensures flush
+- ✅ Daemon thread for long-running apps
 
 ### ColumnVault Append Path
 

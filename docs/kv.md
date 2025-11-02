@@ -4,7 +4,39 @@ Complete API documentation for KohakuVault's key-value storage.
 
 ## Overview
 
-**KVault** provides a dict-like interface for storing binary blobs (images, videos, documents, etc.) with streaming support and write-back caching.
+**KVault** provides a dict-like interface for storing binary blobs (images, videos, documents, etc.) with streaming support and **fully automatic write-back caching**.
+
+### What's New: Smart Caching (v0.2.1+)
+
+The cache system has been redesigned for safety and ease of use:
+
+**Key Improvements:**
+- ✅ **Context manager** - Auto-flush guaranteed, even on exceptions
+- ✅ **Daemon thread** - Auto-flush after idle period (for long-running apps)
+- ✅ **Capacity enforcement** - Cache never exceeds limit (pre-checks before insert)
+- ✅ **Large value handling** - Values > cap_bytes automatically bypass cache
+- ✅ **Auto-flush on close** - `disable_cache()` and `close()` always flush
+- ✅ **Lock support** - Prevent auto-flush during critical sections
+
+**Before (v0.2.0):**
+```python
+vault.enable_cache()
+vault["key"] = data
+vault.flush_cache()  # Manual flush required
+vault.disable_cache()
+```
+
+**Now (v0.2.1+):**
+```python
+# Context manager - simplest and safest
+with vault.cache():
+    vault["key"] = data
+# Auto-flushes here!
+
+# Or daemon thread for long-running apps
+vault.enable_cache(flush_interval=5.0)
+# Flushes every 5 seconds automatically
+```
 
 ## Constructor
 
@@ -205,56 +237,147 @@ vault.clear()
 
 ## Caching Methods
 
-### enable_cache(cap_bytes=67108864, flush_threshold=16777216)
+KohakuVault provides three cache patterns for different use cases:
 
-Enable write-back caching for batch writes.
+### 1. Context Manager (Recommended)
+
+**Simplest and safest** - auto-flushes guaranteed:
 
 ```python
-vault.enable_cache(
-    cap_bytes=64*1024*1024,        # 64 MiB capacity
-    flush_threshold=16*1024*1024   # Auto-flush at 16 MiB
-)
-
-# Writes cached in memory
-for i in range(10000):
-    vault[f"key:{i}"] = b"value"
-
-vault.flush_cache()  # Commit to disk
+with vault.cache(cap_bytes=64*1024*1024):
+    for i in range(10000):
+        vault[f"key:{i}"] = data
+# Auto-flush here, even if exception occurs
 ```
 
 **Parameters:**
-- **cap_bytes** (int): Maximum cache size in bytes
-- **flush_threshold** (int): Auto-flush when exceeded
+- **cap_bytes** (int): Maximum cache size
+- **flush_threshold** (int, optional): Auto-flush threshold (default: cap_bytes // 4)
+- **auto_flush** (bool): If True (default), flush on exit
 
-**How it works:**
-- Writes stored in Rust HashMap (in-memory)
-- Auto-flushes when threshold reached
-- Manual flush with `flush_cache()`
-- Batched in single transaction (fast)
+**Use when:** Batch operations with clear start/end
 
-**Use cases:**
-- Bulk imports
-- Batch processing
-- Reducing disk writes
+### 2. Daemon Thread (Long-Running)
 
-### disable_cache()
-
-Disable cache and flush pending writes.
+**For long-running processes** with periodic flushes:
 
 ```python
+vault.enable_cache(
+    cap_bytes=64*1024*1024,
+    flush_threshold=16*1024*1024,
+    flush_interval=5.0  # Auto-flush every 5 seconds of idle
+)
+
+# Write whenever, daemon flushes automatically
+while True:
+    vault["sensor_data"] = read_sensor()
+    time.sleep(1)
+
+# Daemon auto-flushes if no writes for 5 seconds
+```
+
+**Parameters:**
+- **cap_bytes** (int): Maximum cache size
+- **flush_threshold** (int): Flush when size reached
+- **flush_interval** (float): Auto-flush after N seconds idle
+
+**Use when:** Long-running applications, streaming data
+
+### 3. Manual Control (Backward Compatible)
+
+**Full control** over when to flush:
+
+```python
+vault.enable_cache(cap_bytes=64*1024*1024, flush_threshold=16*1024*1024)
+
+for i in range(10000):
+    vault[f"key:{i}"] = data
+
+vault.flush_cache()  # Manual flush when ready
 vault.disable_cache()
 ```
 
-### flush_cache()
+**Use when:** Need precise control over flush timing
+
+### Advanced: Lock Cache
+
+Prevent auto-flush during critical sections:
+
+```python
+vault.enable_cache(flush_interval=5.0)
+
+with vault.lock_cache():
+    vault["config:part1"] = data1
+    vault["config:part2"] = data2
+    # Daemon won't flush during this block
+# Flush can happen here
+
+# Ensures multi-key writes stay together
+```
+
+### Cache Behavior Details
+
+**Auto-Flush Triggers:**
+
+1. **Threshold reached**: `current_bytes >= flush_threshold`
+2. **Capacity overflow**: Adding value would exceed `cap_bytes` → flush first, then insert
+3. **Large value**: Value size > `cap_bytes` → flush existing cache, bypass cache for this value
+4. **Context exit**: When using `cache()` context manager
+5. **Daemon idle**: When using `flush_interval` and no writes for N seconds
+6. **Vault close**: On `vault.close()` or context manager exit
+
+**Guaranteed Safety:**
+
+✅ Cache never exceeds `cap_bytes`
+✅ Large values handled correctly (auto-bypass)
+✅ No data loss on normal exit (context manager ensures flush)
+✅ Thread-safe (Rust Mutex)
+
+**Not Guaranteed:**
+
+❌ Process crash before flush → data in cache is lost
+❌ Manual mode without flush → data stuck in cache
+
+**Recommendation:** Use `cache()` context manager or `flush_interval` for automatic safety.
+
+### API Reference
+
+#### enable_cache(cap_bytes=67108864, flush_threshold=16777216, flush_interval=None)
+
+Enable write-back cache.
+
+**Parameters:**
+- **cap_bytes** (int): Maximum cache size in bytes
+- **flush_threshold** (int): Auto-flush when this size is reached
+- **flush_interval** (float, optional): Auto-flush after N seconds idle
+
+**Returns:** None
+
+#### disable_cache()
+
+Disable cache (stops daemon thread if running).
+
+**Important:** Automatically flushes cache before disabling to prevent data loss!
+
+This ensures all cached writes are persisted when cache is disabled.
+
+#### flush_cache()
 
 Manually flush cache to disk.
 
-```python
-flushed_count = vault.flush_cache()
-print(f"Flushed {flushed_count} entries")
-```
-
 **Returns:** int - Number of entries flushed
+
+**Note:** Returns 0 if cache is locked via `lock_cache()`
+
+#### cache(cap_bytes, flush_threshold=None, auto_flush=True)
+
+Context manager for scoped caching. Auto-flushes on exit (recommended pattern).
+
+**Returns:** Context manager
+
+#### lock_cache()
+
+Context manager to prevent auto-flush temporarily. Useful with daemon thread for atomic multi-key operations.
 
 ## Maintenance Methods
 
@@ -475,17 +598,83 @@ vault = KVault(
 )
 ```
 
+## Best Practices
+
+### Hybrid Pattern: When to Use KV + Columnar Together
+
+**For managing many large binary files (images, videos, documents):**
+
+**Problem:** Storing millions of blobs purely in KV makes metadata queries inefficient:
+```python
+# Inefficient: Must iterate KV keys and load each blob to check size/type
+for key in vault.keys():
+    data = vault[key]  # Loads entire binary
+    if is_large(data):  # Wasteful!
+        process(data)
+```
+
+**Solution:** Store metadata in columnar, binaries in KV:
+```python
+# Efficient: Query metadata without loading binaries
+for i in range(len(file_ids)):
+    if file_sizes[i] > threshold:  # Fast metadata check
+        binary = kv[f"blob:{file_ids[i]}"]  # Load binary only when needed
+```
+
+**Complete Example:**
+```python
+kv = KVault("media.db")
+cv = ColumnVault(kv)
+
+# Metadata columns
+cv.create_column("ids", "i64")
+cv.create_column("names", "bytes")
+cv.create_column("sizes", "i64")
+
+ids = cv["ids"]
+names = cv["names"]
+sizes = cv["sizes"]
+
+# Ingest
+for file_id, binary, name in stream:
+    ids.append(file_id)
+    names.append(name)
+    sizes.append(len(binary))
+    kv[f"blob:{file_id}"] = binary  # Binary in KV
+
+# Query metadata (no binary loading)
+total_size = sum(sizes)
+large_files = [names[i] for i in range(len(ids)) if sizes[i] > 1024*1024]
+```
+
+**Benefits:**
+- ✅ Fast metadata queries (no binary loading)
+- ✅ Efficient append (columnar O(1))
+- ✅ KV optimized for large blobs
+- ✅ Single SQLite file
+- ✅ Flexible schema (add metadata columns anytime)
+
+**When to use this pattern:**
+- 1,000+ binary files
+- Need to filter/search by metadata
+- Want to iterate without loading all binaries
+- Building media libraries, document stores, ML datasets
+
+See `docs/arch.md` and `docs/col.md` for more details.
+
 ## Examples
 
 See `examples/basic_usage.py` for:
 - Basic put/get operations
 - Streaming large files
-- Write-back caching
+- Write-back caching (all 3 patterns)
 - Context managers
+- Daemon thread auto-flush
 - Custom configuration
 
 ## See Also
 
-- `docs/arch.md` - Overall architecture
-- `docs/col.md` - Columnar storage API
+- `docs/arch.md` - Overall architecture, hybrid pattern details
+- `docs/col.md` - Columnar storage API, hybrid pattern example
 - `examples/basic_usage.py` - Working examples
+- `examples/benchmark.py` - Performance benchmarks
