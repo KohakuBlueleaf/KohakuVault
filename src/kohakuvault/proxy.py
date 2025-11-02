@@ -1,9 +1,11 @@
 import io
 import os
 import time
+import threading
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Optional, Union
 from collections.abc import Mapping
+from contextlib import contextmanager
 
 from kohakuvault import errors as E
 from kohakuvault._kvault import _KVault  # compiled PyO3 class
@@ -186,6 +188,8 @@ class KVault(Mapping):
         self._retries = int(retries)
         self._backoff = float(backoff_base)
         self._closed = False
+        self._daemon_thread = None
+        self._daemon_stop = threading.Event()
 
         try:
             db_path = os.fspath(path)
@@ -229,9 +233,10 @@ class KVault(Mapping):
         self.close()
 
     def close(self) -> None:
-        """Flush cache and mark as closed."""
+        """Flush cache, stop daemon thread, and mark as closed."""
         if not self._closed:
             try:
+                self._stop_daemon_thread()
                 self.flush_cache()
             finally:
                 self._closed = True
@@ -642,7 +647,13 @@ class KVault(Mapping):
     # Cache Management
     # ----------------------------
 
-    def enable_cache(self, *, cap_bytes: int = 64 << 20, flush_threshold: int = 16 << 20) -> None:
+    def enable_cache(
+        self,
+        *,
+        cap_bytes: int = 64 << 20,
+        flush_threshold: int = 16 << 20,
+        flush_interval: Optional[float] = None,
+    ) -> None:
         """
         Enable write-back cache to batch writes.
 
@@ -652,18 +663,35 @@ class KVault(Mapping):
             Maximum cache size in bytes.
         flush_threshold : int, default=16_777_216 (16 MiB)
             Flush cache when this size is reached.
+        flush_interval : float, optional
+            If provided, start daemon thread that auto-flushes after this many
+            seconds of idle time. Example: 5.0 = flush after 5 seconds of no writes.
         """
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
         try:
-            self._inner.enable_cache(cap_bytes, flush_threshold)
+            self._inner.enable_cache(cap_bytes, flush_threshold, flush_interval)
         except Exception as ex:
             raise E.map_exception(ex)
 
+        # Start daemon thread if interval specified
+        if flush_interval is not None:
+            self._start_daemon_thread(flush_interval)
+
     def disable_cache(self) -> None:
-        """Disable write-back cache."""
+        """Disable write-back cache and stop daemon thread if running.
+
+        IMPORTANT: Flushes cache before disabling to prevent data loss!
+        """
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
+
+        # Stop daemon thread first
+        self._stop_daemon_thread()
+
+        # Flush any remaining cached data before disabling
+        self.flush_cache()
+
         try:
             self._inner.disable_cache()
         except Exception as ex:
@@ -684,6 +712,104 @@ class KVault(Mapping):
             return int(self._inner.flush_cache())
         except Exception as ex:
             raise E.map_exception(ex)
+
+    @contextmanager
+    def cache(
+        self,
+        cap_bytes: int = 64 << 20,
+        flush_threshold: Optional[int] = None,
+        auto_flush: bool = True,
+    ):
+        """
+        Context manager for scoped write-back caching.
+
+        Automatically flushes cache on exit (even if exception occurs).
+
+        Parameters
+        ----------
+        cap_bytes : int, default=67_108_864 (64 MiB)
+            Maximum cache size in bytes.
+        flush_threshold : int, optional
+            Flush when this size reached. Defaults to cap_bytes // 4.
+        auto_flush : bool, default=True
+            If True, automatically flush on exit. If False, user must flush manually.
+
+        Examples
+        --------
+        >>> with vault.cache(64 * 1024 * 1024):
+        ...     for i in range(10000):
+        ...         vault[f"key:{i}"] = data
+        ... # Auto-flushed here, guaranteed!
+
+        >>> with vault.cache(auto_flush=False):
+        ...     vault["key"] = data
+        ...     # auto_flush=False skips flush in finally block
+        ...     # but disable_cache() still flushes for safety
+        """
+        if flush_threshold is None:
+            flush_threshold = cap_bytes // 4
+
+        self.enable_cache(cap_bytes=cap_bytes, flush_threshold=flush_threshold)
+        try:
+            yield self
+        finally:
+            if auto_flush:
+                self.flush_cache()
+            self.disable_cache()
+
+    @contextmanager
+    def lock_cache(self):
+        """
+        Context manager to prevent auto-flush during critical section.
+
+        Useful for atomic multi-key operations when using daemon thread.
+
+        Examples
+        --------
+        >>> vault.enable_cache(flush_interval=5.0)
+        >>> with vault.lock_cache():
+        ...     vault["config:part1"] = data1
+        ...     vault["config:part2"] = data2
+        ... # Auto-flush deferred until here
+        """
+        self._inner.set_cache_locked(True)
+        try:
+            yield
+        finally:
+            self._inner.set_cache_locked(False)
+
+    def _start_daemon_thread(self, flush_interval: float) -> None:
+        """Start background thread for auto-flushing cache after idle period."""
+        # Stop existing daemon if any
+        self._stop_daemon_thread()
+
+        self._daemon_stop.clear()
+
+        def daemon_worker():
+            last_flush = time.time()
+            while not self._daemon_stop.wait(0.5):  # Check every 500ms
+                if self._closed:
+                    break
+
+                try:
+                    # Check if enough time has passed since last flush
+                    if time.time() - last_flush >= flush_interval:
+                        # Flush cache if not empty
+                        flushed = self.flush_cache()
+                        if flushed > 0:
+                            last_flush = time.time()
+                except Exception:
+                    pass  # Ignore errors in daemon
+
+        self._daemon_thread = threading.Thread(target=daemon_worker, daemon=True)
+        self._daemon_thread.start()
+
+    def _stop_daemon_thread(self) -> None:
+        """Stop the daemon thread if running."""
+        if self._daemon_thread and self._daemon_thread.is_alive():
+            self._daemon_stop.set()
+            self._daemon_thread.join(timeout=2.0)
+            self._daemon_thread = None
 
     # ----------------------------
     # Maintenance

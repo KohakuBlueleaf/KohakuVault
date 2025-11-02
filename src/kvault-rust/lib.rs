@@ -5,7 +5,9 @@ use rusqlite::{params, Connection, OpenFlags};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use thiserror::Error;
 
 mod col;
@@ -18,6 +20,12 @@ enum KvError {
     Py(String),
     #[error("Key not found")]
     NotFound,
+}
+
+#[derive(Debug)]
+enum CacheError {
+    ValueTooLarge, // Value larger than cache capacity
+    NeedFlush,     // Cache would exceed capacity, need flush first
 }
 
 impl From<KvError> for PyErr {
@@ -44,26 +52,58 @@ struct WriteBackCache {
     current_bytes: usize,
     cap_bytes: usize,
     flush_threshold: usize,
+    last_write_time: Option<Instant>,
 }
 
 impl WriteBackCache {
     fn new(cap_bytes: usize, flush_threshold: usize) -> Self {
-        Self { map: HashMap::new(), current_bytes: 0, cap_bytes, flush_threshold }
+        Self {
+            map: HashMap::new(),
+            current_bytes: 0,
+            cap_bytes,
+            flush_threshold,
+            last_write_time: None,
+        }
     }
-    fn insert(&mut self, k: Vec<u8>, v: Vec<u8>) {
-        let add = k.len() + v.len();
-        self.current_bytes += add;
+
+    /// Try to insert into cache with capacity checks.
+    /// Returns error if value too large or cache needs flush first.
+    fn insert(&mut self, k: Vec<u8>, v: Vec<u8>) -> Result<(), CacheError> {
+        let value_size = k.len() + v.len();
+
+        // Check if value is larger than cache capacity (can't cache it)
+        if value_size > self.cap_bytes {
+            return Err(CacheError::ValueTooLarge);
+        }
+
+        // Check if adding would exceed capacity (need flush first)
+        if self.current_bytes + value_size > self.cap_bytes {
+            return Err(CacheError::NeedFlush);
+        }
+
+        // Safe to insert
+        self.current_bytes += value_size;
         self.map.insert(k, v);
+        self.last_write_time = Some(Instant::now());
+
+        Ok(())
     }
+
     fn should_flush(&self) -> bool {
-        self.current_bytes >= self.flush_threshold || self.current_bytes >= self.cap_bytes
+        self.current_bytes >= self.flush_threshold
     }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     fn drain(&mut self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = Vec::with_capacity(self.map.len());
         for (k, v) in self.map.drain() {
             out.push((k, v));
         }
         self.current_bytes = 0;
+        self.last_write_time = None;
         out
     }
 }
@@ -74,6 +114,7 @@ struct _KVault {
     table: String,
     cache: Mutex<Option<WriteBackCache>>,
     chunk_size: usize,
+    cache_locked: Arc<AtomicBool>, // For lock_cache()
 }
 
 #[pymethods]
@@ -145,15 +186,19 @@ impl _KVault {
             table: table.to_string(),
             cache: Mutex::new(None),
             chunk_size,
+            cache_locked: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Enable/disable write-back cache (bytes-bounded). Flush when threshold reached.
-    #[pyo3(signature = (cap_bytes=64<<20, flush_threshold=16<<20))]
-    fn enable_cache(&self, cap_bytes: usize, flush_threshold: usize) {
+    /// Enable write-back cache (bytes-bounded). Flush when threshold reached.
+    /// Daemon thread for auto-flush is handled in Python layer.
+    #[pyo3(signature = (cap_bytes=64<<20, flush_threshold=16<<20, _flush_interval=None))]
+    fn enable_cache(&self, cap_bytes: usize, flush_threshold: usize, _flush_interval: Option<f64>) {
         let mut guard = self.cache.lock().unwrap();
         *guard = Some(WriteBackCache::new(cap_bytes, flush_threshold));
+        // Note: flush_interval is used by Python daemon thread, not Rust
     }
+
     fn disable_cache(&self) {
         let mut guard = self.cache.lock().unwrap();
         *guard = None;
@@ -173,30 +218,45 @@ impl _KVault {
             return Err(KvError::Py("value must be bytes-like".into()).into());
         };
 
-        if let Some(cache) = self.cache.lock().unwrap().as_mut() {
-            cache.insert(k, v);
-            if cache.should_flush() {
-                let _ = py; // no-op, just reminding ourselves
-                self.flush_cache(py)?;
+        // Try to use cache if enabled
+        {
+            let mut guard = self.cache.lock().unwrap();
+            if let Some(cache) = guard.as_mut() {
+                match cache.insert(k.clone(), v.clone()) {
+                    Ok(()) => {
+                        // Successfully cached, check if should auto-flush
+                        let should_flush = cache.should_flush();
+                        drop(guard); // Release lock before flush
+
+                        if should_flush {
+                            self.flush_cache(py)?;
+                        }
+                        return Ok(());
+                    }
+                    Err(CacheError::ValueTooLarge) => {
+                        // Value too large for cache, flush existing then bypass cache
+                        drop(guard);
+                        self.flush_cache(py)?;
+                        // Fall through to direct write
+                    }
+                    Err(CacheError::NeedFlush) => {
+                        // Cache full, flush then retry insert
+                        drop(guard);
+                        self.flush_cache(py)?;
+
+                        // Retry insert after flush
+                        let mut guard = self.cache.lock().unwrap();
+                        if let Some(cache) = guard.as_mut() {
+                            cache.insert(k, v).ok(); // Should succeed now
+                        }
+                        return Ok(());
+                    }
+                }
             }
-            return Ok(());
         }
 
-        let size = v.len() as i64;
-        let sql = format!(
-            "
-            INSERT INTO {t}(key, value, size)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT(key)
-            DO UPDATE SET
-                value = excluded.value,
-                size = excluded.size
-            ",
-            t = self.table
-        );
-        let conn = self.conn.lock().unwrap();
-        conn.execute(&sql, params![k, v, size])
-            .map_err(KvError::from)?;
+        // Direct write (no cache or bypassed for large value)
+        self.write_direct(&k, &v)?;
         Ok(())
     }
 
@@ -462,15 +522,26 @@ impl _KVault {
     }
 
     /// Flush write-back cache (if enabled) in a single transaction.
+    /// Respects cache_locked flag - won't flush if locked.
     fn flush_cache(&self, _py: Python<'_>) -> PyResult<usize> {
+        // Check if cache is locked (for lock_cache() context manager)
+        if self.cache_locked.load(Ordering::Relaxed) {
+            return Ok(0); // Skip flush if locked
+        }
+
         let mut guard = self.cache.lock().unwrap();
         let Some(cache) = guard.as_mut() else {
             return Ok(0);
         };
-        let entries = cache.drain();
-        if entries.is_empty() {
+
+        // Don't flush if empty
+        if cache.is_empty() {
             return Ok(0);
         }
+
+        let entries = cache.drain();
+        drop(guard); // Release lock before transaction
+
         let sql = format!(
             "
             INSERT INTO {t}(key, value, size)
@@ -517,6 +588,34 @@ impl _KVault {
             .query_row(&sql, [], |r| r.get(0))
             .map_err(KvError::from)?;
         Ok(n)
+    }
+
+    /// Set cache lock status (for Python lock_cache() context manager).
+    fn set_cache_locked(&self, locked: bool) {
+        self.cache_locked.store(locked, Ordering::Relaxed);
+    }
+}
+
+// Helper methods (not exposed to Python)
+impl _KVault {
+    /// Write directly to database (bypass cache).
+    fn write_direct(&self, k: &[u8], v: &[u8]) -> PyResult<()> {
+        let size = v.len() as i64;
+        let sql = format!(
+            "
+            INSERT INTO {t}(key, value, size)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(key)
+            DO UPDATE SET
+                value = excluded.value,
+                size = excluded.size
+            ",
+            t = self.table
+        );
+        let conn = self.conn.lock().unwrap();
+        conn.execute(&sql, params![k, v, size])
+            .map_err(KvError::from)?;
+        Ok(())
     }
 }
 
