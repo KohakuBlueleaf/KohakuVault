@@ -3,7 +3,7 @@ Basic KohakuVault Usage Examples
 
 Demonstrates key-value storage with streaming and caching.
 """
-
+import time
 from kohakuvault import KVault
 
 # =============================================================================
@@ -71,28 +71,49 @@ print()
 # Example 3: Write-Back Caching for Bulk Operations
 # =============================================================================
 
-print("Example 3: Write-Back Caching")
+print("Example 3: Write-Back Caching (Context Manager - Recommended)")
 print("=" * 50)
 
 vault = KVault("thumbnails.db")
 
-# Enable cache: 64 MiB capacity, flush at 16 MiB
-vault.enable_cache(cap_bytes=64 * 1024 * 1024, flush_threshold=16 * 1024 * 1024)
+# Context manager automatically handles flushing
+print("Writing 1000 thumbnails with automatic cache...")
+with vault.cache(cap_bytes=64 * 1024 * 1024):
+    for i in range(1000):
+        vault[f"thumb:{i}"] = b"fake_thumbnail_data_" + str(i).encode()
+# Auto-flushed here!
 
-# Batch write 1000 thumbnails (all cached in memory)
-print("Writing 1000 thumbnails...")
-for i in range(1000):
-    vault[f"thumb:{i}"] = b"fake_thumbnail_data_" + str(i).encode()
-
-# Flush to disk
-flushed = vault.flush_cache()
-print(f"Flushed {flushed} entries to disk")
-
-# Disable cache
-vault.disable_cache()
 print(f"Total keys: {len(vault)}")
-
 vault.close()
+print()
+
+# =============================================================================
+# Example 3b: Long-Running with Daemon Thread
+# =============================================================================
+
+print("Example 3b: Daemon Thread Auto-Flush")
+print("=" * 50)
+
+vault2 = KVault("sensors.db")
+
+# Enable cache with daemon thread (flushes every 2 seconds)
+vault2.enable_cache(
+    cap_bytes=64 * 1024 * 1024,
+    flush_threshold=16 * 1024 * 1024,
+    flush_interval=2.0  # Auto-flush every 2 seconds
+)
+
+print("Writing sensor data with daemon auto-flush...")
+for i in range(100):
+    vault2[f"sensor:{i}"] = b"reading_data_" + str(i).encode()
+    if i % 20 == 0:
+        time.sleep(0.1)  # Simulate real-world timing
+
+print("Data written, daemon will flush automatically")
+time.sleep(2.5)  # Wait for daemon flush
+print(f"Total keys: {len(vault2)}")
+
+vault2.close()  # Stops daemon and flushes remaining data
 print()
 
 # =============================================================================
@@ -138,7 +159,7 @@ vault.close()
 print()
 
 # Cleanup test databases
-for db in ["data.db", "media.db", "thumbnails.db", "temp.db", "optimized.db"]:
+for db in ["data.db", "media.db", "thumbnails.db", "sensors.db", "temp.db", "optimized.db"]:
     for ext in ["", "-wal", "-shm"]:
         try:
             os.remove(f"{db}{ext}")

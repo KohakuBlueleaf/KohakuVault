@@ -14,8 +14,7 @@ import os
 import time
 import tempfile
 import shutil
-from typing import Dict, List, Any
-from tqdm import tqdm
+from typing import Dict, Any
 from kohakuvault import KVault, ColumnVault
 
 
@@ -168,10 +167,8 @@ def bench_column_append(
     import random
 
     unique_id = random.randint(100000, 999999)
-    if storage == "memory":
-        db_path = f"file::memory:{unique_id}?cache=shared"
-    else:
-        db_path = runner.get_db_path(f"col_append_{n_ops}_{dtype}_{min_kb}_{max_mb}_{unique_id}")
+    # Use temp files for all benchmarks (memory vs disk just affects analysis)
+    db_path = runner.get_db_path(f"col_append_{storage}_{n_ops}_{dtype}_{min_kb}_{max_mb}_{unique_id}")
 
     cv = ColumnVault(db_path, min_chunk_bytes=min_kb * 1024, max_chunk_bytes=max_mb * 1024 * 1024)
     cv.create_column("test", dtype)
@@ -212,10 +209,7 @@ def bench_column_extend(
     import random
 
     unique_id = random.randint(100000, 999999)
-    if storage == "memory":
-        db_path = f"file::memory:{unique_id}?cache=shared"
-    else:
-        db_path = runner.get_db_path(f"col_extend_{n_ops}_{dtype}_{unique_id}")
+    db_path = runner.get_db_path(f"col_extend_{storage}_{n_ops}_{dtype}_{unique_id}")
 
     cv = ColumnVault(db_path, min_chunk_bytes=min_kb * 1024, max_chunk_bytes=max_mb * 1024 * 1024)
     cv.create_column("test", dtype)
@@ -252,10 +246,7 @@ def bench_column_random_read(
     import random
 
     unique_id = random.randint(100000, 999999)
-    if storage == "memory":
-        db_path = f"file::memory:{unique_id}?cache=shared"
-    else:
-        db_path = runner.get_db_path(f"col_randread_{n_elements}_{unique_id}")
+    db_path = runner.get_db_path(f"col_randread_{storage}_{n_elements}_{unique_id}")
 
     # Setup
     cv = ColumnVault(db_path, min_chunk_bytes=min_kb * 1024, max_chunk_bytes=max_mb * 1024 * 1024)
