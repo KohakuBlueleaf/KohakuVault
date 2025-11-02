@@ -8,56 +8,39 @@ High-performance, SQLite-backed storage with dual interfaces: **dict-like for bl
 pip install kohakuvault
 ```
 
-### 1. KV Store - Dict-like for Binary Blobs
+**KV Store** - Dict-like interface for binary blobs (images, videos, documents):
 
 ```python
 from kohakuvault import KVault
 
-# Basic operations
 vault = KVault("data.db")
 vault["image:123"] = image_bytes
 vault["video:456"] = video_bytes
+data = vault["image:123"]
 
-# Dict-like interface
-if "image:123" in vault:
-    data = vault["image:123"]
-
-# Bulk operations with automatic caching
-with vault.cache(64*1024*1024):  # 64MB cache
+# Bulk writes with smart caching (NEW in v0.2.2!)
+with vault.cache(64*1024*1024):
     for i in range(10000):
-        vault[f"thumb:{i}"] = thumbnail_data
-# Auto-flushes here!
-
-# Streaming large files
-with open("large_video.mp4", "rb") as f:
-    vault.put_file("video:789", f)
+        vault[f"key:{i}"] = data
+# Auto-flushes on exit!
 ```
 
-### 2. Columnar - List-like for Typed Sequences
+**Columnar Storage** - List-like interface for typed sequences (timeseries, logs, events):
 
 ```python
 from kohakuvault import ColumnVault
 
-# Create columnar storage (can share DB with KVault)
 cv = ColumnVault("data.db")
-
-# Fixed-size types
 cv.create_column("temperatures", "f64")
-cv.create_column("timestamps", "i64")
+cv.create_column("messages", "bytes")  # Variable-size
 
 temps = cv["temperatures"]
-temps.extend([23.5, 24.1, 25.0])  # Like a Python list
-print(temps[0])      # 23.5
-print(temps[-1])     # 25.0
+temps.extend([23.5, 24.1, 25.0])
+print(temps[0])  # 23.5
 
-# Variable-size bytes (strings, JSON, etc.)
-cv.create_column("log_messages", "bytes")
-logs = cv["log_messages"]
+logs = cv["messages"]
 logs.append(b"Server started")
-logs.append(b"Request processed in 5.2ms")
-
-for msg in logs:
-    print(msg.decode())
+print(logs[0])  # b'Server started'
 ```
 
 ## Features
