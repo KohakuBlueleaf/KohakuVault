@@ -175,24 +175,33 @@ cv["sequence"][0]     # Structured
 - Can't do partial reads/writes efficiently
 - Memory pressure on large columns
 
-**Solution**: Split into chunks
-- Default: 128KB → 16MB per chunk (dynamic growth)
+**Solution**: Split into dynamically-sized chunks
+- Default: 128KB → 16MB per chunk (exponential growth)
 - Enables efficient random access
 - Partial reads/writes without loading entire column
 - Better cache locality
 
-**Dynamic growth (like C++ vector):**
+**Dynamic growth (like C++ std::vector):**
 ```
 Chunk lifecycle:
 128KB (create) → 256KB (double) → 512KB → 1MB → 2MB → 4MB → 8MB → 16MB (max)
-When full at 16MB → Create new chunk at 128KB
+When full at 16MB → Grow to max, create new chunk at 128KB
+
+Critical invariant: All chunks 0..k-1 are ALWAYS at max_chunk_bytes (fully filled)
+Only the last chunk k can be < max_chunk_bytes
 ```
 
 **Benefits:**
 - Small footprint initially (128KB)
-- Fast amortized O(1) append
+- Fast amortized O(1) append (same as Python list)
 - Bounded max size (good for caching)
 - Fewer chunks than fixed-size strategy
+- Simple addressing: byte_offset = chunk_idx × max_chunk_bytes + offset_in_chunk
+
+**Cross-chunk element handling:**
+- Elements can span chunk boundaries (e.g., 10-byte element at byte 1020 in 1024-byte chunk)
+- Byte-based addressing automatically handles this
+- Read/write operations seamlessly work across chunks
 
 ### 5. Why Prefix Sum for Variable-Size?
 
@@ -293,12 +302,24 @@ column_proxy.py: Column.append()
   ↓
 col.rs: _ColumnVault.append_raw()
   ↓
-  Find append chunk:
-    Last chunk has space? → Use it
-    Last chunk full? → Try grow (2x)
-    Can't grow (at max)? → Create new chunk
-  ↓
-  Write to chunk BLOB
+  Loop until all data written:
+    ↓
+    prepare_append_chunk():
+      Check last chunk space_left
+      ├─ Enough space? → Return chunk
+      ├─ Can double? → Double size, return chunk
+      ├─ Has ANY space? → Grow to max, return chunk (fill it!)
+      └─ Completely full? → Create new chunk at min_chunk_bytes
+    ↓
+    Calculate bytes_to_write = min(remaining, chunk_capacity - offset)
+    ↓
+    blob_open(chunk, writable=true)  // Incremental BLOB I/O
+    ↓
+    blob.write_at(data, offset)  // Direct write without reading
+    ↓
+    Update current_offset += bytes_written
+    ↓
+    Loop if more data remaining
   ↓
   Update col_meta.length
   ↓
@@ -306,6 +327,12 @@ SQLite: WAL write
   ↓
 Disk: app.db-wal
 ```
+
+**Key optimizations:**
+- Incremental BLOB I/O: No need to read 16MB chunks to append 8 bytes
+- Chunk size check: Query `actual_size` column before reading blob
+- Exponential growth: Efficiently size new chunks based on remaining data
+- Fill-first strategy: Always fill current chunk before creating new one
 
 ## Performance Characteristics
 

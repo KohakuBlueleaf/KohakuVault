@@ -169,10 +169,12 @@ for temp in temps:
 ```
 
 **Why columnar?**
-- Append-heavy workloads (O(1) amortized)
-- Typed data (int/float/bytes)
+- Append-heavy workloads (O(1) amortized, like Python list)
+- Typed data (int/float/bytes with type safety)
 - Efficient iteration and random access
-- Dynamic chunk growth (128KB → 16MB per chunk)
+- Dynamic chunk growth (128KB → 16MB, exponential like std::vector)
+- Cross-chunk element support (byte-based addressing)
+- Minimal memory overhead (incremental BLOB I/O)
 
 See `docs/COLUMNAR_GUIDE.md` and `examples/columnar_demo.py` for complete guide.
 

@@ -336,32 +336,41 @@ def __getitem__(self, i):
 
 **Like C++ std::vector** - start small, grow exponentially:
 
-1. **Create**: First chunk at `min_chunk_bytes` (128KB)
+1. **Create**: First chunk at `min_chunk_bytes` (default 128KB)
 2. **Fill**: Append elements until chunk full
 3. **Grow**: Double chunk size (128KB → 256KB → 512KB → ...)
-4. **Cap**: Stop growing at `max_chunk_bytes` (16MB)
-5. **Overflow**: Create new chunk at `min_chunk_bytes`
+4. **Cap**: Stop growing at `max_chunk_bytes` (default 16MB)
+5. **Overflow**: Create new chunk starting at `min_chunk_bytes`
+
+### Critical Invariant
+
+**All chunks 0 to k-1 are ALWAYS at `max_chunk_bytes` (completely filled).**
+
+Only the last chunk (k) can be smaller than `max_chunk_bytes`. This ensures:
+- Simple byte-based addressing (byte_offset = chunk_idx × max_chunk_bytes + offset_in_chunk)
+- Predictable performance (no complex chunk size tracking needed for reads)
+- Cross-chunk elements handled correctly
 
 ### Example Growth
 
-**For i64 column (8 bytes/element):**
+**For i64 column (8 bytes/element), min=128KB, max=16MB:**
 
 ```
-Chunk 0:
-- Created: 128KB capacity (16,384 elements)
-- Full → Grow to 256KB (32,768 elements)
-- Full → Grow to 512KB (65,536 elements)
-- Full → Grow to 1MB (131,072 elements)
-- Full → Grow to 2MB
-- Full → Grow to 4MB
-- Full → Grow to 8MB
-- Full → Grow to 16MB (max, 2,097,152 elements)
-- Full → Create Chunk 1 at 128KB
+Chunk 0 lifecycle:
+- Append 1st element: Create chunk at 128KB (16,384 elem capacity)
+- Append until full (16,384 elements): Chunk is full
+- Append next element: Double to 256KB (32,768 elem capacity)
+- Append until full (32,768 elements): Chunk is full
+- Continue: 512KB → 1MB → 2MB → 4MB → 8MB → 16MB (max)
+- At 16MB: Chunk holds 2,097,152 elements
+- Append when full: Grow chunk 0 to max (16MB), create chunk 1 at 128KB
 
-Chunk 1:
-- Created: 128KB (starts over)
-- (Growth repeats...)
+Chunk 1 lifecycle:
+- Created: 128KB (starts growth cycle again)
+- Growth repeats: 128KB → 256KB → ... → 16MB
 ```
+
+**Key insight**: Chunk 0 reaches 16MB and is **completely filled** before chunk 1 is created.
 
 ### Performance Analysis
 
@@ -432,24 +441,50 @@ CREATE TABLE col_chunks (
 **For fixed-size columns:**
 
 ```python
-# Given: index i, elem_size, chunks with varying actual_size
+# Given: index i, elem_size, max_chunk_bytes
 
 # Step 1: Convert element index → byte offset
 byte_offset = i * elem_size
 
-# Step 2: Find which chunk contains this byte
-# (Requires summing actual_size of previous chunks)
-chunk_idx, offset_in_chunk = find_chunk(byte_offset)
+# Step 2: Calculate chunk location (using max_chunk_bytes for addressing)
+chunk_idx = byte_offset / max_chunk_bytes
+offset_in_chunk = byte_offset % max_chunk_bytes
 
-# Step 3: Read from chunk
-data = chunks[chunk_idx][offset_in_chunk:offset_in_chunk+elem_size]
+# Step 3: Read from chunk (may span multiple chunks!)
+data = read_from_chunk(chunk_idx, offset_in_chunk, elem_size)
 
 # Step 4: Unpack
 value = struct.unpack("<q", data)[0]  # For i64
 ```
 
-**Rust handles:** Steps 2-3 (efficient SQL queries, BLOB access)
-**Python handles:** Steps 1, 4 (type awareness, packing)
+**Key invariant used**: All chunks 0..k-1 are at `max_chunk_bytes`, so simple division works!
+
+**Rust handles:** Steps 2-3 (chunk addressing, BLOB access, cross-chunk reads)
+**Python handles:** Steps 1, 4 (type awareness, packing/unpacking)
+
+### Cross-Chunk Elements
+
+**Elements can span chunk boundaries** when `max_chunk_bytes % elem_size != 0`.
+
+Example with `elem_size=10`, `max_chunk_bytes=1024`:
+```
+Elements per chunk: 1024 / 10 = 102 (leaves 4 bytes remainder)
+
+Chunk 0: Elements 0-101 (1020 bytes used, 4 bytes unused)
+Chunk 1: Elements 102+ start here
+
+Element 102 position:
+- Byte offset: 102 × 10 = 1020
+- Chunk: 1020 / 1024 = 0
+- Offset in chunk: 1020 % 1024 = 1020
+- **Crosses boundary**: Bytes 1020-1023 in chunk 0, bytes 1024-1029 in chunk 1
+```
+
+**Implementation**: `read_range` and `write_range` use byte-based addressing to automatically handle cross-chunk elements by:
+1. Calculate byte range needed
+2. Iterate over all chunks that contain any part of the range
+3. Read/write the portion from each chunk
+4. Assemble complete element from fragments
 
 ### Append Algorithm
 
@@ -460,35 +495,62 @@ def append(self, value):
     self._inner.append_raw(col_id, packed, elem_size=8, current_length)
 ```
 
-**Rust:**
+**Rust (simplified):**
 ```rust
-fn append_raw(...) {
-    // 1. Find last chunk
-    // 2. Check if space available
-    // 3. If no space:
-    //    - Try double chunk size (up to max)
-    //    - If can't grow, create new chunk at min
-    // 4. Write data to chunk
-    // 5. Update col_meta.length
+fn append_raw(data_bytes) {
+    let remaining = data_bytes.len();
+    let mut written = 0;
+
+    while written < data_bytes.len() {
+        // 1. Prepare chunk (grow/create as needed)
+        let (chunk_idx, offset, capacity) = prepare_append_chunk(remaining);
+
+        // 2. Write portion that fits in this chunk
+        let to_write = min(remaining, capacity - offset);
+        blob_write_at(chunk_idx, offset, data_bytes[written..written+to_write]);
+
+        written += to_write;
+        remaining -= to_write;
+    }
+
+    // 3. Update col_meta.length
 }
 ```
 
-**Growth decision tree:**
+**Growth decision tree for `prepare_append_chunk`:**
 ```
-Append request
+prepare_append_chunk(current_offset, remaining_bytes)
   ↓
 Last chunk exists?
-  No → Create chunk 0 at min_chunk_bytes
+  No → Create chunk 0 with size = min(2^k × min_chunk, max_chunk, remaining)
+       Return (chunk_idx=0, offset=0, capacity=chunk_size)
   Yes ↓
   ↓
-Has space?
-  Yes → Write to chunk
+Calculate space_left in current chunk
+  ↓
+space_left >= remaining?
+  Yes → Return current chunk (has enough space)
   No ↓
   ↓
-Current size < max?
-  Yes → Double chunk size, write
-  No → Create next chunk at min, write
+Try to double current chunk size
+  actual_size × 2 (capped at max_chunk_bytes)
+  ↓
+After doubling, enough space?
+  Yes → Return current chunk
+  No ↓
+  ↓
+Grow current chunk to max_chunk_bytes
+  ↓
+After growing to max, has ANY space left?
+  Yes → Return current chunk (fill remaining space first!)
+  No ↓
+  ↓
+Current chunk completely full at max_chunk_bytes
+  → Create new chunk with size = min(2^k × min_chunk, max_chunk, remaining)
+  → Return new chunk (starts at offset 0)
 ```
+
+**Critical behavior**: Always fill current chunk completely before creating next chunk!
 
 ## Performance Characteristics
 
@@ -530,6 +592,65 @@ Copy cost:
 ```
 
 **Amortized append cost:** O(1) with factor ≈ 2
+
+### Performance Optimizations
+
+**1. Incremental BLOB I/O**
+
+Append operations use SQLite's incremental BLOB API instead of reading entire chunks:
+
+```rust
+// BAD: Read entire 16MB chunk, modify 8 bytes, write back
+let mut chunk_data = read_blob(chunk_idx);  // 16MB read
+chunk_data[offset..offset+8] = new_data;
+write_blob(chunk_idx, chunk_data);          // 16MB write
+
+// GOOD: Write directly to chunk without reading
+let blob = blob_open(chunk_idx, writable=true);
+blob.write_at(new_data, offset);  // Just 8 bytes written
+```
+
+**Impact**: 10,000 appends = 80KB writes instead of 320GB I/O!
+
+**2. Chunk Size Check Before Read**
+
+Before growing a chunk, check `actual_size` column (integer) first:
+
+```rust
+// BAD: Always read blob to check size
+let chunk_data = read_blob(chunk_idx);  // 16MB read
+if chunk_data.len() >= max_chunk { return; }
+
+// GOOD: Check actual_size column first
+let actual_size = query("SELECT actual_size ...")[0];  // Integer read
+if actual_size >= max_chunk { return; }  // Skip blob read!
+```
+
+**Impact**: Eliminates 16MB blob reads on every append after chunk reaches max.
+
+**3. Exponential Growth on Large Appends**
+
+When appending large data (e.g., 1MB at once), new chunks are sized appropriately:
+
+```rust
+fn calculate_new_chunk_size(remaining_bytes, min_chunk, max_chunk) {
+    // Start with min, double until it fits remaining
+    let mut size = min_chunk;
+    while size < remaining && size < max_chunk {
+        size *= 2;
+    }
+    return min(size, max_chunk);
+}
+
+// Examples:
+// remaining = 100 bytes, min = 16 bytes, max = 1024 bytes
+// → 16 < 100 → 32 < 100 → 64 < 100 → 128 >= 100 → size = 128 bytes
+
+// remaining = 5000 bytes, min = 16 bytes, max = 1024 bytes
+// → Keep doubling until 1024 (max) → size = 1024 bytes
+```
+
+**Impact**: Prevents creating thousands of tiny chunks when appending large data.
 
 ### Memory Usage
 
