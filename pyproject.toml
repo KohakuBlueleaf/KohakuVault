@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kohakuvault"
-version = "0.2.1"
+version = "0.2.2"
 description = "SQLite-backed KV store (Rust+PyO3) for large media blobs"
 authors = [
     { name = "KohakuVault Contributors" }

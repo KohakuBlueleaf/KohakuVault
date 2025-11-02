@@ -6,7 +6,7 @@ Complete API documentation for KohakuVault's key-value storage.
 
 **KVault** provides a dict-like interface for storing binary blobs (images, videos, documents, etc.) with streaming support and **fully automatic write-back caching**.
 
-### What's New: Smart Caching (v0.2.1+)
+### What's New: Smart Caching (v0.2.2+)
 
 The cache system has been redesigned for safety and ease of use:
 
@@ -26,7 +26,7 @@ vault.flush_cache()  # Manual flush required
 vault.disable_cache()
 ```
 
-**Now (v0.2.1+):**
+**Now (v0.2.2+):**
 ```python
 # Context manager - simplest and safest
 with vault.cache():
