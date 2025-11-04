@@ -5,7 +5,10 @@ Provides list-like interface for storing large arrays/sequences in SQLite.
 """
 
 import struct
+import threading
+import time
 from collections.abc import MutableSequence
+from contextlib import contextmanager
 from typing import Any, Iterator, Union
 
 from kohakuvault._kvault import _ColumnVault
@@ -206,6 +209,9 @@ class Column(MutableSequence):
         # Cache length (updated on mutations)
         self._length = None
 
+        # Cache enablement flag
+        self._cache_enabled = False
+
     def _get_length(self) -> int:
         """Get current length from database."""
         if self._length is None:
@@ -267,6 +273,10 @@ class Column(MutableSequence):
 
         WARNING: This is O(n) - shifts all elements after idx.
         """
+        # Flush cache before structural operation
+        if self._cache_enabled:
+            self._inner.flush_cache(self._col_id)
+
         if not isinstance(idx, int):
             raise TypeError("Column indices must be integers")
 
@@ -320,6 +330,10 @@ class Column(MutableSequence):
 
         WARNING: This is O(n) - shifts all elements after idx.
         """
+        # Flush cache before structural operation
+        if self._cache_enabled:
+            self._inner.flush_cache(self._col_id)
+
         length = len(self)
 
         # Handle negative/boundary indices
@@ -363,20 +377,32 @@ class Column(MutableSequence):
 
         This is O(1) and the most efficient operation.
         Now uses Rust DataPacker for ~5-10x performance improvement!
+        Uses cache if enabled for even better performance!
         """
         current_length = self._get_length()
 
-        if self._use_rust_packer:
-            # NEW PATH: Use Rust typed interface (packs in Rust)
-            self._inner.append_typed(
-                self._col_id, value, self._rust_packer, self._chunk_bytes, current_length
-            )
+        if self._cache_enabled:
+            # CACHED PATH: Use cached interface
+            if self._use_rust_packer:
+                self._inner.append_typed_cached(
+                    self._col_id, value, self._rust_packer, current_length
+                )
+            else:
+                packed = self._pack(value)
+                self._inner.append_cached(self._col_id, packed, self._elem_size, current_length)
         else:
-            # OLD PATH: Python packing (fallback)
-            packed = self._pack(value)
-            self._inner.append_raw(
-                self._col_id, packed, self._elem_size, self._chunk_bytes, current_length
-            )
+            # DIRECT PATH: Write directly to disk
+            if self._use_rust_packer:
+                # Use Rust typed interface (packs in Rust)
+                self._inner.append_typed(
+                    self._col_id, value, self._rust_packer, self._chunk_bytes, current_length
+                )
+            else:
+                # Python packing (fallback)
+                packed = self._pack(value)
+                self._inner.append_raw(
+                    self._col_id, packed, self._elem_size, self._chunk_bytes, current_length
+                )
 
         self._length = current_length + 1
 
@@ -384,30 +410,99 @@ class Column(MutableSequence):
         """
         Extend column with multiple values.
         Now uses Rust DataPacker for ~10-20x performance improvement on bulk operations!
+        Uses cache if enabled for even better performance!
         """
         if not values:
             return
 
         current_length = self._get_length()
 
-        if self._use_rust_packer:
-            # NEW PATH: Use Rust typed interface (packs all in Rust with single FFI call)
-            self._inner.extend_typed(
-                self._col_id, values, self._rust_packer, self._chunk_bytes, current_length
-            )
+        if self._cache_enabled:
+            # CACHED PATH: Use cached interface
+            if self._use_rust_packer:
+                self._inner.extend_typed_cached(self._col_id, values, self._rust_packer)
+            else:
+                # Pack individually and extend cache
+                packed_list = [self._pack(v) for v in values]
+                self._inner.extend_cached(self._col_id, packed_list, False)
         else:
-            # OLD PATH: Python packing (fallback)
-            packed_data = b"".join(self._pack(v) for v in values)
-            self._inner.append_raw(
-                self._col_id, packed_data, self._elem_size, self._chunk_bytes, current_length
-            )
+            # DIRECT PATH: Write directly to disk
+            if self._use_rust_packer:
+                # Use Rust typed interface (packs all in Rust with single FFI call)
+                self._inner.extend_typed(
+                    self._col_id, values, self._rust_packer, self._chunk_bytes, current_length
+                )
+            else:
+                # Python packing (fallback)
+                packed_data = b"".join(self._pack(v) for v in values)
+                self._inner.append_raw(
+                    self._col_id, packed_data, self._elem_size, self._chunk_bytes, current_length
+                )
 
         self._length = current_length + len(values)
 
     def clear(self) -> None:
         """Remove all elements."""
+        # Flush cache before structural operation
+        if self._cache_enabled:
+            self._inner.flush_cache(self._col_id)
+
         self._inner.set_length(self._col_id, 0)
         self._length = 0
+
+    # ========================================
+    # CACHE METHODS
+    # ========================================
+
+    def enable_cache(
+        self, cap_bytes: int = 64 * 1024 * 1024, flush_threshold: int = 16 * 1024 * 1024
+    ) -> None:
+        """
+        Enable write-back cache for this column.
+
+        Args:
+            cap_bytes: Maximum cache size in bytes (default 64MB)
+            flush_threshold: Auto-flush when cache exceeds this size (default 16MB)
+        """
+        self._inner.enable_cache(self._col_id, cap_bytes, flush_threshold, False, None)
+        self._cache_enabled = True
+
+    def disable_cache(self) -> None:
+        """Disable cache for this column (auto-flushes first)."""
+        if self._cache_enabled:
+            self._inner.disable_cache(self._col_id)
+            self._cache_enabled = False
+
+    def flush_cache(self) -> int:
+        """
+        Flush this column's cache.
+
+        Returns:
+            Number of bytes flushed
+        """
+        if self._cache_enabled:
+            return self._inner.flush_cache(self._col_id)
+        return 0
+
+    @contextmanager
+    def cache(self, cap_bytes: int = 64 * 1024 * 1024, flush_threshold: int = 16 * 1024 * 1024):
+        """
+        Context manager for temporary cache enablement.
+
+        Example:
+            with col.cache():
+                for i in range(1000):
+                    col.append(i)
+        """
+        self.enable_cache(cap_bytes, flush_threshold)
+        try:
+            yield self
+        finally:
+            self.disable_cache()
+
+    # ========================================
+    # END CACHE METHODS
+    # ========================================
 
     def __repr__(self) -> str:
         return f"Column(name={self._name!r}, dtype={self._dtype!r}, length={len(self)})"
@@ -471,6 +566,9 @@ class VarSizeColumn(MutableSequence):
         else:
             self._use_rust_packer = False
             self._packer = None
+
+        # Cache enablement flag
+        self._cache_enabled = False
 
     def _get_length(self) -> int:
         """Get number of elements (from index column)."""
@@ -582,7 +680,10 @@ class VarSizeColumn(MutableSequence):
         )
 
     def append(self, value) -> None:
-        """Append a variable-size element using adaptive chunking (v0.4.0+)."""
+        """
+        Append a variable-size element using adaptive chunking (v0.4.0+).
+        Uses cache if enabled for even better performance!
+        """
         current_length = self._get_length()
 
         # Pack value if using DataPacker for structured types
@@ -593,23 +694,30 @@ class VarSizeColumn(MutableSequence):
                 raise TypeError("Value must be bytes")
             packed_value = value
 
-        # NEW: Use adaptive append (returns chunk_id, start, end as i32 triple)
-        # Use actual data column max_chunk_bytes
-        chunk_id, start_byte, end_byte = self._inner.append_raw_adaptive(
-            self._data_col_id, packed_value, self._data_max_chunk
-        )
+        if self._cache_enabled:
+            # CACHED PATH: Buffer in cache
+            self._inner.append_raw_adaptive_cached(self._data_col_id, packed_value)
+        else:
+            # DIRECT PATH: Write directly to disk
+            # Use adaptive append (returns chunk_id, start, end as i32 triple)
+            chunk_id, start_byte, end_byte = self._inner.append_raw_adaptive(
+                self._data_col_id, packed_value, self._data_max_chunk
+            )
 
-        # Store 12-byte index: (i32 chunk_id, i32 start, i32 end)
-        index_entry = pack_i32(chunk_id) + pack_i32(start_byte) + pack_i32(end_byte)
-        # Index column has elem_size=12, use aligned chunk size for addressing
-        self._inner.append_raw(
-            self._idx_col_id, index_entry, 12, self._idx_chunk_bytes, current_length
-        )
+            # Store 12-byte index: (i32 chunk_id, i32 start, i32 end)
+            index_entry = pack_i32(chunk_id) + pack_i32(start_byte) + pack_i32(end_byte)
+            # Index column has elem_size=12, use aligned chunk size for addressing
+            self._inner.append_raw(
+                self._idx_col_id, index_entry, 12, self._idx_chunk_bytes, current_length
+            )
 
         self._length = current_length + 1
 
     def extend(self, values: list) -> None:
-        """Extend with multiple variable-size elements (v0.4.0+ - optimized in Rust!)."""
+        """
+        Extend with multiple variable-size elements (v0.4.0+ - optimized in Rust!).
+        Uses cache if enabled for even better performance!
+        """
         if not values:
             return
 
@@ -625,26 +733,92 @@ class VarSizeColumn(MutableSequence):
 
         current_length = self._get_length()
 
-        # NEW (v0.4.0): Call extend_adaptive - ALL processing in Rust!
-        # Returns packed index data (12 bytes per element)
-        all_index_data = self._inner.extend_adaptive(
-            self._data_col_id,
-            packed_values,
-            self._data_max_chunk,
-        )
+        if self._cache_enabled:
+            # CACHED PATH: Buffer in cache
+            self._inner.extend_adaptive_cached(self._data_col_id, packed_values)
+        else:
+            # DIRECT PATH: Write directly to disk
+            # Call extend_adaptive - ALL processing in Rust!
+            # Returns packed index data (12 bytes per element)
+            all_index_data = self._inner.extend_adaptive(
+                self._data_col_id,
+                packed_values,
+                self._data_max_chunk,
+            )
 
-        # Append index data (already packed in Rust!)
-        self._inner.append_raw(
-            self._idx_col_id, all_index_data, 12, self._idx_chunk_bytes, current_length
-        )
+            # Append index data (already packed in Rust!)
+            self._inner.append_raw(
+                self._idx_col_id, all_index_data, 12, self._idx_chunk_bytes, current_length
+            )
 
         self._length = current_length + len(values)
 
     def clear(self) -> None:
         """Remove all elements."""
+        # Flush cache before structural operation
+        if self._cache_enabled:
+            self._inner.flush_cache(self._data_col_id)
+
         self._inner.set_length(self._data_col_id, 0)
         self._inner.set_length(self._idx_col_id, 0)
         self._length = 0
+
+    # ========================================
+    # CACHE METHODS
+    # ========================================
+
+    def enable_cache(
+        self, cap_bytes: int = 64 * 1024 * 1024, flush_threshold: int = 16 * 1024 * 1024
+    ) -> None:
+        """
+        Enable write-back cache for this variable-size column.
+
+        Args:
+            cap_bytes: Maximum cache size in bytes (default 64MB)
+            flush_threshold: Auto-flush when cache exceeds this size (default 16MB)
+        """
+        # Enable cache with idx_col_id for variable-size column
+        self._inner.enable_cache(
+            self._data_col_id, cap_bytes, flush_threshold, True, self._idx_col_id
+        )
+        self._cache_enabled = True
+
+    def disable_cache(self) -> None:
+        """Disable cache for this column (auto-flushes first)."""
+        if self._cache_enabled:
+            self._inner.disable_cache(self._data_col_id)
+            self._cache_enabled = False
+
+    def flush_cache(self) -> int:
+        """
+        Flush this column's cache.
+
+        Returns:
+            Number of bytes flushed
+        """
+        if self._cache_enabled:
+            return self._inner.flush_cache(self._data_col_id)
+        return 0
+
+    @contextmanager
+    def cache(self, cap_bytes: int = 64 * 1024 * 1024, flush_threshold: int = 16 * 1024 * 1024):
+        """
+        Context manager for temporary cache enablement.
+
+        Example:
+            with col.cache():
+                for i in range(1000):
+                    col.append(data)
+        """
+        self.enable_cache(cap_bytes, flush_threshold)
+        try:
+            yield self
+        finally:
+            self.disable_cache()
+
+    # ========================================
+    # END CACHE METHODS
+    # ========================================
 
     def __repr__(self) -> str:
         return f"VarSizeColumn(name={self._name!r}, length={len(self)})"
@@ -695,6 +869,8 @@ class ColumnVault:
 
         self._inner = _ColumnVault(path)
         self._columns = {}  # Cache of Column instances
+        self._daemon_thread = None  # Cache flush daemon thread
+        self._daemon_stop = threading.Event()  # Signal to stop daemon
 
     def create_column(
         self, name: str, dtype: str, chunk_bytes: int = None, use_rust_packer: bool = True
@@ -884,6 +1060,128 @@ class ColumnVault:
             self._inner.checkpoint_wal()
         except Exception:
             pass  # Ignore checkpoint errors (non-critical)
+
+    # ========================================
+    # CACHE METHODS
+    # ========================================
+
+    def enable_cache(
+        self,
+        cap_bytes: int = 64 * 1024 * 1024,
+        flush_threshold: int = 16 * 1024 * 1024,
+        flush_interval: float = None,
+    ) -> None:
+        """
+        Enable write-back cache for ALL columns in this vault.
+
+        Args:
+            cap_bytes: Maximum cache size per column in bytes (default 64MB)
+            flush_threshold: Auto-flush when cache exceeds this size (default 16MB)
+            flush_interval: Optional auto-flush interval in seconds (starts daemon thread)
+
+        Example:
+            vault.enable_cache(cap_bytes=64<<20, flush_threshold=16<<20, flush_interval=5.0)
+        """
+        # Enable cache for all existing columns
+        for col in self._columns.values():
+            col.enable_cache(cap_bytes, flush_threshold)
+
+        # Start daemon thread if flush_interval specified
+        if flush_interval is not None and self._daemon_thread is None:
+            self._daemon_stop.clear()
+            self._daemon_thread = threading.Thread(
+                target=self._cache_daemon, args=(flush_interval,), daemon=True
+            )
+            self._daemon_thread.start()
+
+    def disable_cache(self) -> None:
+        """
+        Disable cache for ALL columns (auto-flushes first).
+        Stops daemon thread if running.
+        """
+        # Stop daemon thread
+        if self._daemon_thread is not None:
+            self._daemon_stop.set()
+            self._daemon_thread.join(timeout=2.0)
+            self._daemon_thread = None
+
+        # Disable cache for all columns
+        for col in self._columns.values():
+            col.disable_cache()
+
+    def flush_cache(self) -> int:
+        """
+        Flush all column caches.
+
+        Returns:
+            Total number of bytes flushed
+        """
+        return self._inner.flush_all_caches()
+
+    @contextmanager
+    def cache(
+        self,
+        cap_bytes: int = 64 * 1024 * 1024,
+        flush_threshold: int = 16 * 1024 * 1024,
+    ):
+        """
+        Context manager for temporary cache enablement.
+        Auto-flushes and disables cache on exit.
+
+        Example:
+            with vault.cache(cap_bytes=64<<20):
+                for i in range(1000):
+                    col.append(i)
+        """
+        self.enable_cache(cap_bytes, flush_threshold)
+        try:
+            yield self
+        finally:
+            self.disable_cache()
+
+    @contextmanager
+    def lock_cache(self):
+        """
+        Lock cache to prevent daemon flushes during atomic operations.
+
+        Example:
+            with vault.lock_cache():
+                col1.append(data1)
+                col2.append(data2)  # Ensure both go in same flush
+        """
+        self._inner.lock_cache()
+        try:
+            yield
+        finally:
+            self._inner.unlock_cache()
+
+    def _cache_daemon(self, flush_interval: float) -> None:
+        """
+        Background thread that periodically flushes caches.
+
+        Args:
+            flush_interval: Idle time in seconds before auto-flush
+        """
+        while not self._daemon_stop.is_set():
+            time.sleep(0.5)  # Check every 500ms
+
+            # Skip if cache is locked
+            if self._inner.is_cache_locked():
+                continue
+
+            # Check all columns for idle time
+            for col in self._columns.values():
+                if hasattr(col, "_col_id"):
+                    idle_time = self._inner.get_cache_idle_time(col._col_id)
+                    if idle_time is not None and idle_time >= flush_interval:
+                        try:
+                            self._inner.flush_cache(col._col_id)
+                        except Exception:
+                            pass  # Ignore flush errors in daemon
+
+    # ========================================
+    # END CACHE METHODS
+    # ========================================
 
     def __repr__(self) -> str:
         cols = self.list_columns()
