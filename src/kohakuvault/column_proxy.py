@@ -30,6 +30,16 @@ def unpack_i64(data: bytes, offset: int = 0) -> int:
     return struct.unpack_from("<q", data, offset)[0]
 
 
+def pack_i32(value: int) -> bytes:
+    """Pack int32 to 4 bytes (little-endian)."""
+    return struct.pack("<i", value)
+
+
+def unpack_i32(data: bytes, offset: int = 0) -> int:
+    """Unpack int32 from 4 bytes (little-endian)."""
+    return struct.unpack_from("<i", data, offset)[0]
+
+
 def pack_f64(value: float) -> bytes:
     """Pack float64 to 8 bytes."""
     return struct.pack("<d", value)
@@ -426,7 +436,7 @@ class VarSizeColumn(MutableSequence):
         idx_col_id: int,
         name: str,
         dtype: str,
-        chunk_bytes: int,  # This is now max_chunk_bytes from Rust
+        chunk_bytes: int,  # This is max_chunk_bytes from Rust
         use_rust_packer: bool = True,
     ):
         self._inner = inner
@@ -434,7 +444,17 @@ class VarSizeColumn(MutableSequence):
         self._idx_col_id = idx_col_id
         self._name = name
         self._dtype = dtype
-        self._chunk_bytes = chunk_bytes  # max_chunk_bytes for addressing
+
+        # CRITICAL (v0.4.0): Get ALIGNED max_chunk_bytes for index column
+        # Index has elem_size=12, so max gets aligned to (max/12)*12
+        _, idx_elem_size, _, idx_max_chunk = inner.get_column_info(f"{name}_idx")
+        self._idx_chunk_bytes = idx_max_chunk  # Use aligned value for index addressing
+
+        # Data column max_chunk_bytes for adaptive append
+        _, _, _, data_max_chunk = inner.get_column_info(f"{name}_data")
+        self._data_max_chunk = data_max_chunk
+
+        self._chunk_bytes = chunk_bytes  # Keep for compatibility
         self._length = None
 
         # NEW: Support DataPacker for structured types (msgpack, cbor, strings)
@@ -486,7 +506,7 @@ class VarSizeColumn(MutableSequence):
         return self._get_length()
 
     def __getitem__(self, idx: int) -> bytes:
-        """Get element at index."""
+        """Get element at index using adaptive chunking (v0.4.0+)."""
         if not isinstance(idx, int):
             raise TypeError("Column indices must be integers")
 
@@ -496,23 +516,15 @@ class VarSizeColumn(MutableSequence):
         if idx < 0 or idx >= length:
             raise IndexError(f"Column index out of range: {idx}")
 
-        # Get byte offsets for this element
-        if idx == 0:
-            start_offset = 0
-            # Read first offset
-            offset_data = self._inner.read_range(self._idx_col_id, 0, 1, 8, self._chunk_bytes)
-            end_offset = unpack_i64(offset_data, 0)
-        else:
-            # Read two offsets: [idx-1] and [idx]
-            offset_data = self._inner.read_range(self._idx_col_id, idx - 1, 2, 8, self._chunk_bytes)
-            start_offset = unpack_i64(offset_data, 0)
-            end_offset = unpack_i64(offset_data, 8)
+        # NEW: Read 12-byte index (i32 chunk_id, i32 start, i32 end)
+        # CRITICAL: Use aligned index chunk size, not self._chunk_bytes!
+        index_data = self._inner.read_range(self._idx_col_id, idx, 1, 12, self._idx_chunk_bytes)
+        chunk_id = unpack_i32(index_data, 0)
+        start_byte = unpack_i32(index_data, 4)
+        end_byte = unpack_i32(index_data, 8)
 
-        # Read bytes from data column
-        byte_count = end_offset - start_offset
-        data = self._inner.read_range(
-            self._data_col_id, start_offset, byte_count, 1, self._chunk_bytes
-        )
+        # Read data from single chunk (no cross-chunk!)
+        data = self._inner.read_adaptive(self._data_col_id, chunk_id, start_byte, end_byte)
 
         # If using packer for structured types, unpack the bytes
         if self._use_rust_packer and self._packer:
@@ -528,10 +540,34 @@ class VarSizeColumn(MutableSequence):
         )
 
     def __delitem__(self, idx: int) -> None:
-        """Delete element (expensive - O(n))."""
-        raise NotImplementedError(
-            "Deleting individual elements from variable-size columns not yet supported."
-        )
+        """Delete element (marks for vacuum, doesn't shift data)."""
+        if not isinstance(idx, int):
+            raise TypeError("Column indices must be integers")
+
+        length = len(self)
+        if idx < 0:
+            idx += length
+        if idx < 0 or idx >= length:
+            raise IndexError(f"Column index out of range: {idx}")
+
+        # Delete index entry (shifts remaining entries in index column)
+        # This is a fixed-size column operation (12 bytes per entry)
+        count = length - idx - 1
+        if count > 0:
+            # Read remaining index entries
+            index_data = self._inner.read_range(
+                self._idx_col_id, idx + 1, count, 12, self._idx_chunk_bytes
+            )
+            # Write them back one position earlier
+            self._inner.write_range(self._idx_col_id, idx, index_data, 12, self._idx_chunk_bytes)
+
+        # Update length
+        new_length = length - 1
+        self._inner.set_length(self._idx_col_id, new_length)
+        self._length = new_length
+
+        # Mark the data chunk as having deletions
+        # (actual cleanup happens in vacuum)
 
     def __iter__(self) -> Iterator[bytes]:
         """Iterate over all elements."""
@@ -546,41 +582,34 @@ class VarSizeColumn(MutableSequence):
         )
 
     def append(self, value) -> None:
-        """Append a variable-size element (bytes or structured data)."""
+        """Append a variable-size element using adaptive chunking (v0.4.0+)."""
         current_length = self._get_length()
 
         # Pack value if using DataPacker for structured types
         if self._use_rust_packer and self._packer:
-            # Structured type (msgpack, cbor, string)
             packed_value = self._packer.pack(value)
         else:
-            # Raw bytes
             if not isinstance(value, bytes):
                 raise TypeError("Value must be bytes")
             packed_value = value
 
-        # Get current total byte count
-        if current_length == 0:
-            current_bytes = 0
-        else:
-            # Read last offset
-            offset_data = self._inner.read_range(
-                self._idx_col_id, current_length - 1, 1, 8, self._chunk_bytes
-            )
-            current_bytes = unpack_i64(offset_data, 0)
+        # NEW: Use adaptive append (returns chunk_id, start, end as i32 triple)
+        # Use actual data column max_chunk_bytes
+        chunk_id, start_byte, end_byte = self._inner.append_raw_adaptive(
+            self._data_col_id, packed_value, self._data_max_chunk
+        )
 
-        # Append packed data
-        self._inner.append_raw(self._data_col_id, packed_value, 1, self._chunk_bytes, current_bytes)
-
-        # Append new offset (prefix sum)
-        new_offset = current_bytes + len(packed_value)
-        offset_bytes = pack_i64(new_offset)
-        self._inner.append_raw(self._idx_col_id, offset_bytes, 8, self._chunk_bytes, current_length)
+        # Store 12-byte index: (i32 chunk_id, i32 start, i32 end)
+        index_entry = pack_i32(chunk_id) + pack_i32(start_byte) + pack_i32(end_byte)
+        # Index column has elem_size=12, use aligned chunk size for addressing
+        self._inner.append_raw(
+            self._idx_col_id, index_entry, 12, self._idx_chunk_bytes, current_length
+        )
 
         self._length = current_length + 1
 
     def extend(self, values: list) -> None:
-        """Extend with multiple variable-size elements (bytes or structured data)."""
+        """Extend with multiple variable-size elements (v0.4.0+ - optimized in Rust!)."""
         if not values:
             return
 
@@ -596,31 +625,18 @@ class VarSizeColumn(MutableSequence):
 
         current_length = self._get_length()
 
-        # Get current total byte count
-        if current_length == 0:
-            current_bytes = 0
-        else:
-            offset_data = self._inner.read_range(
-                self._idx_col_id, current_length - 1, 1, 8, self._chunk_bytes
-            )
-            current_bytes = unpack_i64(offset_data, 0)
+        # NEW (v0.4.0): Call extend_adaptive - ALL processing in Rust!
+        # Returns packed index data (12 bytes per element)
+        all_index_data = self._inner.extend_adaptive(
+            self._data_col_id,
+            packed_values,
+            self._data_max_chunk,
+        )
 
-        # Pack all data (now uses packed_values from above)
-        all_data = b"".join(packed_values)
-
-        # Calculate prefix sums (using packed sizes)
-        offsets = []
-        running_sum = current_bytes
-        for v in packed_values:
-            running_sum += len(v)
-            offsets.append(running_sum)
-
-        # Pack offsets
-        offset_data = b"".join(pack_i64(o) for o in offsets)
-
-        # Append data and offsets
-        self._inner.append_raw(self._data_col_id, all_data, 1, self._chunk_bytes, current_bytes)
-        self._inner.append_raw(self._idx_col_id, offset_data, 8, self._chunk_bytes, current_length)
+        # Append index data (already packed in Rust!)
+        self._inner.append_raw(
+            self._idx_col_id, all_index_data, 12, self._idx_chunk_bytes, current_length
+        )
 
         self._length = current_length + len(values)
 
@@ -713,9 +729,10 @@ class ColumnVault:
             name, dtype, elem_size, chunk_bytes, self._min_chunk_bytes, self._max_chunk_bytes
         )
 
-        # IMPORTANT: Pass max_chunk_bytes for addressing, not the default chunk_bytes
+        # IMPORTANT: Get the ALIGNED max_chunk_bytes from database (v0.4.0: element-aligned)
+        _, _, _, aligned_max_chunk = self._inner.get_column_info(name)
         col = Column(
-            self._inner, col_id, name, dtype, elem_size, self._max_chunk_bytes, use_rust_packer
+            self._inner, col_id, name, dtype, elem_size, aligned_max_chunk, use_rust_packer
         )
         self._columns[name] = col
         return col
@@ -723,16 +740,21 @@ class ColumnVault:
     def _create_varsize_column(
         self, name: str, dtype: str, chunk_bytes: int, use_rust_packer: bool = True
     ) -> "VarSizeColumn":
-        """Create a variable-size column using two underlying columns."""
+        """Create a variable-size column using adaptive chunking (v0.4.0+)."""
         # Data column stores packed bytes (elem_size=1)
-        # Store the original dtype in the data column's metadata for reconstruction
+        # Store the original dtype in the data column's metadata
         data_col_id = self._inner.create_column(
             f"{name}_data", dtype, 1, chunk_bytes, self._min_chunk_bytes, self._max_chunk_bytes
         )
 
-        # Index column stores prefix sums (i64)
+        # Index column stores 12-byte triples: (i32 chunk_id, i32 start, i32 end)
         idx_col_id = self._inner.create_column(
-            f"{name}_idx", "i64", 8, chunk_bytes, self._min_chunk_bytes, self._max_chunk_bytes
+            f"{name}_idx",
+            "adaptive_idx",
+            12,
+            chunk_bytes,
+            self._min_chunk_bytes,
+            self._max_chunk_bytes,
         )
 
         # IMPORTANT: Pass max_chunk_bytes for addressing

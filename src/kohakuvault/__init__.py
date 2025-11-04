@@ -28,7 +28,7 @@ except ImportError:
     _DATAPACKER_AVAILABLE = False
     DataPacker = None
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = [
     "KVault",
     "Column",

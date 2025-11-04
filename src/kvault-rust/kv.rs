@@ -314,7 +314,7 @@ impl _KVault {
 
         // 3) Open BLOB for incremental write
         let mut blob: Blob = conn
-            .blob_open(rusqlite::DatabaseName::Main, &self.table, "value", rowid, true)
+            .blob_open(rusqlite::DatabaseName::Main, &self.table, "value", rowid, false)
             .map_err(KvError::from)?;
 
         // 4) Copy in chunks
@@ -421,7 +421,7 @@ impl _KVault {
             })?;
 
         let blob: Blob = conn
-            .blob_open(rusqlite::DatabaseName::Main, &self.table, "value", rowid, false)
+            .blob_open(rusqlite::DatabaseName::Main, &self.table, "value", rowid, true)
             .map_err(KvError::from)?;
 
         let mut offset: usize = 0;
