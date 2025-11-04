@@ -38,6 +38,11 @@ temps = cv["temperatures"]
 temps.extend([23.5, 24.1, 25.0])
 print(temps[0])  # 23.5
 
+# High-performance bulk writes with cache (NEW in v0.4.1!)
+with temps.cache():
+    for temp in sensor_readings:
+        temps.append(temp)  # 10-100x faster!
+
 # Structured data (NEW in v0.3.0!)
 cv.create_column("users", "msgpack")
 users = cv["users"]
@@ -77,9 +82,9 @@ unpacked = packer.unpack_many(packed_all, offsets=offsets)
 - **Memory efficient**: Stream multi-GB files, dynamic chunk growth
 - **Type-safe columnar**: Fixed-size (i64, f64, bytes:N) and variable-size (bytes, str, msgpack, cbor)
 - **Rust performance**: Native speed with Pythonic ergonomics
-- **Smart caching**: Auto-flush context manager, daemon thread, capacity enforcement
-- **Structured data**: Store dicts/lists directly with MessagePack/CBOR (NEW in v0.3.0!)
-- **DataPacker**: Rust-based serialization with multi-encoding support (NEW in v0.3.0!)
+- **Smart caching**: Write-back cache for 10-100x faster bulk writes (NEW in v0.4.1!)
+- **Structured data**: Store dicts/lists directly with MessagePack/CBOR (v0.3.0)
+- **DataPacker**: Rust-based serialization with multi-encoding support (v0.3.0)
 
 ## Best Practices
 

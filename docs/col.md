@@ -1,4 +1,4 @@
-# ColumnVault API Reference (v0.4.0)
+# ColumnVault API Reference (v0.4.1)
 
 Complete API documentation for KohakuVault's columnar storage.
 
@@ -339,6 +339,74 @@ if deleted:
 
 **Warning:** This is permanent and cascades to all chunks!
 
+### Cache Methods (v0.4.1)
+
+Write-back cache for high-performance append operations.
+
+#### enable_cache(cap_bytes=64MB, flush_threshold=16MB, flush_interval=None)
+
+Enable cache for ALL columns in vault.
+
+```python
+# Enable with defaults (64MB capacity, 16MB threshold)
+cv.enable_cache()
+
+# Custom sizes
+cv.enable_cache(cap_bytes=128*1024*1024, flush_threshold=32*1024*1024)
+
+# With background daemon (flushes after 5 seconds idle)
+cv.enable_cache(flush_interval=5.0)
+```
+
+**Parameters:**
+- **cap_bytes** (int): Maximum cache size per column (default 64MB). When exceeded, auto-flushes.
+- **flush_threshold** (int): Soft limit for auto-flush (default 16MB)
+- **flush_interval** (float, optional): Enables daemon thread that auto-flushes after idle time
+
+#### flush_cache()
+
+Manually flush all column caches.
+
+```python
+bytes_flushed = cv.flush_cache()
+```
+
+**Returns:** int - Total bytes flushed across all columns
+
+#### disable_cache()
+
+Disable cache (auto-flushes first) and stops daemon thread.
+
+```python
+cv.disable_cache()
+```
+
+#### cache() context manager
+
+Temporary cache enablement with auto-flush on exit.
+
+```python
+with cv.cache(cap_bytes=64<<20):
+    col1.extend(data1)
+    col2.extend(data2)
+    # Auto-flushes here
+```
+
+#### lock_cache() context manager
+
+Prevent daemon flushes during atomic operations.
+
+```python
+with cv.lock_cache():
+    col1.append(value1)
+    col2.append(value2)
+    # Ensures both cached together before daemon flush
+```
+
+**Performance Impact:**
+- **Cached append**: 10-100x faster for small operations
+- **Cached extend**: 2-10x faster (reduces write amplification)
+
 ## Column (Fixed-Size Types)
 
 List-like interface for fixed-size elements.
@@ -410,6 +478,26 @@ col.clear()
 assert len(col) == 0
 ```
 
+#### Cache Methods (v0.4.1)
+
+Per-column cache control (same API as ColumnVault).
+
+```python
+# Enable cache for this column only
+col.enable_cache(cap_bytes=64<<20, flush_threshold=16<<20)
+
+# Context manager
+with col.cache():
+    for i in range(10000):
+        col.append(i)  # 10-100x faster!
+
+# Manual control
+col.flush_cache()  # Returns bytes flushed
+col.disable_cache()
+```
+
+**Note:** Cache auto-flushes before structural operations (insert, delete, clear).
+
 ### Query Methods
 
 ```python
@@ -468,6 +556,10 @@ print(msgs[-1])  # b'x'
 # Iterate
 for msg in msgs:
     print(msg.decode())
+
+# Cache support (v0.4.1) - same API as Column
+with msgs.cache():
+    msgs.extend(large_data_list)  # 2-10x faster
 ```
 
 ### How It Works
