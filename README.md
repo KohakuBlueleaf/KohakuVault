@@ -31,16 +31,43 @@ with vault.cache(64*1024*1024):
 from kohakuvault import ColumnVault
 
 cv = ColumnVault("data.db")
-cv.create_column("temperatures", "f64")
-cv.create_column("messages", "bytes")  # Variable-size
 
+# Primitives
+cv.create_column("temperatures", "f64")
 temps = cv["temperatures"]
 temps.extend([23.5, 24.1, 25.0])
 print(temps[0])  # 23.5
 
-logs = cv["messages"]
-logs.append(b"Server started")
-print(logs[0])  # b'Server started'
+# Structured data (NEW in v0.3.0!)
+cv.create_column("users", "msgpack")
+users = cv["users"]
+users.append({"name": "Alice", "age": 30, "tags": ["vip"]})
+print(users[0])  # {'name': 'Alice', 'age': 30, 'tags': ['vip']}
+
+# Strings with encoding (NEW in v0.3.0!)
+cv.create_column("messages", "str:utf8")
+messages = cv["messages"]
+messages.append("Hello, 世界!")
+print(messages[0])  # 'Hello, 世界!'
+```
+
+**DataPacker** - Rust-based serialization (NEW in v0.3.0!):
+
+```python
+from kohakuvault import DataPacker
+
+# MessagePack for structured data
+packer = DataPacker("msgpack")
+packed = packer.pack({"user": "alice", "score": 95.5})
+data = packer.unpack(packed, 0)
+
+# Bulk operations
+records = [{"id": i, "val": i*1.5} for i in range(1000)]
+packed_all = packer.pack_many(records)  # Concatenated bytes
+
+# Unpack with offsets (for variable-size)
+offsets = [0, len(packer.pack(records[0]))]  # Calculate offsets
+unpacked = packer.unpack_many(packed_all, offsets=offsets)
 ```
 
 ## Features
@@ -48,9 +75,11 @@ print(logs[0])  # b'Server started'
 - **Dual interfaces**: Dict for blobs (KVault), List for sequences (ColumnVault)
 - **Zero external dependencies**: Single SQLite file, no services required
 - **Memory efficient**: Stream multi-GB files, dynamic chunk growth
-- **Type-safe columnar**: Fixed-size (i64, f64, bytes:N) and variable-size (bytes)
+- **Type-safe columnar**: Fixed-size (i64, f64, bytes:N) and variable-size (bytes, str, msgpack, cbor)
 - **Rust performance**: Native speed with Pythonic ergonomics
 - **Smart caching**: Auto-flush context manager, daemon thread, capacity enforcement
+- **Structured data**: Store dicts/lists directly with MessagePack/CBOR (NEW in v0.3.0!)
+- **DataPacker**: Rust-based serialization with multi-encoding support (NEW in v0.3.0!)
 
 ## Best Practices
 
