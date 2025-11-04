@@ -212,9 +212,9 @@ def benchmark_kvault_read(config: BenchmarkConfig):
 
 
 def benchmark_column_append_extend(config: BenchmarkConfig):
-    """Benchmark ColumnVault append vs extend."""
+    """Benchmark ColumnVault append vs extend (with and without cache)."""
     print("\n" + "=" * 80)
-    print("3. ColumnVault Append vs Extend Performance")
+    print("3. ColumnVault Append vs Extend Performance (cached vs uncached)")
     print("=" * 80)
 
     results = []
@@ -231,19 +231,22 @@ def benchmark_column_append_extend(config: BenchmarkConfig):
     for size in config.column_sizes:
         dtypes_to_test.append(f"bytes:{size}")
 
-    # Test configurations
+    # Test configurations: method x cache_enabled
     test_configs = []
     for n_entries in config.entries:
         for dtype in dtypes_to_test:
-            # Use same entry count for both append and extend for fair comparison
-            test_configs.append((n_entries, dtype, "append"))
-            test_configs.append((n_entries, dtype, "extend"))
+            # Test all combinations: append/extend x cached/uncached
+            test_configs.append((n_entries, dtype, "append", False))
+            test_configs.append((n_entries, dtype, "append", True))
+            test_configs.append((n_entries, dtype, "extend", False))
+            test_configs.append((n_entries, dtype, "extend", True))
 
     # Run benchmarks with progress bar
-    for n_entries, dtype, method in tqdm(test_configs, desc="Column Append/Extend"):
+    for n_entries, dtype, method, use_cache in tqdm(test_configs, desc="Column Append/Extend"):
         # Sanitize dtype for filename and column name (replace : with _)
         safe_dtype = dtype.replace(":", "_")
-        db_path = config.get_db_path(f"col_{method}_{n_entries}_{safe_dtype}")
+        cache_str = "cached" if use_cache else "uncached"
+        db_path = config.get_db_path(f"col_{method}_{cache_str}_{n_entries}_{safe_dtype}")
 
         cv = ColumnVault(
             db_path,
@@ -251,6 +254,10 @@ def benchmark_column_append_extend(config: BenchmarkConfig):
             max_chunk_bytes=config.max_chunk_mb * 1024 * 1024,
         )
         col = cv.create_column("test", dtype)
+
+        # Enable cache if requested
+        if use_cache:
+            col.enable_cache(cap_bytes=64 * 1024 * 1024, flush_threshold=16 * 1024 * 1024)
 
         # Prepare data and calculate ACTUAL packed size using DataPacker
         test_packer = DataPacker(dtype)
@@ -285,6 +292,11 @@ def benchmark_column_append_extend(config: BenchmarkConfig):
                 col.append(item)
         else:  # extend
             col.extend(data)
+
+        # Flush cache if enabled
+        if use_cache:
+            col.flush_cache()
+
         elapsed = time.perf_counter() - start
 
         # Checkpoint WAL to get accurate DB size
@@ -301,6 +313,7 @@ def benchmark_column_append_extend(config: BenchmarkConfig):
                 "entries": n_entries,
                 "dtype": dtype,
                 "method": method,
+                "cached": use_cache,
                 "time": elapsed,
                 "ops_per_sec": n_entries / elapsed,
                 "mb_per_sec": mb_per_sec,
@@ -308,20 +321,35 @@ def benchmark_column_append_extend(config: BenchmarkConfig):
             }
         )
 
-    # Print results table with actual encoded data size
+    # Print results table - all methods compared to baseline append
     print(
-        f"\n{'Entries':<10s} {'Type':<18s} {'Method':<10s} {'Time':<12s} {'Ops/Sec':<15s} {'MB/s':<10s} {'Encoded/Entry':<14s} {'DB Size':<12s}"
+        f"\n{'Entries':<10s} {'Type':<18s} {'Method':<20s} {'Time':<12s} {'Ops/Sec':<15s} {'MB/s':<10s} {'vs append':<12s}"
     )
     print("-" * 100)
 
-    # Group by entry count and dtype to show append/extend pairs
+    # Group by entry count and dtype, show: append, append+cache, extend
     for n_entries in config.entries:
         for dtype in dtypes_to_test:
+            # Get all three results
             append_r = next(
                 (
                     r
                     for r in results
-                    if r["dtype"] == dtype and r["method"] == "append" and r["entries"] == n_entries
+                    if r["dtype"] == dtype
+                    and r["method"] == "append"
+                    and r["entries"] == n_entries
+                    and not r["cached"]
+                ),
+                None,
+            )
+            append_cached_r = next(
+                (
+                    r
+                    for r in results
+                    if r["dtype"] == dtype
+                    and r["method"] == "append"
+                    and r["entries"] == n_entries
+                    and r["cached"]
                 ),
                 None,
             )
@@ -329,32 +357,36 @@ def benchmark_column_append_extend(config: BenchmarkConfig):
                 (
                     r
                     for r in results
-                    if r["dtype"] == dtype and r["method"] == "extend" and r["entries"] == n_entries
+                    if r["dtype"] == dtype
+                    and r["method"] == "extend"
+                    and r["entries"] == n_entries
+                    and not r["cached"]
                 ),
                 None,
             )
 
-            if append_r and extend_r:
-                # Get actual encoded size from the result (calculated via DataPacker)
-                # This is stored implicitly - recalculate from mb_per_sec
-                encoded_bytes = (
-                    append_r["mb_per_sec"] * (1024 * 1024) * append_r["time"]
-                ) / append_r["entries"]
-
+            if append_r and append_cached_r and extend_r:
+                # Baseline: append (no cache)
                 print(
-                    f"{append_r['entries']:<10,d} {dtype:<18s} {append_r['method']:<10s} "
+                    f"{append_r['entries']:<10,d} {dtype:<18s} {'append':<20s} "
                     f"{format_time(append_r['time']):<12s} {append_r['ops_per_sec']:<15,.0f} "
-                    f"{append_r['mb_per_sec']:<10.1f} {encoded_bytes:<14.1f} {format_size(append_r['db_size']):<12s}"
+                    f"{append_r['mb_per_sec']:<10.1f} {'1.00x (base)':<12s}"
                 )
 
-                speedup = extend_r["ops_per_sec"] / append_r["ops_per_sec"]
-                encoded_bytes_extend = (
-                    extend_r["mb_per_sec"] * (1024 * 1024) * extend_r["time"]
-                ) / extend_r["entries"]
+                # Cached append - compare to baseline append
+                speedup_cached = append_cached_r["ops_per_sec"] / append_r["ops_per_sec"]
                 print(
-                    f"{extend_r['entries']:<10,d} {dtype:<18s} {extend_r['method']:<10s} "
+                    f"{append_cached_r['entries']:<10,d} {dtype:<18s} {'append (cached)':<20s} "
+                    f"{format_time(append_cached_r['time']):<12s} {append_cached_r['ops_per_sec']:<15,.0f} "
+                    f"{append_cached_r['mb_per_sec']:<10.1f} {speedup_cached:<12.2f}x"
+                )
+
+                # Extend - compare to baseline append
+                speedup_extend = extend_r["ops_per_sec"] / append_r["ops_per_sec"]
+                print(
+                    f"{extend_r['entries']:<10,d} {dtype:<18s} {'extend':<20s} "
                     f"{format_time(extend_r['time']):<12s} {extend_r['ops_per_sec']:<15,.0f} "
-                    f"{extend_r['mb_per_sec']:<10.1f} {encoded_bytes_extend:<14.1f} {format_size(extend_r['db_size']):<12s} ({speedup:.1f}x)"
+                    f"{extend_r['mb_per_sec']:<10.1f} {speedup_extend:<12.2f}x"
                 )
                 print()
 
