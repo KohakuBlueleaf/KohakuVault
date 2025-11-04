@@ -1,10 +1,32 @@
-# ColumnVault API Reference
+# ColumnVault API Reference (v0.4.0)
 
 Complete API documentation for KohakuVault's columnar storage.
 
+## ⚠️ Breaking Changes in v0.4.0
+
+**Incompatible with v0.3.0 databases** - Full redesign for performance
+
+**What Changed:**
+1. **Element-aligned chunks**: Fixed-size columns enforce `chunk_size % elem_size == 0`
+2. **Adaptive variable-size**: New schema with `bytes_used` tracking
+3. **12-byte index**: Variable-size changed from 8-byte offset to (chunk_id, start, end)
+4. **Chunk-wise extend**: Writes entire chunks at once (50-100x faster!)
+5. **No cross-element spanning**: Each element fully contained in one chunk
+
+**Performance Gains:**
+- Variable-size space: **316x improvement** (10 msgpack: 132MB → 416KB)
+- Variable-size extend: **50-100x faster** than append
+- Test runtime: 21s → 6.6s
+
+---
+
 ## Overview
 
-**ColumnVault** provides list-like interfaces for storing typed sequences (timeseries, logs, arrays) with efficient append operations and dynamic chunk growth.
+**ColumnVault** provides list-like interfaces for storing typed sequences (timeseries, logs, arrays) with:
+- **Element-aligned chunks** for fixed-size types (i64, f64, bytes:N)
+- **Adaptive chunking** for variable-size types (bytes, str, msgpack, cbor)
+- **Efficient bulk operations** (extend writes entire chunks at once)
+- **Smart space management** (tracks used vs wasted bytes)
 
 ## ColumnVault (Container)
 
@@ -83,6 +105,191 @@ temps.append(23.5)
 
 **Raises:**
 - `NotFound`: Column doesn't exist
+
+---
+
+## Chunking Algorithms (v0.4.0)
+
+### Fixed-Size Columns (Element-Aligned)
+
+**Constraint:** `chunk_size` must be multiple of `elem_size`
+
+**Auto-Alignment:**
+- `aligned_min = ceil(min / elem_size) × elem_size`
+- `aligned_max = floor(max / elem_size) × elem_size`
+- Error if `aligned_min > aligned_max`
+
+**Example:**
+```
+elem_size=10, min=128KB, max=16MB
+aligned_min = 131,080 bytes (13,108 elements)
+aligned_max = 16,777,210 bytes (1,677,721 elements)
+```
+
+**Benefits:**
+- No elements span chunk boundaries
+- Predictable addressing: `chunk_idx = byte_offset / chunk_size`
+- Simpler, faster reads
+
+### Variable-Size Columns (Adaptive Chunking)
+
+**New Schema (v0.4.0):**
+```sql
+col_chunks:
+- actual_size: Chunk capacity (blob size)
+- bytes_used: Actually used bytes (≤ actual_size)
+- has_deleted: 1 if has deletions (for vacuum)
+- start_elem_idx: First element index in chunk
+- end_elem_idx: Last element index in chunk
+
+Index column (12 bytes per element):
+- i32 chunk_id: Which chunk contains this element
+- i32 start_byte: Start position in chunk
+- i32 end_byte: End position in chunk
+```
+
+**Append Algorithm:**
+
+```python
+needed = len(data)
+chunk_size = current chunk capacity
+used = bytes actually used in chunk
+available = chunk_size - used
+
+# CASE 1: Fits without expansion
+if available >= needed:
+    write_to_chunk()
+    update_bytes_used()
+
+# CASE 2: max - used >= needed (can expand to legal size)
+elif max_chunk_size - used >= needed:
+    legal_size = min_chunk_size × 2^k  # where legal_size - used >= needed
+    expand_to(legal_size)
+    write_to_chunk()
+
+# CASE 3: max - used < needed
+elif chunk_size < max_chunk_size and needed <= max_chunk_size:
+    # 3-1: Not at max yet
+    expand_to(used + needed)
+    write_to_chunk()
+
+elif chunk_size >= max_chunk_size and needed <= max_chunk_size/2:
+    # 3-2: At max, small element (≤ 50% max)
+    expand_to(used + needed)  # Up to 1.5× max allowed
+    write_to_chunk()
+
+else:
+    # 3-3: At max, large element (> 50% max)
+    create_new_chunk()
+    write_to_chunk()
+```
+
+**Extend Algorithm (Optimized - Chunk-Wise Writes):**
+
+```python
+# Step 1: Read last chunk's unused space (if any)
+if last_chunk_has_space:
+    can_add_to_last_chunk = True
+
+# Step 2: Buffer elements until total > max_chunk_size
+buffer = []
+buffer_size = 0
+
+for element in values:
+    if buffer_size + len(element) > max_chunk_size:
+        # Write full chunk at once!
+        chunk_data = concat(buffer)
+        chunk_capacity = find_legal_size(buffer_size)  # min × 2^k
+
+        write_full_chunk(chunk_data, chunk_capacity, buffer_size)
+        build_index_entries(buffer)  # All in Rust!
+
+        buffer = [element]
+        buffer_size = len(element)
+    else:
+        buffer.append(element)
+        buffer_size += len(element)
+
+# Step 3: Write remaining buffer
+if buffer:
+    write_full_chunk(buffer)
+```
+
+**Key Optimization:**
+- **No element-by-element appends** in extend!
+- Writes **entire chunks** at once
+- All packing/indexing done in Rust (1 FFI call)
+- Result: **50-100x faster** than looping append
+
+**Insert Algorithm:**
+
+```python
+# 1. Find insertion point
+(chunk_id, insert_offset) = get_location_from_index(elem_idx)
+
+# 2. Read rest of chunk data after insert point
+rest_data = read_chunk_from(chunk_id, insert_offset)
+
+# 3. Write combined data
+write_to_chunk(chunk_id, insert_offset, new_data + rest_data)
+
+# 4. Update metadata for all elements in chunk after elem_idx
+shift_metadata_in_chunk(chunk_id, elem_idx, len(new_data))
+
+# 5. Check if chunk too large (> 2× max)
+if new_chunk_size > max_chunk_size * 2:
+    split_chunk(chunk_id)  # Split into 2 chunks
+    update_all_indices()
+
+update_bytes_used(chunk_id)
+```
+
+**Benefits:**
+- Supports insertion anywhere
+- Automatic chunk split if too large
+- Maintains chunk locality
+
+**Delete Algorithm:**
+
+```python
+# Just shift index entries (fixed-size operation on 12-byte elements)
+read_remaining_indices()
+write_back_one_position_earlier()
+update_length()
+
+# Don't remove data from chunks (lazy deletion)
+# Actual cleanup happens in vacuum
+```
+
+**Benefits:**
+- Fast deletion (just index manipulation)
+- No chunk rewriting
+- Space reclaimed by vacuum when needed
+
+**Vacuum Algorithm:**
+
+```python
+# 1. Find chunks with has_deleted = 1
+dirty_chunks = query_chunks_with_flag()
+
+# 2. For each dirty chunk
+for chunk_id in dirty_chunks:
+    # Get all valid elements from index (by start_elem_idx, end_elem_idx)
+    elements = query_elements_in_chunk(chunk_id)
+
+    # Rebuild chunk with only valid data
+    new_data = concat(valid_elements)
+    new_chunk_size = len(new_data)
+
+    replace_chunk(chunk_id, new_data, new_chunk_size)
+    update_indices(elements)
+    mark_chunk_clean(chunk_id)
+```
+
+**Benefits:**
+- Reclaims space from deletions
+- Rebuilds fragmented chunks
+- Can be run periodically
 
 #### ensure(name, dtype, chunk_bytes=None)
 

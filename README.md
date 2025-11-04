@@ -333,36 +333,11 @@ SQLite database (bundled)
 git checkout -b feature-name
 # Make changes
 black src/kohakuvault && cargo fmt  # Format
-pytest                               # Test
+cargo clippy                        # Basic linting
+pytest                              # Test
 git commit && git push
 # Open PR
 ```
-
-## Releasing
-
-GitHub Actions automatically builds wheels and publishes to PyPI when you push a tag:
-
-```bash
-# 1. Update version in pyproject.toml and Cargo.toml
-# 2. Commit changes
-git add pyproject.toml Cargo.toml
-git commit -m "Bump version to 0.1.0"
-
-# 3. Create and push tag
-git tag v0.1.0
-git push origin main --tags
-
-# 4. GitHub Actions will:
-#    - Build wheels for all platforms
-#    - Create GitHub Release with wheels attached
-#    - Publish to PyPI (with skip-existing for safety)
-```
-
-**What happens:**
-- Wheels are built for Linux, Windows, macOS (Apple Silicon)
-- All wheels are uploaded to the GitHub Release (downloadable)
-- Wheels are published to PyPI
-- If some wheels already exist on PyPI, they're skipped (no error)
 
 ## License
 
