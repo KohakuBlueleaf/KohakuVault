@@ -1,3 +1,6 @@
+// Allow PyO3-specific false positive warnings
+#![allow(clippy::useless_conversion)]
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyBytesMethods};
 use rusqlite::{params, Connection};
@@ -38,8 +41,8 @@ impl _ColumnVault {
         let conn = Connection::open(path).map_err(ColError::from)?;
 
         // Enable WAL mode for concurrent access
-        let _ = conn.pragma_update(None, "journal_mode", &"WAL");
-        let _ = conn.pragma_update(None, "synchronous", &"NORMAL");
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
 
         // Create schema for columnar storage
         conn.execute_batch(

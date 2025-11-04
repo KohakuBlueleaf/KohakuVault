@@ -1,3 +1,6 @@
+// Allow PyO3-specific false positive warnings
+#![allow(clippy::useless_conversion)]
+
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBytes, PyBytesMethods, PyString, PyStringMethods};
 use rusqlite::blob::Blob;
@@ -125,6 +128,7 @@ impl _KVault {
     /// enable_wal, page_size, mmap_size, cache_pages_kb are tunables
     #[new]
     #[pyo3(signature = (path, table="kv", chunk_size=1<<20, enable_wal=true, page_size=32768, mmap_size=268_435_456, cache_kb=100_000))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         _py: Python<'_>,
         path: &str,
@@ -153,13 +157,13 @@ impl _KVault {
             let _ = conn.execute_batch(&format!("PRAGMA page_size={};", page_size));
         }
         if enable_wal {
-            let _ = conn.pragma_update(None, "journal_mode", &"WAL");
+            let _ = conn.pragma_update(None, "journal_mode", "WAL");
         }
-        let _ = conn.pragma_update(None, "synchronous", &"NORMAL");
-        let _ = conn.pragma_update(None, "mmap_size", &mmap_size);
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        let _ = conn.pragma_update(None, "mmap_size", mmap_size);
         // negative cache_size means KB units
-        let _ = conn.pragma_update(None, "cache_size", &(-cache_kb));
-        let _ = conn.pragma_update(None, "temp_store", &"MEMORY");
+        let _ = conn.pragma_update(None, "cache_size", -cache_kb);
+        let _ = conn.pragma_update(None, "temp_store", "MEMORY");
         let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
 
         // Schema

@@ -3,6 +3,7 @@ Basic KohakuVault Usage Examples
 
 Demonstrates key-value storage with streaming and caching.
 """
+
 import time
 from kohakuvault import KVault
 
@@ -100,7 +101,7 @@ vault2 = KVault("sensors.db")
 vault2.enable_cache(
     cap_bytes=64 * 1024 * 1024,
     flush_threshold=16 * 1024 * 1024,
-    flush_interval=2.0  # Auto-flush every 2 seconds
+    flush_interval=2.0,  # Auto-flush every 2 seconds
 )
 
 print("Writing sensor data with daemon auto-flush...")
