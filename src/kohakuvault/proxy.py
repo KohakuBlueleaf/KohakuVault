@@ -233,13 +233,30 @@ class KVault(Mapping):
         self.close()
 
     def close(self) -> None:
-        """Flush cache, stop daemon thread, and mark as closed."""
+        """Flush cache, checkpoint WAL, stop daemon thread, and mark as closed."""
         if not self._closed:
             try:
                 self._stop_daemon_thread()
                 self.flush_cache()
+                # Checkpoint WAL to main DB file
+                self.checkpoint()
             finally:
                 self._closed = True
+
+    def checkpoint(self) -> None:
+        """
+        Manually checkpoint WAL file to main database.
+
+        This merges the WAL file into the main DB file, preventing
+        the WAL from growing indefinitely. Called automatically on close(),
+        but can be called manually for long-running processes.
+        """
+        if self._closed:
+            return
+        try:
+            self._inner.checkpoint_wal()
+        except Exception:
+            pass  # Ignore checkpoint errors (non-critical)
 
     # ----------------------------
     # Dict-like Interface

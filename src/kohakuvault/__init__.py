@@ -19,12 +19,22 @@ from .errors import (
     IoError,
 )
 
+# Try to import DataPacker (will be available after maturin build)
+try:
+    from ._kvault import DataPacker
+
+    _DATAPACKER_AVAILABLE = True
+except ImportError:
+    _DATAPACKER_AVAILABLE = False
+    DataPacker = None
+
 __version__ = "0.2.2"
 __all__ = [
     "KVault",
     "Column",
     "ColumnVault",
     "VarSizeColumn",
+    "DataPacker",
     "KohakuVaultError",
     "NotFound",
     "DatabaseBusy",

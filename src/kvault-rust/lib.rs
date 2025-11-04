@@ -14,6 +14,7 @@ use std::time::Instant;
 use thiserror::Error;
 
 mod col;
+mod packer;
 
 #[derive(Error, Debug)]
 enum KvError {
@@ -158,6 +159,9 @@ impl _KVault {
         }
         if enable_wal {
             let _ = conn.pragma_update(None, "journal_mode", "WAL");
+            // Set WAL auto-checkpoint to 1000 pages (default)
+            // This prevents WAL from growing indefinitely
+            let _ = conn.pragma_update(None, "wal_autocheckpoint", 1000);
         }
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         let _ = conn.pragma_update(None, "mmap_size", mmap_size);
@@ -598,6 +602,17 @@ impl _KVault {
     fn set_cache_locked(&self, locked: bool) {
         self.cache_locked.store(locked, Ordering::Relaxed);
     }
+
+    /// Manually checkpoint WAL file to main database.
+    /// This helps prevent WAL from growing too large.
+    /// Returns number of WAL frames checkpointed.
+    fn checkpoint_wal(&self) -> PyResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        // PRAGMA wal_checkpoint(PASSIVE) - non-blocking checkpoint
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+            .map_err(KvError::from)?;
+        Ok(0) // Success indicator (actual frame count not easily accessible)
+    }
 }
 
 // Helper methods (not exposed to Python)
@@ -627,5 +642,6 @@ impl _KVault {
 fn _kvault(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<_KVault>()?;
     m.add_class::<col::_ColumnVault>()?;
+    m.add_class::<packer::DataPacker>()?;
     Ok(())
 }

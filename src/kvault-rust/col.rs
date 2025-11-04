@@ -2,7 +2,7 @@
 #![allow(clippy::useless_conversion)]
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyBytesMethods};
+use pyo3::types::{PyBytes, PyBytesMethods, PyList};
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
 use thiserror::Error;
@@ -42,6 +42,9 @@ impl _ColumnVault {
 
         // Enable WAL mode for concurrent access
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        // Set WAL auto-checkpoint to 1000 pages (default)
+        // This prevents WAL from growing indefinitely
+        let _ = conn.pragma_update(None, "wal_autocheckpoint", 1000);
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
 
         // Create schema for columnar storage
@@ -434,6 +437,56 @@ impl _ColumnVault {
             .map_err(ColError::from)?;
 
         Ok(deleted > 0)
+    }
+
+    /// Append value using DataPacker (NEW - typed interface)
+    fn append_typed(
+        &self,
+        col_id: i64,
+        value: &Bound<'_, PyAny>,
+        packer: &crate::packer::DataPacker,
+        chunk_bytes: i64,
+        current_length: i64,
+    ) -> PyResult<()> {
+        // Pack value in Rust
+        let packed_bytes = packer.pack(value.py(), value)?;
+        let py_bytes = packed_bytes.bind(value.py());
+
+        // Get element size from packer
+        let elem_size = packer.elem_size() as i64;
+
+        // Append raw bytes (existing method)
+        self.append_raw(col_id, py_bytes, elem_size, chunk_bytes, current_length)
+    }
+
+    /// Extend with multiple values using DataPacker (NEW - typed interface)
+    fn extend_typed(
+        &self,
+        col_id: i64,
+        values: &Bound<'_, PyList>,
+        packer: &crate::packer::DataPacker,
+        chunk_bytes: i64,
+        current_length: i64,
+    ) -> PyResult<()> {
+        // Pack all values in Rust (single concatenated bytes)
+        let packed_bytes = packer.pack_many(values.py(), values)?;
+        let py_bytes = packed_bytes.bind(values.py());
+
+        let elem_size = packer.elem_size() as i64;
+
+        // Append all at once (existing method)
+        self.append_raw(col_id, py_bytes, elem_size, chunk_bytes, current_length)
+    }
+
+    /// Manually checkpoint WAL file to main database.
+    /// This helps prevent WAL from growing too large.
+    /// Returns success indicator (0 = success).
+    fn checkpoint_wal(&self) -> PyResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        // PRAGMA wal_checkpoint(PASSIVE) - non-blocking checkpoint
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+            .map_err(ColError::from)?;
+        Ok(0) // Success indicator
     }
 }
 
