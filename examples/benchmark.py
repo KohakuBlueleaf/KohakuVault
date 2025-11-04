@@ -1,56 +1,54 @@
 """
-KohakuVault Performance Benchmark Matrix
+KohakuVault Performance Benchmark
 
-Tests performance across multiple dimensions:
-- Storage: In-memory vs Disk
-- Operations: Write, Read, Random Access, Delete
-- Data count: 100, 1K, 10K, 100K
-- Value size: 100B, 1KB, 10KB, 100KB
-- Cache: Disabled, 16MB, 64MB (KVault)
-- Chunk size: Small, Medium, Large (ColumnVault)
+Simplified benchmark suite with configurable parameters.
+Tests: KVault write/read, ColumnVault append/extend/read, DataPacker
 """
 
 import os
 import time
 import tempfile
 import shutil
-from typing import Dict, Any
-from kohakuvault import KVault, ColumnVault
+from typing import List
+from tqdm import tqdm
+from kohakuvault import KVault, ColumnVault, DataPacker
 
 
 # =============================================================================
-# Benchmark Infrastructure
+# Configuration
 # =============================================================================
 
 
-class BenchmarkRunner:
-    """Manages benchmark execution and cleanup."""
+class BenchmarkConfig:
+    """Configurable benchmark parameters."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        entries: List[int] = None,
+        entry_sizes: List[int] = None,
+        cache_sizes_mb: List[int] = None,
+        column_sizes: List[int] = None,  # Column-specific data sizes (for bytes columns)
+    ):
+        # Use sorted(set()) to remove duplicates and sort
+        self.entries = sorted(set(entries or [1000, 10000]))
+        self.entry_sizes = sorted(set(entry_sizes or [1024, 16384]))  # 1KB, 16KB (for KVault)
+        self.cache_sizes_mb = sorted(set(cache_sizes_mb or [0, 64]))  # No cache, 64MB cache
+        self.column_sizes = sorted(set(column_sizes or []))  # Additional column sizes (bytes:N)
         self.temp_dir = tempfile.mkdtemp()
-        self.results = []
 
     def get_db_path(self, name: str) -> str:
-        """Get path for disk-based database."""
+        """Get path for disk database."""
         return os.path.join(self.temp_dir, f"{name}.db")
 
     def cleanup(self):
         """Remove all temporary files."""
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def run(self, func, **params) -> Dict[str, Any]:
-        """Time and execute a benchmark function."""
-        start = time.perf_counter()
-        result = func()
-        elapsed = time.perf_counter() - start
-
-        return {"elapsed": elapsed, "params": params, **result}
-
 
 def format_time(seconds: float) -> str:
     """Format time in appropriate unit."""
     if seconds < 0.001:
-        return f"{seconds*1000000:.0f}µs"
+        return f"{seconds*1000000:.0f}us"
     elif seconds < 1.0:
         return f"{seconds*1000:.1f}ms"
     else:
@@ -67,840 +65,612 @@ def format_size(bytes_val: int) -> str:
 
 
 # =============================================================================
-# KVault Benchmarks
+# 1. KVault Write Benchmarks
 # =============================================================================
 
 
-def bench_kvault_write(
-    storage: str, n_ops: int, value_size: int, cache_mb: int, runner: BenchmarkRunner
-):
-    """Benchmark KVault write operations."""
-    db_path = (
-        ":memory:"
-        if storage == "memory"
-        else runner.get_db_path(f"kv_write_{n_ops}_{value_size}_{cache_mb}")
-    )
-
-    vault = KVault(db_path)
-
-    if cache_mb > 0:
-        vault.enable_cache(
-            cap_bytes=cache_mb * 1024 * 1024, flush_threshold=cache_mb * 1024 * 1024 // 4
-        )
-
-    value = b"x" * value_size
-
-    start = time.perf_counter()
-    for i in range(n_ops):
-        vault[f"k:{i:08d}"] = value
-
-    if cache_mb > 0:
-        vault.flush_cache()
-
-    elapsed = time.perf_counter() - start
-
-    # Get DB size for disk storage
-    db_size = 0
-    if storage == "disk":
-        try:
-            db_size = os.path.getsize(db_path)
-        except:
-            pass
-
-    vault.close()
-
-    return {
-        "ops_per_sec": n_ops / elapsed if elapsed > 0 else 0,
-        "mb_per_sec": (n_ops * value_size) / (1024 * 1024) / elapsed if elapsed > 0 else 0,
-        "db_size": db_size,
-    }
-
-
-def bench_kvault_read(storage: str, n_ops: int, value_size: int, runner: BenchmarkRunner):
-    """Benchmark KVault read operations."""
-    # For memory, use shared memory so it persists across connections
-    # For disk, use regular file path
-    if storage == "memory":
-        db_path = "file::memory:?cache=shared"  # Shared memory database
-    else:
-        db_path = runner.get_db_path(f"kv_read_{n_ops}_{value_size}")
-
-    # Setup - write data
-    vault = KVault(db_path)
-    vault.enable_cache()
-    value = b"x" * value_size
-    for i in range(n_ops):
-        vault[f"k:{i:08d}"] = value
-    vault.flush_cache()
-
-    # For memory storage, keep vault open to preserve data
-    # For disk storage, can close and reopen
-    if storage == "disk":
-        vault.close()
-        vault = KVault(db_path)
-
-    # Benchmark reads
-    start = time.perf_counter()
-
-    for i in range(n_ops):
-        _ = vault[f"k:{i:08d}"]
-
-    elapsed = time.perf_counter() - start
-    vault.close()
-
-    return {
-        "ops_per_sec": n_ops / elapsed if elapsed > 0 else 0,
-        "mb_per_sec": (n_ops * value_size) / (1024 * 1024) / elapsed if elapsed > 0 else 0,
-    }
-
-
-# =============================================================================
-# ColumnVault Benchmarks
-# =============================================================================
-
-
-def bench_column_append(
-    storage: str, n_ops: int, dtype: str, min_kb: int, max_mb: int, runner: BenchmarkRunner
-):
-    """Benchmark ColumnVault individual append operations."""
-    # Use unique path even for memory to avoid conflicts
-    import random
-
-    unique_id = random.randint(100000, 999999)
-    # Use temp files for all benchmarks (memory vs disk just affects analysis)
-    db_path = runner.get_db_path(
-        f"col_append_{storage}_{n_ops}_{dtype}_{min_kb}_{max_mb}_{unique_id}"
-    )
-
-    cv = ColumnVault(db_path, min_chunk_bytes=min_kb * 1024, max_chunk_bytes=max_mb * 1024 * 1024)
-    cv.create_column("test", dtype)
-    col = cv["test"]
-
-    start = time.perf_counter()
-
-    if dtype == "i64":
-        for i in range(n_ops):
-            col.append(i)
-    elif dtype == "f64":
-        for i in range(n_ops):
-            col.append(i * 1.5)
-    elif dtype.startswith("bytes:"):
-        size = int(dtype.split(":")[1])
-        for i in range(n_ops):
-            col.append(b"x" * size)
-    elif dtype == "bytes":
-        for i in range(n_ops):
-            col.append(f"variable_string_{i}".encode())
-
-    elapsed = time.perf_counter() - start
-
-    db_size = 0
-    if storage == "disk":
-        try:
-            db_size = os.path.getsize(db_path)
-        except:
-            pass
-
-    return {"ops_per_sec": n_ops / elapsed if elapsed > 0 else 0, "db_size": db_size}
-
-
-def bench_column_extend(
-    storage: str, n_ops: int, dtype: str, min_kb: int, max_mb: int, runner: BenchmarkRunner
-):
-    """Benchmark ColumnVault bulk extend operations."""
-    import random
-
-    unique_id = random.randint(100000, 999999)
-    db_path = runner.get_db_path(f"col_extend_{storage}_{n_ops}_{dtype}_{unique_id}")
-
-    cv = ColumnVault(db_path, min_chunk_bytes=min_kb * 1024, max_chunk_bytes=max_mb * 1024 * 1024)
-    cv.create_column("test", dtype)
-    col = cv["test"]
-
-    # Prepare data
-    if dtype == "i64":
-        data = list(range(n_ops))
-    elif dtype == "f64":
-        data = [i * 1.5 for i in range(n_ops)]
-    elif dtype.startswith("bytes:"):
-        size = int(dtype.split(":")[1])
-        data = [b"x" * size for _ in range(n_ops)]
-    elif dtype == "bytes":
-        data = [f"variable_string_{i}".encode() for i in range(n_ops)]
-
-    start = time.perf_counter()
-    col.extend(data)
-    elapsed = time.perf_counter() - start
-
-    return {"ops_per_sec": n_ops / elapsed if elapsed > 0 else 0}
-
-
-def bench_column_random_read(
-    storage: str,
-    n_elements: int,
-    n_reads: int,
-    dtype: str,
-    min_kb: int,
-    max_mb: int,
-    runner: BenchmarkRunner,
-):
-    """Benchmark ColumnVault random access reads."""
-    import random
-
-    unique_id = random.randint(100000, 999999)
-    db_path = runner.get_db_path(f"col_randread_{storage}_{n_elements}_{unique_id}")
-
-    # Setup
-    cv = ColumnVault(db_path, min_chunk_bytes=min_kb * 1024, max_chunk_bytes=max_mb * 1024 * 1024)
-    cv.create_column("test", dtype)
-    col = cv["test"]
-
-    if dtype == "i64":
-        col.extend(list(range(n_elements)))
-    elif dtype == "f64":
-        col.extend([i * 1.5 for i in range(n_elements)])
-
-    # Random reads
-    import random
-
-    random.seed(42)
-    indices = [random.randint(0, n_elements - 1) for _ in range(n_reads)]
-
-    start = time.perf_counter()
-    for idx in indices:
-        _ = col[idx]
-    elapsed = time.perf_counter() - start
-
-    return {"ops_per_sec": n_reads / elapsed if elapsed > 0 else 0}
-
-
-# =============================================================================
-# Matrix Benchmark Runner
-# =============================================================================
-
-
-def get_scale_params(scale: str):
-    """Get parameters based on scale level."""
-    if scale == "small":
-        return {
-            "kv_ops": [1000],
-            "kv_large_ops": [],
-            "col_ops": [1000],
-            "col_large_ops": [],
-            "scale_test": [100, 1000],
-        }
-    elif scale == "large":
-        return {
-            "kv_ops": [1000, 10000],
-            "kv_large_ops": [100000],
-            "col_ops": [1000, 10000],
-            "col_large_ops": [100000],
-            "scale_test": [100, 1000, 10000, 100000],
-        }
-    else:  # medium (default)
-        return {
-            "kv_ops": [1000, 10000],
-            "kv_large_ops": [],
-            "col_ops": [1000, 10000],
-            "col_large_ops": [],
-            "scale_test": [100, 1000, 10000],
-        }
-
-
-def run_matrix_benchmark():
-    """Run comprehensive matrix benchmark with default settings."""
-    run_matrix_benchmark_configurable({1, 2, 3, 4, 5, 6, 7}, "medium")
-
-
-def run_matrix_benchmark_configurable(matrices_to_run, scale="medium"):
-    """Run configurable matrix benchmark."""
-    runner = BenchmarkRunner()
-    params = get_scale_params(scale)
-
-    print("=" * 100)
-    print("KohakuVault Performance Benchmark Matrix")
-    print("=" * 100)
-    print()
-
-    # =============================================================================
-    # Matrix 1: KVault Write - Storage × Data Count × Value Size × Cache
-    # =============================================================================
-
-    if 1 in matrices_to_run:
-        print("MATRIX 1: KVault Write Performance")
-    print("-" * 100)
-    print()
-
-    # Comprehensive matrix for different scenarios
-    configs = [
-        # (storage, n_ops, value_size, cache_mb)
-        ("memory", 1000, 100, 0),
-        ("memory", 1000, 100, 64),
-        ("memory", 1000, 1024, 0),
-        ("memory", 1000, 1024, 64),
-        ("memory", 10000, 100, 0),
-        ("memory", 10000, 100, 64),
-        ("memory", 10000, 10240, 0),  # 10KB values
-        ("memory", 10000, 10240, 64),
-        ("disk", 1000, 100, 0),
-        ("disk", 1000, 100, 64),
-        ("disk", 1000, 1024, 0),
-        ("disk", 1000, 1024, 64),
-        ("disk", 1000, 131072, 0),  # 128KB values (image-like)
-        ("disk", 10000, 1024, 0),
-        ("disk", 10000, 1024, 0),
-        ("disk", 100000, 1024, 0),  # 100K ops
-    ]
-
-    kv_write_results = []
-    for storage, n_ops, value_size, cache_mb in configs:
-        result = runner.run(
-            lambda s=storage, n=n_ops, v=value_size, c=cache_mb: bench_kvault_write(
-                s, n, v, c, runner
-            ),
-            storage=storage,
-            n_ops=n_ops,
-            value_size=value_size,
-            cache_mb=cache_mb,
-        )
-        kv_write_results.append(result)
-
-    # Print table
-    print(
-        f"{'Storage':<8s} {'Ops':<8s} {'ValSize':<8s} {'Cache':<8s} {'Time':<12s} {'Ops/Sec':<12s} {'MB/s':<10s} {'DB Size':<10s}"
-    )
-    print("-" * 100)
-    for r in kv_write_results:
-        p = r["params"]
-        cache_str = f"{p['cache_mb']}MB" if p["cache_mb"] > 0 else "No"
-        db_size_str = format_size(r["db_size"]) if r["db_size"] > 0 else "-"
-        print(
-            f"{p['storage']:<8s} {p['n_ops']:<8,d} {format_size(p['value_size']):<8s} {cache_str:<8s} "
-            f"{format_time(r['elapsed']):<12s} {r['ops_per_sec']:<12,.0f} {r['mb_per_sec']:<10.1f} {db_size_str:<10s}"
-        )
-
-    print()
-
-    # =============================================================================
-    # Matrix 2: KVault Read - Storage × Data Count × Value Size
-    # =============================================================================
-
-    print("MATRIX 2: KVault Read Performance")
-    print("-" * 100)
-    print()
-
-    read_configs = [
-        ("memory", 1000, 100),
-        ("memory", 1000, 1024),
-        ("memory", 10000, 100),
-        ("memory", 10000, 1024),
-        ("memory", 10000, 10240),  # 10KB values
-        ("disk", 1000, 100),
-        ("disk", 1000, 1024),
-        ("disk", 10000, 1024),
-        ("disk", 10000, 10240),
-        ("disk", 100000, 1024),  # 100K ops
-    ]
-
-    kv_read_results = []
-    for storage, n_ops, value_size in read_configs:
-        result = runner.run(
-            lambda s=storage, n=n_ops, v=value_size: bench_kvault_read(s, n, v, runner),
-            storage=storage,
-            n_ops=n_ops,
-            value_size=value_size,
-        )
-        kv_read_results.append(result)
-
-    print(
-        f"{'Storage':<8s} {'Ops':<8s} {'ValSize':<8s} {'Time':<12s} {'Ops/Sec':<12s} {'MB/s':<10s}"
-    )
-    print("-" * 100)
-    for r in kv_read_results:
-        p = r["params"]
-        print(
-            f"{p['storage']:<8s} {p['n_ops']:<8,d} {format_size(p['value_size']):<8s} "
-            f"{format_time(r['elapsed']):<12s} {r['ops_per_sec']:<12,.0f} {r['mb_per_sec']:<10.1f}"
-        )
-
-    print()
-
-    # =============================================================================
-    # Matrix 3: ColumnVault Append - Storage × Data Count × Dtype × Chunk Size
-    # =============================================================================
-
-    print("MATRIX 3: ColumnVault Append Performance")
-    print("-" * 100)
-    print()
-
-    col_append_configs = [
-        # (storage, n_ops, dtype, min_kb, max_mb)
-        ("memory", 1000, "i64", 16, 1),  # Tiny chunks
-        ("memory", 1000, "i64", 128, 16),  # Default chunks
-        ("memory", 1000, "i64", 512, 64),  # Large chunks
-        ("memory", 10000, "i64", 16, 1),
-        ("memory", 10000, "i64", 128, 16),
-        ("memory", 10000, "i64", 512, 64),
-        ("memory", 100000, "i64", 128, 16),  # 100K scale test
-        ("disk", 1000, "i64", 128, 16),
-        ("disk", 10000, "i64", 128, 16),
-        ("disk", 10000, "f64", 128, 16),
-        ("disk", 10000, "bytes:32", 128, 16),
-        ("disk", 1000, "bytes:131072", 128, 16),  # Large data (image-like)
-        ("disk", 1000, "bytes", 128, 16),  # Variable size
-        ("disk", 100000, "i64", 128, 16),  # 100K scale test on disk
-    ]
-
-    col_append_results = []
-    for storage, n_ops, dtype, min_kb, max_mb in col_append_configs:
-        result = runner.run(
-            lambda s=storage, n=n_ops, d=dtype, mi=min_kb, ma=max_mb: bench_column_append(
-                s, n, d, mi, ma, runner
-            ),
-            storage=storage,
-            n_ops=n_ops,
-            dtype=dtype,
-            min_kb=min_kb,
-            max_mb=max_mb,
-        )
-        col_append_results.append(result)
-
-    print(
-        f"{'Storage':<8s} {'Ops':<8s} {'Type':<12s} {'Chunks':<15s} {'Time':<12s} {'Ops/Sec':<12s} {'DB Size':<10s}"
-    )
-    print("-" * 100)
-    for r in col_append_results:
-        p = r["params"]
-        chunk_str = f"{p['min_kb']}KB-{p['max_mb']}MB"
-        db_size_str = format_size(r["db_size"]) if r["db_size"] > 0 else "-"
-        print(
-            f"{p['storage']:<8s} {p['n_ops']:<8,d} {p['dtype']:<12s} {chunk_str:<15s} "
-            f"{format_time(r['elapsed']):<12s} {r['ops_per_sec']:<12,.0f} {db_size_str:<10s}"
-        )
-
-    print()
-
-    # =============================================================================
-    # Matrix 4: ColumnVault Extend vs Append
-    # =============================================================================
-
-    print("MATRIX 4: ColumnVault Extend (bulk) vs Append (individual)")
-    print("-" * 100)
-    print()
-
-    extend_configs = [
-        ("memory", 1000, "i64", 128, 16),
-        ("memory", 10000, "i64", 128, 16),
-        ("memory", 100000, "i64", 128, 16),  # 100K ops
-        ("disk", 1000, "i64", 128, 16),
-        ("disk", 10000, "i64", 128, 16),
-        ("disk", 100000, "i64", 128, 16),  # 100K ops
-    ]
-
-    print(
-        f"{'Storage':<8s} {'Ops':<8s} {'Method':<10s} {'Time':<12s} {'Ops/Sec':<12s} {'Speedup':<10s}"
-    )
-    print("-" * 100)
-
-    for storage, n_ops, dtype, min_kb, max_mb in extend_configs:
-        # Append
-        append_result = runner.run(
-            lambda s=storage, n=n_ops, d=dtype, mi=min_kb, ma=max_mb: bench_column_append(
-                s, n, d, mi, ma, runner
-            ),
-            storage=storage,
-            n_ops=n_ops,
-            dtype=dtype,
-        )
-
-        # Extend
-        extend_result = runner.run(
-            lambda s=storage, n=n_ops, d=dtype, mi=min_kb, ma=max_mb: bench_column_extend(
-                s, n, d, mi, ma, runner
-            ),
-            storage=storage,
-            n_ops=n_ops,
-            dtype=dtype,
-        )
-
-        speedup = (
-            extend_result["ops_per_sec"] / append_result["ops_per_sec"]
-            if append_result["ops_per_sec"] > 0
-            else 0
-        )
-
-        print(
-            f"{storage:<8s} {n_ops:<8,d} {'append':<10s} {format_time(append_result['elapsed']):<12s} {append_result['ops_per_sec']:<12,.0f} {'-':<10s}"
-        )
-        print(
-            f"{storage:<8s} {n_ops:<8,d} {'extend':<10s} {format_time(extend_result['elapsed']):<12s} {extend_result['ops_per_sec']:<12,.0f} {speedup:<10.1f}x"
-        )
-        print()
-
-    # =============================================================================
-    # Matrix 5: ColumnVault Random Read - Chunk Size Impact
-    # =============================================================================
-
-    print("MATRIX 5: ColumnVault Random Read Performance")
-    print("-" * 100)
-    print()
-
-    rand_configs = [
-        ("memory", 10000, 1000, "i64", 16, 1),
-        ("memory", 10000, 1000, "i64", 128, 16),
-        ("memory", 10000, 1000, "i64", 512, 64),
-        ("memory", 100000, 5000, "i64", 128, 16),  # Larger scale
-        ("disk", 10000, 1000, "i64", 16, 1),
-        ("disk", 10000, 1000, "i64", 128, 16),
-        ("disk", 10000, 1000, "i64", 512, 64),
-        ("disk", 100000, 5000, "i64", 128, 16),  # Larger scale
-    ]
-
-    col_read_results = []
-    for storage, n_elements, n_reads, dtype, min_kb, max_mb in rand_configs:
-        result = runner.run(
-            lambda s=storage, ne=n_elements, nr=n_reads, d=dtype, mi=min_kb, ma=max_mb: bench_column_random_read(
-                s, ne, nr, d, mi, ma, runner
-            ),
-            storage=storage,
-            n_elements=n_elements,
-            n_reads=n_reads,
-            chunk_config=f"{min_kb}KB-{max_mb}MB",
-        )
-        col_read_results.append(result)
-
-    print(
-        f"{'Storage':<8s} {'Elements':<10s} {'Reads':<8s} {'Chunks':<15s} {'Time':<12s} {'Reads/Sec':<12s} {'µs/Read':<10s}"
-    )
-    print("-" * 100)
-    for r in col_read_results:
-        p = r["params"]
-        time_per_read = (r["elapsed"] / p["n_reads"] * 1000000) if p["n_reads"] > 0 else 0
-        print(
-            f"{p['storage']:<8s} {p['n_elements']:<10,d} {p['n_reads']:<8,d} {p['chunk_config']:<15s} "
-            f"{format_time(r['elapsed']):<12s} {r['ops_per_sec']:<12,.0f} {time_per_read:<10.1f}"
-        )
-
-    print()
-
-    # =============================================================================
-    # Matrix 6: Data Type Comparison (same conditions)
-    # =============================================================================
-
-    print("MATRIX 6: Data Type Performance Comparison (disk, default chunks)")
-    print("-" * 100)
-    print()
-
-    # Adjust operation count based on data size to keep runtime reasonable
-    dtype_configs = [
-        ("i64", 10000),
-        ("f64", 10000),
-        ("bytes:32", 10000),
-        ("bytes:100", 10000),
-        ("bytes:1024", 10000),
-        ("bytes:10240", 1000),  # 10KB - document-like (fewer ops)
-        ("bytes:131072", 100),  # 128KB - image-like (much fewer ops)
-        ("bytes", 10000),  # Variable
-    ]
-
-    dtype_results = []
-    for dtype, n_ops in dtype_configs:
-        result = runner.run(
-            lambda d=dtype, n=n_ops: bench_column_append("disk", n, d, 128, 16, runner),
-            dtype=dtype,
-            n_ops=n_ops,
-        )
-        dtype_results.append(result)
-
-    print(
-        f"{'Type':<15s} {'Ops':<8s} {'Time':<12s} {'Ops/Sec':<12s} {'DB Size':<10s} {'Bytes/Elem':<12s} {'MB/s':<10s}"
-    )
-    print("-" * 100)
-    for i, r in enumerate(dtype_results):
-        dtype, n_ops = dtype_configs[i]
-        elem_size = (
-            8 if dtype in ["i64", "f64"] else (int(dtype.split(":")[1]) if ":" in dtype else 20)
-        )
-        elem_size_str = str(elem_size) if isinstance(elem_size, int) else "~20"
-        mb_per_sec = (n_ops * elem_size) / (1024 * 1024) / r["elapsed"] if r["elapsed"] > 0 else 0
-        print(
-            f"{dtype:<15s} {n_ops:<8,d} {format_time(r['elapsed']):<12s} {r['ops_per_sec']:<12,.0f} "
-            f"{format_size(r['db_size']):<10s} {elem_size_str:<12s} {mb_per_sec:<10.1f}"
-        )
-
-    print()
-
-    # =============================================================================
-    # Matrix 7: Scale Test - How performance changes with data volume
-    # =============================================================================
-
-    print("MATRIX 7: Scale Test - ColumnVault i64 append (disk, 128KB-16MB chunks)")
-    print("-" * 100)
-    print()
-
-    scale_configs = [100, 1000, 10000, 100000]
-
-    scale_results = []
-    for n in scale_configs:
-        result = runner.run(
-            lambda nn=n: bench_column_append("disk", nn, "i64", 128, 16, runner), n_ops=n
-        )
-        scale_results.append(result)
-
-    print(f"{'N Elements':<12s} {'Time':<12s} {'Ops/Sec':<12s} {'Time/Op':<12s} {'DB Size':<10s}")
-    print("-" * 100)
-    for i, r in enumerate(scale_results):
-        n = scale_configs[i]
-        time_per_op = r["elapsed"] / n if n > 0 else 0
-        print(
-            f"{n:<12,d} {format_time(r['elapsed']):<12s} {r['ops_per_sec']:<12,.0f} "
-            f"{format_time(time_per_op):<12s} {format_size(r['db_size']):<10s}"
-        )
-
-    print()
-
-    # =============================================================================
-    # Summary Analysis
-    # =============================================================================
-
-    print("=" * 100)
-    print("SUMMARY ANALYSIS")
-    print("=" * 100)
-    print()
-
-    # Cache impact
-    mem_nocache = [
-        r
-        for r in kv_write_results
-        if r["params"]["storage"] == "memory"
-        and r["params"]["cache_mb"] == 0
-        and r["params"]["n_ops"] == 1000
-        and r["params"]["value_size"] == 1024
-    ][0]
-    mem_cache = [
-        r
-        for r in kv_write_results
-        if r["params"]["storage"] == "memory"
-        and r["params"]["cache_mb"] == 64
-        and r["params"]["n_ops"] == 1000
-        and r["params"]["value_size"] == 1024
-    ][0]
-    cache_speedup = mem_cache["ops_per_sec"] / mem_nocache["ops_per_sec"]
-
-    print(f"1. Cache Impact (KVault):")
-    print(f"   - Without cache: {mem_nocache['ops_per_sec']:,.0f} ops/s")
-    print(f"   - With 64MB cache: {mem_cache['ops_per_sec']:,.0f} ops/s")
-    print(f"   - Speedup: {cache_speedup:.1f}x")
-    print()
-
-    # Storage impact
-    disk_result = [
-        r
-        for r in kv_write_results
-        if r["params"]["storage"] == "disk"
-        and r["params"]["n_ops"] == 1000
-        and r["params"]["value_size"] == 1024
-        and r["params"]["cache_mb"] == 64
-    ][0]
-    storage_ratio = mem_cache["ops_per_sec"] / disk_result["ops_per_sec"]
-    print(f"2. Storage Impact (KVault with cache):")
-    print(f"   - Memory: {mem_cache['ops_per_sec']:,.0f} ops/s")
-    print(f"   - Disk: {disk_result['ops_per_sec']:,.0f} ops/s")
-    print(f"   - Memory is {storage_ratio:.1f}x faster")
-    print()
-
-    # Value size impact
-    small_val = [
-        r
-        for r in kv_write_results
-        if r["params"]["storage"] == "memory"
-        and r["params"]["n_ops"] == 1000
-        and r["params"]["value_size"] == 100
-        and r["params"]["cache_mb"] == 0
-    ][0]
-    large_val = [
-        r
-        for r in kv_write_results
-        if r["params"]["storage"] == "memory"
-        and r["params"]["n_ops"] == 1000
-        and r["params"]["value_size"] == 1024
-        and r["params"]["cache_mb"] == 0
-    ][0]
-    print(f"3. Value Size Impact (KVault, memory, no cache):")
-    print(
-        f"   - 100B values: {small_val['ops_per_sec']:,.0f} ops/s ({small_val['mb_per_sec']:.1f} MB/s)"
-    )
-    print(
-        f"   - 1KB values: {large_val['ops_per_sec']:,.0f} ops/s ({large_val['mb_per_sec']:.1f} MB/s)"
-    )
-    print(f"   - MB/s ratio: {large_val['mb_per_sec'] / small_val['mb_per_sec']:.1f}x")
-    print()
-
-    # Extend vs Append (from Matrix 4 results already computed)
-    append_disk_10k = None
-    extend_disk_10k = None
-    for storage, n_ops, dtype, min_kb, max_mb in extend_configs:
-        if storage == "disk" and n_ops == 10000:
-            # Find from already computed results
-            for r in col_append_results:
-                if (
-                    r["params"]["storage"] == "disk"
-                    and r["params"]["n_ops"] == 10000
-                    and r["params"]["dtype"] == "i64"
-                    and r["params"].get("min_kb", 128) == 128
-                ):
-                    append_disk_10k = r
-                    break
-            break
-
-    # Check if we have the comparison data from Matrix 4
-    print(f"4. Bulk vs Individual (ColumnVault, 10K i64 on disk):")
-    print(f"   - See Matrix 4 for detailed comparison")
-    print(f"   - Bulk extend is typically 50-200x faster than individual append")
-
-    # Chunk size impact on append
-    tiny_chunk = [
-        r
-        for r in col_append_results
-        if r["params"]["storage"] == "memory"
-        and r["params"]["n_ops"] == 10000
-        and r["params"]["min_kb"] == 16
-    ][0]
-    default_chunk = [
-        r
-        for r in col_append_results
-        if r["params"]["storage"] == "memory"
-        and r["params"]["n_ops"] == 10000
-        and r["params"]["min_kb"] == 128
-    ][0]
-    large_chunk = [
-        r
-        for r in col_append_results
-        if r["params"]["storage"] == "memory"
-        and r["params"]["n_ops"] == 10000
-        and r["params"]["min_kb"] == 512
-    ][0]
-
-    print(f"5. Chunk Size Impact (ColumnVault, 10K i64 append, memory):")
-    print(f"   - Tiny (16KB-1MB): {tiny_chunk['ops_per_sec']:,.0f} ops/s")
-    print(f"   - Default (128KB-16MB): {default_chunk['ops_per_sec']:,.0f} ops/s")
-    print(f"   - Large (512KB-64MB): {large_chunk['ops_per_sec']:,.0f} ops/s")
-    print(
-        f"   - Default is {default_chunk['ops_per_sec']/tiny_chunk['ops_per_sec']:.1f}x faster than tiny"
-    )
-    print()
-
-    # Scale analysis
-    print(f"6. Scalability (ColumnVault i64 append on disk):")
-    for i, n in enumerate(scale_configs):
-        r = scale_results[i]
-        time_per_op = r["elapsed"] / n if n > 0 else 0
-        print(
-            f"   - {n:>7,d} ops: {r['ops_per_sec']:>10,.0f} ops/s  ({format_time(time_per_op)}/op)  DB: {format_size(r['db_size'])}"
-        )
-    print()
-
-    # Large data handling
-    print(f"7. Large Data Handling (disk, default chunks):")
-    large_data_results = [r for r in dtype_results if r["params"]["dtype"] in ["bytes:131072"]]
-    if large_data_results:
-        r = large_data_results[0]
-        n_ops = r["params"]["n_ops"]
-        total_mb = (n_ops * 131072) / (1024 * 1024)
-        mb_per_sec = total_mb / r["elapsed"] if r["elapsed"] > 0 else 0
-        print(f"   - bytes:131072 (128KB/element): {r['ops_per_sec']:,.0f} ops/s")
-        print(f"   - Total data: {total_mb:.1f} MB written in {format_time(r['elapsed'])}")
-        print(f"   - Throughput: {mb_per_sec:.1f} MB/s")
-    print()
-
-    # Cleanup
-    runner.cleanup()
-
-    print("=" * 100)
-    print("Benchmark completed!")
-    print("=" * 100)
-
-
-# =============================================================================
-# Quick Benchmark (Faster)
-# =============================================================================
-
-
-def run_quick_benchmark():
-    """Quick benchmark with essential comparisons."""
-    runner = BenchmarkRunner()
-
-    print("=" * 100)
-    print("KohakuVault Quick Benchmark")
-    print("=" * 100)
-    print()
+def benchmark_kvault_write(config: BenchmarkConfig):
+    """Benchmark KVault write with/without cache."""
+    print("\n" + "=" * 80)
+    print("1. KVault Write Performance (with/without cache)")
+    print("=" * 80)
 
     results = []
 
-    # KVault comparisons
-    print("Testing KVault...")
-    r1 = runner.run(
-        lambda: bench_kvault_write("memory", 5000, 1024, 0, runner),
-        name="KVault write (memory, no cache)",
-    )
-    r2 = runner.run(
-        lambda: bench_kvault_write("memory", 5000, 1024, 64, runner),
-        name="KVault write (memory, 64MB cache)",
-    )
-    r3 = runner.run(
-        lambda: bench_kvault_write("disk", 5000, 1024, 64, runner),
-        name="KVault write (disk, 64MB cache)",
-    )
-    r4 = runner.run(
-        lambda: bench_kvault_read("disk", 5000, 1024, runner), name="KVault read (disk)"
-    )
+    # Generate test configurations
+    test_configs = []
+    for n_entries in config.entries:
+        for entry_size in config.entry_sizes:
+            for cache_mb in config.cache_sizes_mb:
+                test_configs.append((n_entries, entry_size, cache_mb))
 
-    results.extend([r1, r2, r3, r4])
+    # Run benchmarks with progress bar
+    for n_entries, entry_size, cache_mb in tqdm(test_configs, desc="KVault Write"):
+        db_path = config.get_db_path(f"kv_write_{n_entries}_{entry_size}_{cache_mb}")
 
-    # ColumnVault comparisons
-    print("Testing ColumnVault...")
-    r5 = runner.run(
-        lambda: bench_column_append("memory", 10000, "i64", 128, 16, runner),
-        name="Column append i64 (memory)",
-    )
-    r6 = runner.run(
-        lambda: bench_column_extend("memory", 10000, "i64", 128, 16, runner),
-        name="Column extend i64 (memory)",
-    )
-    r7 = runner.run(
-        lambda: bench_column_append("disk", 10000, "i64", 128, 16, runner),
-        name="Column append i64 (disk)",
-    )
-    r8 = runner.run(
-        lambda: bench_column_random_read("disk", 10000, 1000, "i64", 128, 16, runner),
-        name="Column random read (disk)",
-    )
+        vault = KVault(db_path)
 
-    results.extend([r5, r6, r7, r8])
+        if cache_mb > 0:
+            vault.enable_cache(
+                cap_bytes=cache_mb * 1024 * 1024, flush_threshold=cache_mb * 1024 * 1024 // 4
+            )
 
-    print()
-    print("-" * 100)
-    print(f"{'Benchmark':<45s} {'Time':<12s} {'Ops/Sec':<12s}")
-    print("-" * 100)
-    for r in results:
-        print(
-            f"{r['params']['name']:<45s} {format_time(r['elapsed']):<12s} {r['ops_per_sec']:<12,.0f}"
+        value = b"x" * entry_size
+
+        # Benchmark write
+        start = time.perf_counter()
+        for i in range(n_entries):
+            vault[f"k:{i:08d}"] = value
+
+        if cache_mb > 0:
+            vault.flush_cache()
+
+        # Force WAL checkpoint to get accurate DB size
+        vault.checkpoint()
+
+        elapsed = time.perf_counter() - start
+        vault.close()
+
+        # Get DB size
+        db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+
+        results.append(
+            {
+                "entries": n_entries,
+                "entry_size": entry_size,
+                "cache_mb": cache_mb,
+                "time": elapsed,
+                "ops_per_sec": n_entries / elapsed,
+                "mb_per_sec": (n_entries * entry_size) / (1024 * 1024) / elapsed,
+                "db_size": db_size,
+            }
         )
 
-    print()
+    # Print results table
+    print(
+        f"\n{'Entries':<10s} {'Size':<10s} {'Cache':<10s} {'Time':<12s} {'Ops/Sec':<15s} {'MB/s':<10s} {'DB Size':<12s}"
+    )
+    print("-" * 80)
+    for r in results:
+        cache_str = f"{r['cache_mb']}MB" if r["cache_mb"] > 0 else "Disabled"
+        print(
+            f"{r['entries']:<10,d} {format_size(r['entry_size']):<10s} {cache_str:<10s} "
+            f"{format_time(r['time']):<12s} {r['ops_per_sec']:<15,.0f} {r['mb_per_sec']:<10.1f} "
+            f"{format_size(r['db_size']):<12s}"
+        )
 
-    # Key insights
-    cache_speedup = r2["ops_per_sec"] / r1["ops_per_sec"]
-    extend_speedup = r6["ops_per_sec"] / r5["ops_per_sec"]
 
-    print("Key Insights:")
-    print(f"  - Cache speedup: {cache_speedup:.1f}x")
-    print(f"  - Bulk extend vs individual append: {extend_speedup:.1f}x")
-    print(f"  - Memory vs disk (with cache): {r2['ops_per_sec']/r3['ops_per_sec']:.1f}x")
-    print()
+# =============================================================================
+# 2. KVault Read Benchmarks
+# =============================================================================
 
-    runner.cleanup()
-    print("Quick benchmark completed!")
+
+def benchmark_kvault_read(config: BenchmarkConfig):
+    """Benchmark KVault read performance."""
+    print("\n" + "=" * 80)
+    print("2. KVault Read Performance")
+    print("=" * 80)
+
+    results = []
+
+    # Generate test configurations
+    test_configs = []
+    for n_entries in config.entries:
+        for entry_size in config.entry_sizes:
+            test_configs.append((n_entries, entry_size))
+
+    # Run benchmarks with progress bar
+    for n_entries, entry_size in tqdm(test_configs, desc="KVault Read"):
+        db_path = config.get_db_path(f"kv_read_{n_entries}_{entry_size}")
+
+        # Setup: Write data first
+        vault = KVault(db_path)
+        vault.enable_cache()
+        value = b"x" * entry_size
+        for i in range(n_entries):
+            vault[f"k:{i:08d}"] = value
+        vault.flush_cache()
+        vault.close()
+
+        # Reopen and benchmark reads
+        vault = KVault(db_path)
+
+        start = time.perf_counter()
+        for i in range(n_entries):
+            _ = vault[f"k:{i:08d}"]
+        elapsed = time.perf_counter() - start
+
+        vault.close()
+
+        results.append(
+            {
+                "entries": n_entries,
+                "entry_size": entry_size,
+                "time": elapsed,
+                "ops_per_sec": n_entries / elapsed,
+                "mb_per_sec": (n_entries * entry_size) / (1024 * 1024) / elapsed,
+            }
+        )
+
+    # Print results table
+    print(f"\n{'Entries':<10s} {'Size':<10s} {'Time':<12s} {'Ops/Sec':<15s} {'MB/s':<10s}")
+    print("-" * 80)
+    for r in results:
+        print(
+            f"{r['entries']:<10,d} {format_size(r['entry_size']):<10s} "
+            f"{format_time(r['time']):<12s} {r['ops_per_sec']:<15,.0f} {r['mb_per_sec']:<10.1f}"
+        )
+
+
+# =============================================================================
+# 3. ColumnVault Append/Extend Benchmarks
+# =============================================================================
+
+
+def benchmark_column_append_extend(config: BenchmarkConfig):
+    """Benchmark ColumnVault append vs extend."""
+    print("\n" + "=" * 80)
+    print("3. ColumnVault Append vs Extend Performance")
+    print("=" * 80)
+
+    results = []
+
+    # Always test i64, f64, small bytes, small string, msgpack, and user-specified sizes
+    dtypes_to_test = [
+        "i64",
+        "f64",
+        "bytes:32",  # Small fixed bytes (~32 bytes)
+        "str:32:utf8",  # Small fixed string (32 bytes)
+        "str:utf8",  # Variable string
+        "msgpack",  # Structured data
+    ]
+    for size in config.column_sizes:
+        dtypes_to_test.append(f"bytes:{size}")
+
+    # Test configurations
+    test_configs = []
+    for n_entries in config.entries:
+        for dtype in dtypes_to_test:
+            # Use same entry count for both append and extend for fair comparison
+            test_configs.append((n_entries, dtype, "append"))
+            test_configs.append((n_entries, dtype, "extend"))
+
+    # Run benchmarks with progress bar
+    for n_entries, dtype, method in tqdm(test_configs, desc="Column Append/Extend"):
+        # Sanitize dtype for filename and column name (replace : with _)
+        safe_dtype = dtype.replace(":", "_")
+        db_path = config.get_db_path(f"col_{method}_{n_entries}_{safe_dtype}")
+
+        cv = ColumnVault(db_path)
+        col = cv.create_column("test", dtype)
+
+        # Prepare data and calculate ACTUAL packed size using DataPacker
+        test_packer = DataPacker(dtype)
+
+        if dtype == "i64":
+            data = list(range(n_entries))
+        elif dtype == "f64":
+            data = [float(i) * 1.5 for i in range(n_entries)]
+        elif dtype.startswith("bytes:"):
+            size = int(dtype.split(":")[1])
+            data = [b"x" * size for _ in range(n_entries)]
+        elif dtype.startswith("str:") and ":" in dtype[4:]:  # str:N:encoding
+            # Fixed-size string
+            data = [f"str_{i:04d}" for i in range(n_entries)]
+        elif dtype.startswith("str:"):
+            # Variable-size string
+            data = [f"string_{i}" for i in range(n_entries)]
+        elif dtype == "msgpack":
+            # Structured data
+            data = [{"id": i, "val": i * 1.5} for i in range(n_entries)]
+        else:
+            data = list(range(n_entries))
+
+        # Calculate actual packed size using DataPacker
+        sample_packed = test_packer.pack(data[0])
+        elem_size = len(sample_packed)  # ACTUAL encoded size
+
+        # Benchmark
+        start = time.perf_counter()
+        if method == "append":
+            for item in data:
+                col.append(item)
+        else:  # extend
+            col.extend(data)
+        elapsed = time.perf_counter() - start
+
+        # Checkpoint WAL to get accurate DB size
+        cv.checkpoint()
+
+        db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+
+        # Calculate throughput using actual encoded data size
+        total_bytes = n_entries * elem_size  # Use actual packed size from DataPacker
+        mb_per_sec = (total_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+
+        results.append(
+            {
+                "entries": n_entries,
+                "dtype": dtype,
+                "method": method,
+                "time": elapsed,
+                "ops_per_sec": n_entries / elapsed,
+                "mb_per_sec": mb_per_sec,
+                "db_size": db_size,
+            }
+        )
+
+    # Print results table with actual encoded data size
+    print(
+        f"\n{'Entries':<10s} {'Type':<18s} {'Method':<10s} {'Time':<12s} {'Ops/Sec':<15s} {'MB/s':<10s} {'Encoded/Entry':<14s} {'DB Size':<12s}"
+    )
+    print("-" * 100)
+
+    # Group by entry count and dtype to show append/extend pairs
+    for n_entries in config.entries:
+        for dtype in dtypes_to_test:
+            append_r = next(
+                (
+                    r
+                    for r in results
+                    if r["dtype"] == dtype and r["method"] == "append" and r["entries"] == n_entries
+                ),
+                None,
+            )
+            extend_r = next(
+                (
+                    r
+                    for r in results
+                    if r["dtype"] == dtype and r["method"] == "extend" and r["entries"] == n_entries
+                ),
+                None,
+            )
+
+            if append_r and extend_r:
+                # Get actual encoded size from the result (calculated via DataPacker)
+                # This is stored implicitly - recalculate from mb_per_sec
+                encoded_bytes = (
+                    append_r["mb_per_sec"] * (1024 * 1024) * append_r["time"]
+                ) / append_r["entries"]
+
+                print(
+                    f"{append_r['entries']:<10,d} {dtype:<18s} {append_r['method']:<10s} "
+                    f"{format_time(append_r['time']):<12s} {append_r['ops_per_sec']:<15,.0f} "
+                    f"{append_r['mb_per_sec']:<10.1f} {encoded_bytes:<14.1f} {format_size(append_r['db_size']):<12s}"
+                )
+
+                speedup = extend_r["ops_per_sec"] / append_r["ops_per_sec"]
+                encoded_bytes_extend = (
+                    extend_r["mb_per_sec"] * (1024 * 1024) * extend_r["time"]
+                ) / extend_r["entries"]
+                print(
+                    f"{extend_r['entries']:<10,d} {dtype:<18s} {extend_r['method']:<10s} "
+                    f"{format_time(extend_r['time']):<12s} {extend_r['ops_per_sec']:<15,.0f} "
+                    f"{extend_r['mb_per_sec']:<10.1f} {encoded_bytes_extend:<14.1f} {format_size(extend_r['db_size']):<12s} ({speedup:.1f}x)"
+                )
+                print()
+
+
+# =============================================================================
+# 4. ColumnVault Read Benchmarks
+# =============================================================================
+
+
+def benchmark_column_read(config: BenchmarkConfig):
+    """Benchmark ColumnVault read and read_range."""
+    print("\n" + "=" * 80)
+    print("4. ColumnVault Read Performance (single & range)")
+    print("=" * 80)
+
+    results = []
+
+    # Test i64, f64, bytes, strings, msgpack
+    dtypes_to_test = [
+        ("i64", 8),
+        ("f64", 8),
+        ("bytes:32", 32),
+        ("str:32:utf8", 32),
+        ("str:utf8", 10),  # Variable, ~10 bytes average
+        ("msgpack", 32),  # Variable, ~32 bytes average
+    ]
+
+    # Test configurations
+    test_configs = []
+    for n_entries in config.entries:
+        for dtype, elem_size in dtypes_to_test:
+            test_configs.append((n_entries, dtype, elem_size, "single"))
+            test_configs.append((n_entries, dtype, elem_size, "range"))
+
+    # Run benchmarks with progress bar
+    for n_entries, dtype, elem_size, read_type in tqdm(test_configs, desc="Column Read"):
+        # Sanitize dtype for filename
+        safe_dtype = dtype.replace(":", "_")
+        db_path = config.get_db_path(f"col_read_{n_entries}_{safe_dtype}_{read_type}")
+
+        # Setup: Create and populate column
+        cv = ColumnVault(db_path)
+        col = cv.create_column("test", dtype)
+
+        # Populate with appropriate data
+        if dtype == "i64":
+            col.extend(list(range(n_entries)))
+        elif dtype == "f64":
+            col.extend([float(i) * 1.5 for i in range(n_entries)])
+        elif dtype == "bytes:32":
+            col.extend([b"x" * 32 for _ in range(n_entries)])
+        elif dtype == "str:32:utf8":
+            col.extend([f"str_{i:04d}" for _ in range(n_entries)])
+        elif dtype == "str:utf8":
+            col.extend([f"string_{i}" for i in range(n_entries)])
+        elif dtype == "msgpack":
+            col.extend([{"id": i, "val": i * 1.5} for i in range(n_entries)])
+
+        # Benchmark reads
+        n_reads = min(n_entries, 1000)  # Read subset for large datasets
+
+        start = time.perf_counter()
+        if read_type == "single":
+            # Random single reads
+            import random
+
+            random.seed(42)
+            for _ in range(n_reads):
+                idx = random.randint(0, n_entries - 1)
+                _ = col[idx]
+        else:  # range
+            # Sequential range reads
+            chunk_size = 100
+            for start_idx in range(0, n_reads, chunk_size):
+                end_idx = min(start_idx + chunk_size, n_entries)
+                for i in range(start_idx, end_idx):
+                    _ = col[i]
+
+        elapsed = time.perf_counter() - start
+
+        # Calculate throughput
+        total_bytes = n_reads * elem_size
+        mb_per_sec = (total_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+        kb_per_sec = (total_bytes / 1024) / elapsed if elapsed > 0 else 0
+
+        results.append(
+            {
+                "entries": n_entries,
+                "dtype": dtype,
+                "elem_size": elem_size,
+                "read_type": read_type,
+                "n_reads": n_reads,
+                "time": elapsed,
+                "ops_per_sec": n_reads / elapsed,
+                "mb_per_sec": mb_per_sec,
+                "kb_per_sec": kb_per_sec,
+            }
+        )
+
+    # Print results table
+    print(
+        f"\n{'Entries':<10s} {'Type':<18s} {'Read Type':<12s} {'Reads':<10s} {'Time':<12s} {'Reads/Sec':<15s} {'KB/s':<10s}"
+    )
+    print("-" * 90)
+    for r in results:
+        # Add size info to dtype display
+        dtype_display = r["dtype"]
+        if r["dtype"] == "msgpack":
+            dtype_display = "msgpack(~32B)"
+        elif r["dtype"] == "str:utf8":
+            dtype_display = "str:utf8(~10B)"
+        elif r["dtype"].startswith("str:"):
+            size = r["dtype"].split(":")[1]
+            dtype_display = f"str:{size}B"
+
+        # Use KB/s for small data, MB/s for large
+        throughput = r["kb_per_sec"] if r["elem_size"] <= 32 else r["mb_per_sec"] * 1024
+        print(
+            f"{r['entries']:<10,d} {dtype_display:<18s} {r['read_type']:<12s} {r['n_reads']:<10,d} "
+            f"{format_time(r['time']):<12s} {r['ops_per_sec']:<15,.0f} {throughput:<10.1f}"
+        )
+
+
+# =============================================================================
+# 5. DataPacker Benchmarks
+# =============================================================================
+
+
+def benchmark_datapacker(config: BenchmarkConfig):
+    """Benchmark DataPacker pack/unpack performance."""
+    print("\n" + "=" * 80)
+    print("5. DataPacker Performance (pack/unpack/pack_many/unpack_many)")
+    print("=" * 80)
+
+    results = []
+
+    # Test different data types
+    packer_types = [
+        ("i64", lambda i: i),
+        ("f64", lambda i: float(i)),
+        ("bytes:128", lambda i: b"x" * 128),
+        ("str:utf8", lambda i: f"string_{i}"),
+        ("msgpack", lambda i: {"id": i, "name": f"item_{i}", "value": i * 1.5}),
+    ]
+
+    n_ops = 10000  # Fixed for packer tests
+
+    for dtype, data_gen in tqdm(packer_types, desc="DataPacker"):
+        packer = DataPacker(dtype)
+
+        # Test pack
+        data = [data_gen(i) for i in range(n_ops)]
+
+        start = time.perf_counter()
+        for item in data:
+            _ = packer.pack(item)
+        pack_elapsed = time.perf_counter() - start
+
+        # Test pack_many (works for ALL types now)
+        start = time.perf_counter()
+        packed_all = packer.pack_many(data)
+        pack_many_elapsed = time.perf_counter() - start
+
+        # Test unpack
+        packed_data = [packer.pack(item) for item in data]
+
+        start = time.perf_counter()
+        for packed in packed_data:
+            _ = packer.unpack(packed, 0)
+        unpack_elapsed = time.perf_counter() - start
+
+        # Test unpack_many
+        unpack_many_elapsed = None
+        if packer.is_varsize:
+            # For variable-size, calculate offsets
+            offsets = []
+            pos = 0
+            for packed in packed_data:
+                offsets.append(pos)
+                pos += len(packed)
+
+            start = time.perf_counter()
+            _ = packer.unpack_many(packed_all, offsets=offsets)
+            unpack_many_elapsed = time.perf_counter() - start
+        else:
+            # For fixed-size, use count
+            start = time.perf_counter()
+            _ = packer.unpack_many(packed_all, count=n_ops)
+            unpack_many_elapsed = time.perf_counter() - start
+
+        results.append(
+            {
+                "dtype": dtype,
+                "pack_time": pack_elapsed,
+                "pack_ops_per_sec": n_ops / pack_elapsed,
+                "pack_many_time": pack_many_elapsed,
+                "pack_many_ops_per_sec": n_ops / pack_many_elapsed,
+                "unpack_time": unpack_elapsed,
+                "unpack_ops_per_sec": n_ops / unpack_elapsed,
+                "unpack_many_time": unpack_many_elapsed,
+                "unpack_many_ops_per_sec": (
+                    n_ops / unpack_many_elapsed if unpack_many_elapsed else None
+                ),
+            }
+        )
+
+    # Print timing results
+    print(
+        f"\n{'Type':<20s} {'Encoded Size':<15s} {'pack()':<12s} {'pack_many':<12s} {'unpack()':<12s} {'unpack_many':<12s}"
+    )
+    print("-" * 90)
+    for r in results:
+        # Get actual encoded size for first element
+        dtype = r["dtype"]
+        packer = DataPacker(dtype)
+
+        # Generate sample data to measure size
+        if dtype == "i64":
+            sample = 0
+        elif dtype == "f64":
+            sample = 0.0
+        elif dtype == "bytes:128":
+            sample = b"x" * 128
+        elif dtype == "str:utf8":
+            sample = "string_0"
+        elif dtype == "msgpack":
+            sample = {"id": 0, "name": "item_0", "value": 0.0}
+
+        sample_packed = packer.pack(sample)
+        encoded_size = len(sample_packed)
+
+        print(
+            f"{dtype:<20s} "
+            f"{encoded_size:<15d} "
+            f"{format_time(r['pack_time']):<12s} "
+            f"{format_time(r['pack_many_time']):<12s} "
+            f"{format_time(r['unpack_time']):<12s} "
+            f"{format_time(r['unpack_many_time']):<12s}"
+        )
+
+    print(
+        f"\n{'Type':<20s} {'pack/s':<15s} {'pack_many/s':<15s} {'unpack/s':<15s} {'unpack_many/s':<15s}"
+    )
+    print("-" * 90)
+    for r in results:
+        print(
+            f"{r['dtype']:<20s} "
+            f"{r['pack_ops_per_sec']:<15,.0f} "
+            f"{r['pack_many_ops_per_sec']:<15,.0f} "
+            f"{r['unpack_ops_per_sec']:<15,.0f} "
+            f"{r['unpack_many_ops_per_sec']:<15,.0f}"
+        )
+
+
+# =============================================================================
+# Main Benchmark Runner
+# =============================================================================
+
+
+def run_benchmark(
+    entries: List[int] = None,
+    entry_sizes: List[int] = None,
+    cache_sizes_mb: List[int] = None,
+    column_sizes: List[int] = None,
+):
+    """
+    Run comprehensive benchmark suite.
+
+    Parameters
+    ----------
+    entries : List[int]
+        Number of entries to test, e.g., [1000, 10000]
+    entry_sizes : List[int]
+        Entry sizes in bytes for KVault, e.g., [1024, 16384]
+    cache_sizes_mb : List[int]
+        Cache sizes in MB, e.g., [0, 64]
+    column_sizes : List[int]
+        Additional column data sizes (bytes:N), e.g., [128, 1024]
+    """
+    config = BenchmarkConfig(entries, entry_sizes, cache_sizes_mb, column_sizes)
+
+    print("=" * 80)
+    print("KohakuVault Performance Benchmark")
+    print("=" * 80)
+    print(f"\nConfiguration:")
+    print(f"  Entries: {config.entries}")
+    print(f"  Entry sizes (KVault): {[format_size(s) for s in config.entry_sizes]}")
+    print(f"  Cache sizes: {config.cache_sizes_mb} MB")
+    print(
+        f"  Column sizes: i64, f64"
+        + (
+            f", bytes:[{', '.join(str(s) for s in config.column_sizes)}]"
+            if config.column_sizes
+            else ""
+        )
+    )
+    print(f"  Temp dir: {config.temp_dir}")
+
+    try:
+        # Run all benchmark suites
+        benchmark_kvault_write(config)
+        benchmark_kvault_read(config)
+        benchmark_column_append_extend(config)
+        benchmark_column_read(config)
+        benchmark_datapacker(config)
+
+        print("\n" + "=" * 80)
+        print("Benchmark Complete!")
+        print("=" * 80)
+
+    finally:
+        config.cleanup()
+        print(f"\nCleaned up temp directory: {config.temp_dir}")
+
+
+def run_quick_benchmark():
+    """Quick benchmark with minimal configurations."""
+    print("Running quick benchmark (use custom parameters for full test)...\n")
+    run_benchmark(
+        entries=[1000],
+        entry_sizes=[1024],
+        cache_sizes_mb=[0, 64],
+        column_sizes=[],  # Just i64/f64
+    )
 
 
 if __name__ == "__main__":
@@ -911,74 +681,61 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python benchmark.py                          # Quick benchmark
-  python benchmark.py --full                   # Full benchmark (all matrices)
-  python benchmark.py --kvault-only            # Only KVault tests
-  python benchmark.py --column-only            # Only ColumnVault tests
-  python benchmark.py --scale small            # Small scale (faster)
-  python benchmark.py --scale medium           # Medium scale (default)
-  python benchmark.py --scale large            # Large scale (slower)
-  python benchmark.py --skip-matrix 5 6        # Skip matrices 5 and 6
-  python benchmark.py --full --scale small     # Full test with small scale
+  python benchmark.py                                    # Quick benchmark
+  python benchmark.py --entries 1000 10000              # Custom entry counts
+  python benchmark.py --sizes 1024 16384 65536          # KVault entry sizes
+  python benchmark.py --cache 0 16 64                    # Custom cache sizes
+  python benchmark.py --column-sizes 128 1024 16384     # Test bytes:128, bytes:1024, bytes:16384
+  python benchmark.py --entries 10000 --column-sizes 4096  # Specific config
         """,
     )
 
     parser.add_argument(
-        "--full", action="store_true", help="Run full matrix benchmark (default: quick benchmark)"
-    )
-
-    parser.add_argument(
-        "--kvault-only", action="store_true", help="Only run KVault benchmarks (matrices 1-2)"
-    )
-
-    parser.add_argument(
-        "--column-only", action="store_true", help="Only run ColumnVault benchmarks (matrices 3-7)"
-    )
-
-    parser.add_argument(
-        "--scale",
-        choices=["small", "medium", "large"],
-        default="medium",
-        help="Scale of tests: small (fast), medium (default), large (comprehensive)",
-    )
-
-    parser.add_argument(
-        "--skip-matrix", type=int, nargs="+", metavar="N", help="Skip specific matrix numbers (1-7)"
-    )
-
-    parser.add_argument(
-        "--only-matrix",
+        "--entries",
         type=int,
         nargs="+",
-        metavar="N",
-        help="Only run specific matrix numbers (1-7)",
+        default=[1000, 10000],
+        help="Number of entries to test (default: 1000 10000)",
+    )
+
+    parser.add_argument(
+        "--sizes",
+        type=int,
+        nargs="+",
+        default=[1024, 16384],
+        help="Entry sizes in bytes (default: 1024 16384)",
+    )
+
+    parser.add_argument(
+        "--cache",
+        type=int,
+        nargs="+",
+        default=[0, 64],
+        help="Cache sizes in MB (default: 0 64)",
+    )
+
+    parser.add_argument(
+        "--column-sizes",
+        type=int,
+        nargs="*",
+        default=[],
+        help="Additional column data sizes for bytes:N testing (default: just i64/f64)",
+    )
+
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Run quick benchmark with minimal config",
     )
 
     args = parser.parse_args()
 
-    # Determine which matrices to run
-    if args.only_matrix:
-        matrices_to_run = set(args.only_matrix)
-    else:
-        matrices_to_run = {1, 2, 3, 4, 5, 6, 7}
-
-    if args.skip_matrix:
-        matrices_to_run -= set(args.skip_matrix)
-
-    if args.kvault_only:
-        matrices_to_run &= {1, 2}
-
-    if args.column_only:
-        matrices_to_run &= {3, 4, 5, 6, 7}
-
-    # Run appropriate benchmark
-    if args.full:
-        print(f"Running FULL matrix benchmark (scale: {args.scale})...")
-        print(f"Matrices to run: {sorted(matrices_to_run)}")
-        print()
-        run_matrix_benchmark_configurable(matrices_to_run, args.scale)
-    else:
-        print("Running quick benchmark...")
-        print("(Use --full for comprehensive matrix, --help for options)")
-        print()
+    if args.quick:
         run_quick_benchmark()
+    else:
+        run_benchmark(
+            entries=args.entries,
+            entry_sizes=args.sizes,
+            cache_sizes_mb=args.cache,
+            column_sizes=args.column_sizes,
+        )
