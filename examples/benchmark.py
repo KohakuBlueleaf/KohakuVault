@@ -28,12 +28,16 @@ class BenchmarkConfig:
         entry_sizes: List[int] = None,
         cache_sizes_mb: List[int] = None,
         column_sizes: List[int] = None,  # Column-specific data sizes (for bytes columns)
+        min_chunk_kb: int = 16,  # Minimum chunk size in KB (default 16KB)
+        max_chunk_mb: int = 16,  # Maximum chunk size in MB (default 16MB)
     ):
         # Use sorted(set()) to remove duplicates and sort
         self.entries = sorted(set(entries or [1000, 10000]))
         self.entry_sizes = sorted(set(entry_sizes or [1024, 16384]))  # 1KB, 16KB (for KVault)
         self.cache_sizes_mb = sorted(set(cache_sizes_mb or [0, 64]))  # No cache, 64MB cache
         self.column_sizes = sorted(set(column_sizes or []))  # Additional column sizes (bytes:N)
+        self.min_chunk_kb = min_chunk_kb  # Min chunk size (default 16KB)
+        self.max_chunk_mb = max_chunk_mb  # Max chunk size (default 16MB)
         self.temp_dir = tempfile.mkdtemp()
 
     def get_db_path(self, name: str) -> str:
@@ -241,7 +245,11 @@ def benchmark_column_append_extend(config: BenchmarkConfig):
         safe_dtype = dtype.replace(":", "_")
         db_path = config.get_db_path(f"col_{method}_{n_entries}_{safe_dtype}")
 
-        cv = ColumnVault(db_path)
+        cv = ColumnVault(
+            db_path,
+            min_chunk_bytes=config.min_chunk_kb * 1024,
+            max_chunk_bytes=config.max_chunk_mb * 1024 * 1024,
+        )
         col = cv.create_column("test", dtype)
 
         # Prepare data and calculate ACTUAL packed size using DataPacker
@@ -387,8 +395,12 @@ def benchmark_column_read(config: BenchmarkConfig):
         safe_dtype = dtype.replace(":", "_")
         db_path = config.get_db_path(f"col_read_{n_entries}_{safe_dtype}_{read_type}")
 
-        # Setup: Create and populate column
-        cv = ColumnVault(db_path)
+        # Setup: Create and populate column with configured chunk sizes
+        cv = ColumnVault(
+            db_path,
+            min_chunk_bytes=config.min_chunk_kb * 1024,
+            max_chunk_bytes=config.max_chunk_mb * 1024 * 1024,
+        )
         col = cv.create_column("test", dtype)
 
         # Populate with appropriate data
@@ -611,6 +623,8 @@ def run_benchmark(
     entry_sizes: List[int] = None,
     cache_sizes_mb: List[int] = None,
     column_sizes: List[int] = None,
+    min_chunk_kb: int = 16,
+    max_chunk_mb: int = 16,
 ):
     """
     Run comprehensive benchmark suite.
@@ -625,8 +639,14 @@ def run_benchmark(
         Cache sizes in MB, e.g., [0, 64]
     column_sizes : List[int]
         Additional column data sizes (bytes:N), e.g., [128, 1024]
+    min_chunk_kb : int
+        Minimum chunk size in KB (default: 16)
+    max_chunk_mb : int
+        Maximum chunk size in MB (default: 16)
     """
-    config = BenchmarkConfig(entries, entry_sizes, cache_sizes_mb, column_sizes)
+    config = BenchmarkConfig(
+        entries, entry_sizes, cache_sizes_mb, column_sizes, min_chunk_kb, max_chunk_mb
+    )
 
     print("=" * 80)
     print("KohakuVault Performance Benchmark")
@@ -635,6 +655,7 @@ def run_benchmark(
     print(f"  Entries: {config.entries}")
     print(f"  Entry sizes (KVault): {[format_size(s) for s in config.entry_sizes]}")
     print(f"  Cache sizes: {config.cache_sizes_mb} MB")
+    print(f"  Column chunk: {config.min_chunk_kb}KB - {config.max_chunk_mb}MB")
     print(
         f"  Column sizes: i64, f64"
         + (
@@ -670,6 +691,8 @@ def run_quick_benchmark():
         entry_sizes=[1024],
         cache_sizes_mb=[0, 64],
         column_sizes=[],  # Just i64/f64
+        min_chunk_kb=16,  # 16KB
+        max_chunk_mb=16,  # 16MB
     )
 
 
@@ -686,6 +709,7 @@ Examples:
   python benchmark.py --sizes 1024 16384 65536          # KVault entry sizes
   python benchmark.py --cache 0 16 64                    # Custom cache sizes
   python benchmark.py --column-sizes 128 1024 16384     # Test bytes:128, bytes:1024, bytes:16384
+  python benchmark.py --min-chunk 128 --max-chunk 64    # 128KB min, 64MB max chunks
   python benchmark.py --entries 10000 --column-sizes 4096  # Specific config
         """,
     )
@@ -723,6 +747,20 @@ Examples:
     )
 
     parser.add_argument(
+        "--min-chunk",
+        type=int,
+        default=16,
+        help="Minimum chunk size in KB (default: 16)",
+    )
+
+    parser.add_argument(
+        "--max-chunk",
+        type=int,
+        default=16,
+        help="Maximum chunk size in MB (default: 16)",
+    )
+
+    parser.add_argument(
         "--quick",
         action="store_true",
         help="Run quick benchmark with minimal config",
@@ -738,4 +776,6 @@ Examples:
             entry_sizes=args.sizes,
             cache_sizes_mb=args.cache,
             column_sizes=args.column_sizes,
+            min_chunk_kb=args.min_chunk,
+            max_chunk_mb=args.max_chunk,
         )

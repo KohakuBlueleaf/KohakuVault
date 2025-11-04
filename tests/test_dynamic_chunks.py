@@ -16,6 +16,7 @@ from kohakuvault import ColumnVault
 # Test parameters: small chunks to observe growth behavior
 MIN_CHUNK = 16  # 16 bytes
 MAX_CHUNK = 1024  # 1KB
+MAX_CHUNK_VARSIZE = 4096  # 4KB for varsize (v0.4.0: elements must fit in max)
 
 
 def test_fixed_column_append_with_dynamic_chunks():
@@ -202,7 +203,8 @@ def test_fixed_bytes_column_with_dynamic_chunks():
 
 def test_varsize_bytes_append_with_dynamic_chunks():
     """Test variable-size bytes column with dynamic chunking."""
-    cv = ColumnVault(":memory:", min_chunk_bytes=MIN_CHUNK, max_chunk_bytes=MAX_CHUNK)
+    # v0.4.0: Use larger max for varsize
+    cv = ColumnVault(":memory:", min_chunk_bytes=MIN_CHUNK, max_chunk_bytes=MAX_CHUNK_VARSIZE)
 
     cv.create_column("strings", "bytes")
     col = cv["strings"]
@@ -225,7 +227,8 @@ def test_varsize_bytes_append_with_dynamic_chunks():
 
 def test_varsize_bytes_extend_with_dynamic_chunks():
     """Test extending variable-size bytes column."""
-    cv = ColumnVault(":memory:", min_chunk_bytes=MIN_CHUNK, max_chunk_bytes=MAX_CHUNK)
+    # v0.4.0: Use larger max for varsize
+    cv = ColumnVault(":memory:", min_chunk_bytes=MIN_CHUNK, max_chunk_bytes=MAX_CHUNK_VARSIZE)
 
     cv.create_column("data", "bytes")
     col = cv["data"]
@@ -248,7 +251,8 @@ def test_varsize_bytes_extend_with_dynamic_chunks():
 
 def test_varsize_bytes_iteration_with_dynamic_chunks():
     """Test iteration over variable-size bytes with dynamic chunking."""
-    cv = ColumnVault(":memory:", min_chunk_bytes=MIN_CHUNK, max_chunk_bytes=MAX_CHUNK)
+    # v0.4.0: Use larger max for varsize
+    cv = ColumnVault(":memory:", min_chunk_bytes=MIN_CHUNK, max_chunk_bytes=MAX_CHUNK_VARSIZE)
 
     cv.create_column("items", "bytes")
     col = cv["items"]
@@ -264,19 +268,21 @@ def test_varsize_bytes_iteration_with_dynamic_chunks():
 
 def test_varsize_bytes_empty_and_large():
     """Test variable-size bytes with empty strings and large strings."""
-    cv = ColumnVault(":memory:", min_chunk_bytes=MIN_CHUNK, max_chunk_bytes=MAX_CHUNK)
+    # v0.4.0: Use larger max for varsize since elements must fit in max_chunk_bytes
+    cv = ColumnVault(":memory:", min_chunk_bytes=MIN_CHUNK, max_chunk_bytes=MAX_CHUNK_VARSIZE)
 
     cv.create_column("mixed", "bytes")
     col = cv["mixed"]
 
     # Mix of empty, small, and large strings
+    # v0.4.0: Elements must fit in max_chunk_bytes (4KB)
     test_data = [
         b"",
         b"small",
-        b"x" * 500,  # Larger than max chunk
+        b"x" * 500,  # Medium
         b"",
         b"medium_size_string_here",
-        b"y" * 2000,  # Much larger than max chunk
+        b"y" * 2000,  # Large but fits in 4KB
         b"",
         b"tiny",
     ]
@@ -291,7 +297,8 @@ def test_varsize_bytes_empty_and_large():
 
 def test_multiple_columns_same_vault():
     """Test multiple columns in same vault with dynamic chunking."""
-    cv = ColumnVault(":memory:", min_chunk_bytes=MIN_CHUNK, max_chunk_bytes=MAX_CHUNK)
+    # v0.4.0: Use larger max for varsize columns
+    cv = ColumnVault(":memory:", min_chunk_bytes=MIN_CHUNK, max_chunk_bytes=MAX_CHUNK_VARSIZE)
 
     # Create multiple columns
     cv.create_column("ints", "i64")
