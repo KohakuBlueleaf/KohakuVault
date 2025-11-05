@@ -65,8 +65,10 @@ pub enum PackerDType {
     /// Raw bytes with optional fixed size
     Bytes { fixed_size: Option<usize> },
 
-    /// MessagePack serialization (schema-less)
-    MessagePack,
+    /// MessagePack serialization with optional fixed size
+    /// - None: variable-size (grows/shrinks with data)
+    /// - Some(n): fixed n bytes (error if exceeds, pad if smaller)
+    MessagePack { fixed_size: Option<usize> },
 
     /// MessagePack with JSON Schema validation
     #[cfg(feature = "schema-validation")]
@@ -75,8 +77,11 @@ pub enum PackerDType {
         compiled_schema: std::sync::Arc<jsonschema::JSONSchema>,
     },
 
-    /// CBOR serialization (optionally with CDDL schema)
-    Cbor { schema: Option<String> },
+    /// CBOR serialization with optional fixed size
+    Cbor {
+        schema: Option<String>,
+        fixed_size: Option<usize>,
+    },
 }
 
 impl PackerDType {
@@ -135,9 +140,32 @@ impl PackerDType {
                 Ok(Self::Bytes { fixed_size })
             }
 
-            "msgpack" | "messagepack" => Ok(Self::MessagePack),
+            "msgpack" | "messagepack" => {
+                // Parse: "msgpack" or "msgpack:128"
+                let fixed_size = if parts.len() > 1 {
+                    Some(parts[1].parse().map_err(|_| {
+                        PackerError::InvalidDtype(format!("Invalid size: {}", parts[1]))
+                    })?)
+                } else {
+                    None
+                };
+                Ok(Self::MessagePack { fixed_size })
+            }
 
-            "cbor" => Ok(Self::Cbor { schema: None }),
+            "cbor" => {
+                // Parse: "cbor" or "cbor:128"
+                let fixed_size = if parts.len() > 1 {
+                    Some(parts[1].parse().map_err(|_| {
+                        PackerError::InvalidDtype(format!("Invalid size: {}", parts[1]))
+                    })?)
+                } else {
+                    None
+                };
+                Ok(Self::Cbor {
+                    schema: None,
+                    fixed_size,
+                })
+            }
 
             _ => Err(PackerError::InvalidDtype(format!("Unknown dtype: {}", dtype_str))),
         }
@@ -152,10 +180,12 @@ impl PackerDType {
             Self::String { fixed_size: None, .. } => 0,
             Self::Bytes { fixed_size: Some(size) } => *size,
             Self::Bytes { fixed_size: None } => 0,
-            Self::MessagePack => 0,
+            Self::MessagePack { fixed_size: Some(size) } => *size,
+            Self::MessagePack { fixed_size: None } => 0,
             #[cfg(feature = "schema-validation")]
             Self::MessagePackValidated { .. } => 0,
-            Self::Cbor { .. } => 0,
+            Self::Cbor { fixed_size: Some(size), .. } => *size,
+            Self::Cbor { fixed_size: None, .. } => 0,
         }
     }
 
@@ -217,7 +247,12 @@ impl DataPacker {
     #[staticmethod]
     #[pyo3(signature = (schema=None))]
     fn with_cddl_schema(schema: Option<&str>) -> PyResult<Self> {
-        Ok(Self { dtype: PackerDType::Cbor { schema: schema.map(|s| s.to_string()) } })
+        Ok(Self {
+            dtype: PackerDType::Cbor {
+                schema: schema.map(|s| s.to_string()),
+                fixed_size: None,
+            },
+        })
     }
 
     /// Pack single value to bytes
@@ -352,14 +387,28 @@ impl DataPacker {
                 pack_bytes(&bytes, *fixed_size)
             }
 
-            PackerDType::MessagePack => pack_messagepack(value),
+            PackerDType::MessagePack { fixed_size } => {
+                let bytes = pack_messagepack(value)?;
+                if let Some(size) = fixed_size {
+                    pack_bytes(&bytes, Some(*size))
+                } else {
+                    Ok(bytes)
+                }
+            }
 
             #[cfg(feature = "schema-validation")]
             PackerDType::MessagePackValidated { schema: _schema, compiled_schema } => {
                 pack_messagepack_validated(value, compiled_schema)
             }
 
-            PackerDType::Cbor { schema } => pack_cbor(value, schema.as_deref()),
+            PackerDType::Cbor { schema, fixed_size } => {
+                let bytes = pack_cbor(value, schema.as_deref())?;
+                if let Some(size) = fixed_size {
+                    pack_bytes(&bytes, Some(*size))
+                } else {
+                    Ok(bytes)
+                }
+            }
         }
     }
 
@@ -389,12 +438,38 @@ impl DataPacker {
 
             PackerDType::Bytes { fixed_size } => unpack_bytes(py, data, offset, *fixed_size),
 
-            PackerDType::MessagePack => unpack_messagepack(py, &data[offset..]),
+            PackerDType::MessagePack { fixed_size } => {
+                if let Some(size) = fixed_size {
+                    // Fixed-size: read exact bytes
+                    if offset + size > data.len() {
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Not enough data"));
+                    }
+                    // MessagePack is self-delimiting, so just try to decode
+                    // The deserializer will stop at the end of the msgpack data
+                    unpack_messagepack(py, &data[offset..offset + size])
+                } else {
+                    // Variable-size: read from offset to end
+                    unpack_messagepack(py, &data[offset..])
+                }
+            }
 
             #[cfg(feature = "schema-validation")]
             PackerDType::MessagePackValidated { .. } => unpack_messagepack(py, &data[offset..]),
 
-            PackerDType::Cbor { .. } => unpack_cbor(py, &data[offset..]),
+            PackerDType::Cbor { fixed_size, .. } => {
+                if let Some(size) = fixed_size {
+                    // Fixed-size: read exact bytes
+                    if offset + size > data.len() {
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Not enough data"));
+                    }
+                    // CBOR is self-delimiting, so just try to decode
+                    // The deserializer will stop at the end of the cbor data
+                    unpack_cbor(py, &data[offset..offset + size])
+                } else {
+                    // Variable-size: read from offset to end
+                    unpack_cbor(py, &data[offset..])
+                }
+            }
         }
     }
 }
@@ -428,8 +503,18 @@ mod tests {
         let dtype = PackerDType::from_str("bytes:128").unwrap();
         assert_eq!(dtype.elem_size(), 128);
 
-        // Test msgpack
+        // Test msgpack (variable-size)
         let dtype = PackerDType::from_str("msgpack").unwrap();
         assert!(dtype.is_varsize());
+        assert_eq!(dtype.elem_size(), 0);
+
+        // Test msgpack (fixed-size)
+        let dtype = PackerDType::from_str("msgpack:256").unwrap();
+        assert!(!dtype.is_varsize());
+        assert_eq!(dtype.elem_size(), 256);
+
+        // Test cbor (fixed-size)
+        let dtype = PackerDType::from_str("cbor:128").unwrap();
+        assert_eq!(dtype.elem_size(), 128);
     }
 }

@@ -242,14 +242,14 @@ mod tests {
 
     #[test]
     fn test_cache_basic() {
-        let mut cache = WriteBackCache::new(1000, 500);
+        let cache: WriteBackCache<Vec<u8>, Vec<u8>> = WriteBackCache::new(1000, 500);
         assert!(cache.is_empty());
         assert!(!cache.should_flush());
     }
 
     #[test]
     fn test_cache_insert() {
-        let mut cache = WriteBackCache::new(1000, 500);
+        let mut cache: WriteBackCache<Vec<u8>, Vec<u8>> = WriteBackCache::new(1000, 500);
 
         // Insert small value - should succeed
         assert!(cache.insert(b"key1".to_vec(), b"value1".to_vec()).is_ok());
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_cache_too_large() {
-        let mut cache = WriteBackCache::new(100, 50);
+        let mut cache: WriteBackCache<Vec<u8>, Vec<u8>> = WriteBackCache::new(100, 50);
 
         // Try to insert value larger than capacity
         let large_value = vec![0u8; 200];
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn test_cache_need_flush() {
-        let mut cache = WriteBackCache::new(100, 50);
+        let mut cache: WriteBackCache<Vec<u8>, Vec<u8>> = WriteBackCache::new(100, 50);
 
         // Insert first value
         cache.insert(b"k1".to_vec(), vec![0u8; 40]).unwrap();
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_cache_drain() {
-        let mut cache = WriteBackCache::new(1000, 500);
+        let mut cache: WriteBackCache<Vec<u8>, Vec<u8>> = WriteBackCache::new(1000, 500);
 
         cache.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
         cache.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
