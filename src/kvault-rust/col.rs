@@ -680,6 +680,262 @@ impl _ColumnVault {
         Ok(PyBytes::new_bound(py, &result).unbind())
     }
 
+    /// Batch read variable-size elements with single FFI call.
+    ///
+    /// This function performs all the "find chunks + extract data" logic in Rust:
+    /// 1. Read N index entries (N×12 bytes) from index column
+    /// 2. Parse indices in Rust (fast bit manipulation)
+    /// 3. Group reads by chunk_id (minimize SQLite queries)
+    /// 4. For each unique chunk: read once, extract multiple elements
+    /// 5. Return all element data in optimal format
+    ///
+    /// # Arguments
+    /// * `py` - Python GIL token
+    /// * `idx_col_id` - Index column ID
+    /// * `data_col_id` - Data column ID
+    /// * `start_idx` - Starting element index
+    /// * `count` - Number of elements to read
+    /// * `idx_elem_size` - Should be 12 (for validation)
+    /// * `idx_chunk_bytes` - Aligned chunk size for index column
+    ///
+    /// # Returns
+    /// List of PyBytes (one per element, preserving order)
+    ///
+    /// # Performance
+    /// Expected: 10-50x faster than Python loop for N=10-1000
+    /// - Single index read + minimal data chunk reads
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (idx_col_id, data_col_id, start_idx, count, idx_elem_size, idx_chunk_bytes))]
+    fn batch_read_varsize(
+        &self,
+        py: Python<'_>,
+        idx_col_id: i64,
+        data_col_id: i64,
+        start_idx: i64,
+        count: i64,
+        idx_elem_size: i64,
+        idx_chunk_bytes: i64,
+    ) -> PyResult<Py<PyList>> {
+        // Validate inputs
+        if idx_elem_size != 12 {
+            return Err(ColError::Col(format!(
+                "Invalid index elem_size: expected 12, got {}",
+                idx_elem_size
+            ))
+            .into());
+        }
+
+        if count == 0 {
+            return Ok(PyList::empty_bound(py).unbind());
+        }
+
+        if count > 10_000_000 {
+            return Err(ColError::Col(format!(
+                "Batch read too large: {} elements (max 10M)",
+                count
+            ))
+            .into());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        // STEP 1: Read all index entries at once (N×12 bytes)
+        // This is ONE SQLite read, much faster than N individual reads
+        let index_data_bytes = self._read_range_internal(
+            &conn,
+            idx_col_id,
+            start_idx,
+            count,
+            idx_elem_size,
+            idx_chunk_bytes,
+        )?;
+
+        // STEP 2: Parse all indices in Rust (fast!)
+        // Build a map: chunk_id -> Vec<(start, end, result_idx)>
+        let mut chunk_reads: HashMap<i32, Vec<(i32, i32, usize)>> = HashMap::new();
+
+        for i in 0..count as usize {
+            let offset = i * 12;
+            let chunk_id = i32::from_le_bytes([
+                index_data_bytes[offset],
+                index_data_bytes[offset + 1],
+                index_data_bytes[offset + 2],
+                index_data_bytes[offset + 3],
+            ]);
+            let start_byte = i32::from_le_bytes([
+                index_data_bytes[offset + 4],
+                index_data_bytes[offset + 5],
+                index_data_bytes[offset + 6],
+                index_data_bytes[offset + 7],
+            ]);
+            let end_byte = i32::from_le_bytes([
+                index_data_bytes[offset + 8],
+                index_data_bytes[offset + 9],
+                index_data_bytes[offset + 10],
+                index_data_bytes[offset + 11],
+            ]);
+
+            chunk_reads
+                .entry(chunk_id)
+                .or_default()
+                .push((start_byte, end_byte, i));
+        }
+
+        // STEP 3: Prepare result array (preserve order!)
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; count as usize];
+
+        // STEP 4: For each unique chunk, read ONCE and extract all elements
+        for (chunk_id, reads) in chunk_reads.iter() {
+            // Get rowid for BLOB read
+            let rowid: i64 = conn
+                .query_row(
+                    "SELECT rowid FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![data_col_id, *chunk_id as i64],
+                    |row| row.get(0),
+                )
+                .map_err(|e| {
+                    ColError::Col(format!(
+                        "Chunk not found: col_id={}, chunk_id={}, error={}",
+                        data_col_id, chunk_id, e
+                    ))
+                })?;
+
+            // Open BLOB for efficient reading
+            let blob = conn
+                .blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "col_chunks",
+                    "data",
+                    rowid,
+                    true, // read-only
+                )
+                .map_err(ColError::from)?;
+
+            // Extract all elements from this chunk
+            for &(start_byte, end_byte, result_idx) in reads {
+                let len = (end_byte - start_byte) as usize;
+                let mut element_data = vec![0u8; len];
+                blob.read_at(&mut element_data, start_byte as usize)
+                    .map_err(ColError::from)?;
+
+                results[result_idx] = Some(element_data);
+            }
+        }
+
+        // STEP 5: Convert to Python list
+        let py_list = PyList::empty_bound(py);
+        for result in results {
+            match result {
+                Some(data) => {
+                    py_list.append(PyBytes::new_bound(py, &data))?;
+                }
+                None => {
+                    return Err(ColError::Col("Missing element in batch read".to_string()).into());
+                }
+            }
+        }
+
+        Ok(py_list.unbind())
+    }
+
+    /// Batch read + unpack variable-size elements in one call.
+    ///
+    /// Combines batch reading with DataPacker unpacking for maximum efficiency.
+    ///
+    /// # Arguments
+    /// * `packer` - DataPacker instance for unpacking
+    /// * Other args same as batch_read_varsize
+    ///
+    /// # Returns
+    /// List of unpacked Python objects (not bytes)
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (idx_col_id, data_col_id, start_idx, count, idx_elem_size, idx_chunk_bytes, packer))]
+    fn batch_read_varsize_unpacked(
+        &self,
+        py: Python<'_>,
+        idx_col_id: i64,
+        data_col_id: i64,
+        start_idx: i64,
+        count: i64,
+        idx_elem_size: i64,
+        idx_chunk_bytes: i64,
+        packer: &crate::packer::DataPacker,
+    ) -> PyResult<Py<PyList>> {
+        // First, get raw bytes using batch_read_varsize logic
+        let raw_list = self.batch_read_varsize(
+            py,
+            idx_col_id,
+            data_col_id,
+            start_idx,
+            count,
+            idx_elem_size,
+            idx_chunk_bytes,
+        )?;
+
+        // Unpack each element using DataPacker (all in Rust!)
+        let raw_list_bound = raw_list.bind(py);
+        let result_list = PyList::empty_bound(py);
+
+        for item in raw_list_bound.iter() {
+            let bytes = item.downcast::<PyBytes>()?;
+            let unpacked = packer.unpack(py, bytes.as_bytes(), 0)?;
+            result_list.append(unpacked)?;
+        }
+
+        Ok(result_list.unbind())
+    }
+
+    /// Batch read fixed-size elements with optional unpacking.
+    ///
+    /// While read_range already handles this efficiently, this adds
+    /// integrated unpacking for consistency with varsize API.
+    ///
+    /// # Arguments
+    /// * `col_id` - Column ID
+    /// * `start_idx` - Starting element index
+    /// * `count` - Number of elements
+    /// * `elem_size` - Size of each element
+    /// * `chunk_bytes` - Chunk size
+    /// * `packer` - Optional DataPacker for unpacking
+    ///
+    /// # Returns
+    /// List of unpacked values
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (col_id, start_idx, count, elem_size, chunk_bytes, packer=None))]
+    fn batch_read_fixed(
+        &self,
+        py: Python<'_>,
+        col_id: i64,
+        start_idx: i64,
+        count: i64,
+        elem_size: i64,
+        chunk_bytes: i64,
+        packer: Option<&crate::packer::DataPacker>,
+    ) -> PyResult<Py<PyList>> {
+        if count == 0 {
+            return Ok(PyList::empty_bound(py).unbind());
+        }
+
+        // Use existing read_range
+        let data = self.read_range(py, col_id, start_idx, count, elem_size, chunk_bytes)?;
+
+        // If no packer, manually split and return bytes
+        if packer.is_none() {
+            let data_bytes = data.bind(py).as_bytes();
+            let result = PyList::empty_bound(py);
+            for i in 0..count as usize {
+                let offset = i * elem_size as usize;
+                let elem_bytes = &data_bytes[offset..offset + elem_size as usize];
+                result.append(PyBytes::new_bound(py, elem_bytes))?;
+            }
+            return Ok(result.unbind());
+        }
+
+        // Unpack using DataPacker
+        let packer = packer.unwrap();
+        packer.unpack_many(py, data.bind(py).as_bytes(), Some(count as usize), None)
+    }
+
     /// Write a range of elements to a column (from raw bytes).
     ///
     /// Args:
@@ -1426,6 +1682,62 @@ impl _ColumnVault {
 
 // Helper methods (not exposed to Python)
 impl _ColumnVault {
+    /// Internal helper: read_range without Python GIL overhead.
+    /// Returns Vec<u8> instead of Py<PyBytes> for use within Rust.
+    fn _read_range_internal(
+        &self,
+        conn: &Connection,
+        col_id: i64,
+        start_idx: i64,
+        count: i64,
+        elem_size: i64,
+        chunk_bytes: i64,
+    ) -> Result<Vec<u8>, ColError> {
+        // With element-aligned chunks: elements don't cross chunks,
+        // but a read_range can span multiple chunks
+        let start_byte = start_idx * elem_size;
+        let total_bytes = (count * elem_size) as usize;
+        let end_byte = start_byte + total_bytes as i64;
+
+        // Calculate chunk range
+        let start_chunk = start_byte / chunk_bytes;
+        let end_chunk = (end_byte - 1) / chunk_bytes;
+
+        let mut result = vec![0u8; total_bytes];
+        let mut result_offset = 0;
+
+        // Read from each chunk
+        for chunk_idx in start_chunk..=end_chunk {
+            let chunk_start_byte = chunk_idx * chunk_bytes;
+            let chunk_end_byte = chunk_start_byte + chunk_bytes;
+
+            let read_start = std::cmp::max(start_byte, chunk_start_byte);
+            let read_end = std::cmp::min(end_byte, chunk_end_byte);
+            let bytes_to_read = (read_end - read_start) as usize;
+
+            if bytes_to_read == 0 {
+                continue;
+            }
+
+            let offset_in_chunk = (read_start - chunk_start_byte) as usize;
+
+            let chunk_data: Vec<u8> = conn
+                .query_row(
+                    "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![col_id, chunk_idx],
+                    |row| row.get(0),
+                )
+                .map_err(ColError::from)?;
+
+            result[result_offset..result_offset + bytes_to_read]
+                .copy_from_slice(&chunk_data[offset_in_chunk..offset_in_chunk + bytes_to_read]);
+
+            result_offset += bytes_to_read;
+        }
+
+        Ok(result)
+    }
+
     /// Pack (i32, i32, i32) index triple to 12 bytes (little-endian)
     fn pack_index_triple(chunk_id: i32, start: i32, end: i32) -> [u8; 12] {
         let mut result = [0u8; 12];
