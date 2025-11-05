@@ -38,18 +38,22 @@ temps = cv["temperatures"]
 temps.extend([23.5, 24.1, 25.0])
 print(temps[0])  # 23.5
 
-# High-performance bulk writes with cache (NEW in v0.4.1!)
+# High-performance bulk writes with cache (v0.4.1!)
 with temps.cache():
     for temp in sensor_readings:
         temps.append(temp)  # 10-100x faster!
 
-# Structured data (NEW in v0.3.0!)
+# Efficient slice reading (NEW in v0.5.0!)
+values = temps[100:200]  # 20-237x faster than loops!
+print(len(values))  # 100
+
+# Structured data (v0.3.0!)
 cv.create_column("users", "msgpack")
 users = cv["users"]
 users.append({"name": "Alice", "age": 30, "tags": ["vip"]})
 print(users[0])  # {'name': 'Alice', 'age': 30, 'tags': ['vip']}
 
-# Strings with encoding (NEW in v0.3.0!)
+# Strings with encoding (v0.3.0!)
 cv.create_column("messages", "str:utf8")
 messages = cv["messages"]
 messages.append("Hello, 世界!")
@@ -82,9 +86,38 @@ unpacked = packer.unpack_many(packed_all, offsets=offsets)
 - **Memory efficient**: Stream multi-GB files, dynamic chunk growth
 - **Type-safe columnar**: Fixed-size (i64, f64, bytes:N) and variable-size (bytes, str, msgpack, cbor)
 - **Rust performance**: Native speed with Pythonic ergonomics
-- **Smart caching**: Write-back cache for 10-100x faster bulk writes (NEW in v0.4.1!)
+- **Smart caching**: Write-back cache for 10-100x faster bulk writes (v0.4.1!)
+- **Efficient slicing**: Batch reads for 20-237x faster range access (NEW in v0.5.0!)
 - **Structured data**: Store dicts/lists directly with MessagePack/CBOR (v0.3.0)
 - **DataPacker**: Rust-based serialization with multi-encoding support (v0.3.0)
+
+## Performance (M1 Max MacBook Pro, 50K entries)
+
+### KVault
+**Write (with cache):**
+- **16KB entries**: 24K ops/sec, **377 MB/s**
+- **1KB entries**: 195K ops/sec, 191 MB/s
+
+**Read:**
+- **16KB entries**: 63K ops/sec, **987 MB/s**
+- **1KB entries**: 165K ops/sec, 162 MB/s
+
+### ColumnVault Write (extend with cache)
+- **i64**: **12.5M ops/sec**, 95 MB/s (**486x** faster than uncached append)
+- **f64**: **12.5M ops/sec**, 95 MB/s (**468x** faster than uncached append)
+- **msgpack**: 1.3M ops/sec, 22 MB/s (**1168x** faster than uncached append)
+
+### ColumnVault Slice Read (v0.5.0)
+- **f64**: **2.3M ops/sec**, 17 MB/s (**237x faster** than single-element loop)
+- **i64**: **2.0M ops/sec**, 15 MB/s (**135x faster** than single-element loop)
+- **bytes:32**: 99K ops/sec, 3 MB/s (**101x faster** than single-element loop)
+- **msgpack**: 338K ops/sec, 10 MB/s (**79x faster** than single-element loop)
+
+*Hardware: M1 Max MacBook Pro 1TB SSD*
+- *QD1 Sequential: 3,600 MB/s read, 5,100 MB/s write*
+- *QD64 4K Random: 670 MB/s read, 140 MB/s write*
+
+*Full benchmark: `python examples/benchmark.py --entries 50000`*
 
 ## Best Practices
 

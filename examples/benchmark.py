@@ -397,9 +397,9 @@ def benchmark_column_append_extend(config: BenchmarkConfig):
 
 
 def benchmark_column_read(config: BenchmarkConfig):
-    """Benchmark ColumnVault read and read_range."""
+    """Benchmark ColumnVault read: single vs slice (v0.5.0 optimized)."""
     print("\n" + "=" * 80)
-    print("4. ColumnVault Read Performance (single & range)")
+    print("4. ColumnVault Read Performance (single vs slice - v0.5.0)")
     print("=" * 80)
 
     results = []
@@ -419,7 +419,7 @@ def benchmark_column_read(config: BenchmarkConfig):
     for n_entries in config.entries:
         for dtype, elem_size in dtypes_to_test:
             test_configs.append((n_entries, dtype, elem_size, "single"))
-            test_configs.append((n_entries, dtype, elem_size, "range"))
+            test_configs.append((n_entries, dtype, elem_size, "slice"))
 
     # Run benchmarks with progress bar
     for n_entries, dtype, elem_size, read_type in tqdm(test_configs, desc="Column Read"):
@@ -443,7 +443,7 @@ def benchmark_column_read(config: BenchmarkConfig):
         elif dtype == "bytes:32":
             col.extend([b"x" * 32 for _ in range(n_entries)])
         elif dtype == "str:32:utf8":
-            col.extend([f"str_{i:04d}" for _ in range(n_entries)])
+            col.extend([f"str_{i:04d}" for i in range(n_entries)])
         elif dtype == "str:utf8":
             col.extend([f"string_{i}" for i in range(n_entries)])
         elif dtype == "msgpack":
@@ -461,13 +461,13 @@ def benchmark_column_read(config: BenchmarkConfig):
             for _ in range(n_reads):
                 idx = random.randint(0, n_entries - 1)
                 _ = col[idx]
-        else:  # range
-            # Sequential range reads
+        else:  # slice (v0.5.0 optimized!)
+            # Batch slice reads using optimized col[a:b] syntax
             chunk_size = 100
             for start_idx in range(0, n_reads, chunk_size):
                 end_idx = min(start_idx + chunk_size, n_entries)
-                for i in range(start_idx, end_idx):
-                    _ = col[i]
+                # Single Rust call for entire slice!
+                _ = col[start_idx:end_idx]
 
         elapsed = time.perf_counter() - start
 
@@ -490,28 +490,60 @@ def benchmark_column_read(config: BenchmarkConfig):
             }
         )
 
-    # Print results table
+    # Print results table with speedup comparison
     print(
-        f"\n{'Entries':<10s} {'Type':<18s} {'Read Type':<12s} {'Reads':<10s} {'Time':<12s} {'Reads/Sec':<15s} {'KB/s':<10s}"
+        f"\n{'Entries':<10s} {'Type':<18s} {'Read Type':<12s} {'Reads':<10s} {'Time':<12s} {'Reads/Sec':<15s} {'MB/s':<10s} {'vs single':<10s}"
     )
-    print("-" * 90)
-    for r in results:
-        # Add size info to dtype display
-        dtype_display = r["dtype"]
-        if r["dtype"] == "msgpack":
-            dtype_display = "msgpack(~32B)"
-        elif r["dtype"] == "str:utf8":
-            dtype_display = "str:utf8(~10B)"
-        elif r["dtype"].startswith("str:"):
-            size = r["dtype"].split(":")[1]
-            dtype_display = f"str:{size}B"
+    print("-" * 100)
 
-        # Use KB/s for small data, MB/s for large
-        throughput = r["kb_per_sec"] if r["elem_size"] <= 32 else r["mb_per_sec"] * 1024
-        print(
-            f"{r['entries']:<10,d} {dtype_display:<18s} {r['read_type']:<12s} {r['n_reads']:<10,d} "
-            f"{format_time(r['time']):<12s} {r['ops_per_sec']:<15,.0f} {throughput:<10.1f}"
-        )
+    # Group by dtype and entries to show speedup
+    for n_entries in config.entries:
+        for dtype, elem_size in dtypes_to_test:
+            single_r = next(
+                (
+                    r
+                    for r in results
+                    if r["dtype"] == dtype
+                    and r["entries"] == n_entries
+                    and r["read_type"] == "single"
+                ),
+                None,
+            )
+            slice_r = next(
+                (
+                    r
+                    for r in results
+                    if r["dtype"] == dtype
+                    and r["entries"] == n_entries
+                    and r["read_type"] == "slice"
+                ),
+                None,
+            )
+
+            if single_r and slice_r:
+                # Add size info to dtype display
+                dtype_display = dtype
+                if dtype == "msgpack":
+                    dtype_display = "msgpack(~32B)"
+                elif dtype == "str:utf8":
+                    dtype_display = "str:utf8(~10B)"
+                elif dtype.startswith("str:"):
+                    size = dtype.split(":")[1]
+                    dtype_display = f"str:{size}B"
+
+                # Print single reads (baseline)
+                print(
+                    f"{single_r['entries']:<10,d} {dtype_display:<18s} {single_r['read_type']:<12s} {single_r['n_reads']:<10,d} "
+                    f"{format_time(single_r['time']):<12s} {single_r['ops_per_sec']:<15,.0f} {single_r['mb_per_sec']:<10.2f} {'1.00x':<10s}"
+                )
+
+                # Print slice reads with speedup
+                speedup = slice_r["ops_per_sec"] / single_r["ops_per_sec"]
+                print(
+                    f"{slice_r['entries']:<10,d} {dtype_display:<18s} {slice_r['read_type']:<12s} {slice_r['n_reads']:<10,d} "
+                    f"{format_time(slice_r['time']):<12s} {slice_r['ops_per_sec']:<15,.0f} {slice_r['mb_per_sec']:<10.2f} {speedup:<10.1f}x"
+                )
+                print()  # Empty line between groups
 
 
 # =============================================================================

@@ -1,6 +1,42 @@
-# ColumnVault API Reference (v0.4.1)
+# ColumnVault API Reference (v0.5.0)
 
 Complete API documentation for KohakuVault's columnar storage.
+
+## 🚀 New in v0.5.0: Efficient Slice Reading
+
+**20-237x faster range access** with batch read + batch unpack in Rust!
+
+```python
+# Old way (slow - multiple Python→Rust calls)
+data = [col[i] for i in range(100, 200)]
+
+# New way (fast - single Rust call!)
+data = col[100:200]  # 20-237x faster!
+```
+
+**Performance (M1 Max MacBook Pro, 50K entries, 1000 reads):**
+
+| Type | Single Loop | Slice (v0.5.0) | Speedup |
+|------|------------|----------------|---------|
+| **i64** | 0.11 MB/s | 15 MB/s | **135x** |
+| **f64** | 0.07 MB/s | 17 MB/s | **237x** |
+| **bytes:32** | 0.03 MB/s | 3 MB/s | **101x** |
+| **str (variable)** | 0.05 MB/s | 2.5 MB/s | **47x** |
+| **msgpack** | 0.13 MB/s | 10 MB/s | **79x** |
+
+**Features:**
+- Works for all types (i64, f64, bytes, strings, msgpack, cbor)
+- Automatic iteration optimization (no code changes needed)
+- Integrated unpacking runs entirely in Rust
+- Backward compatible with existing code
+
+**Hardware Context:**
+- M1 Max MacBook Pro 1TB SSD
+- QD1 Sequential: 3,600 MB/s read, 5,100 MB/s write
+- QD64 4K Random: 670 MB/s read, 140 MB/s write
+- QD1 4K Random: 50 MB/s read, 20 MB/s write
+
+---
 
 ## ⚠️ Breaking Changes in v0.4.0
 
@@ -13,7 +49,7 @@ Complete API documentation for KohakuVault's columnar storage.
 4. **Chunk-wise extend**: Writes entire chunks at once (50-100x faster!)
 5. **No cross-element spanning**: Each element fully contained in one chunk
 
-**Performance Gains:**
+**Performance Gains (v0.4.0):**
 - Variable-size space: **316x improvement** (10 msgpack: 132MB → 416KB)
 - Variable-size extend: **50-100x faster** than append
 - Test runtime: 21s → 6.6s
@@ -416,9 +452,14 @@ List-like interface for fixed-size elements.
 ### Indexing
 
 ```python
-# Get element
+# Get single element
 value = col[0]
 value = col[-1]        # Negative indexing supported
+
+# Get slice (NEW in v0.5.0 - FAST!)
+values = col[100:200]  # 20-237x faster than loop!
+values = col[:50]      # First 50 elements
+values = col[-10:]     # Last 10 elements
 
 # Set element
 col[0] = 42
@@ -428,9 +469,15 @@ col[-1] = 99
 del col[0]
 ```
 
+**Performance (v0.5.0):**
+- Slice reading uses single Rust call with batch unpacking
+- **135-237x faster** than `[col[i] for i in range(a, b)]`
+- Automatic iteration optimization (no code changes needed)
+
 **Raises:**
 - `IndexError`: Index out of bounds
 - `TypeError`: Invalid index type or value type
+- `ValueError`: Step slicing not supported (e.g., `col[::2]`)
 
 ### Methods
 
@@ -526,10 +573,11 @@ List-like interface for variable-length byte strings.
 
 **Supported:**
 - ✅ `col[i]` get (O(1))
+- ✅ `col[a:b]` slice (NEW in v0.5.0 - **20-100x faster!**)
 - ✅ `len(col)` (O(1))
 - ✅ `append(value)` (O(1))
 - ✅ `extend(values)` (O(k))
-- ✅ Iteration (O(n))
+- ✅ Iteration (O(n) - **optimized in v0.5.0!**)
 - ✅ `clear()` (O(1))
 
 **Not supported:**
@@ -548,12 +596,16 @@ msgs.append(b"short")
 msgs.append(b"this is a much longer message")
 msgs.append(b"x")
 
-# Access
+# Single element access
 print(msgs[0])   # b'short' (exact size, no padding)
 print(msgs[1])   # b'this is a much longer message'
 print(msgs[-1])  # b'x'
 
-# Iterate
+# Slice access (NEW in v0.5.0 - FAST!)
+batch = msgs[10:110]  # 20-100x faster than loop!
+print(len(batch))     # 100
+
+# Iterate (automatically optimized in v0.5.0)
 for msg in msgs:
     print(msg.decode())
 
