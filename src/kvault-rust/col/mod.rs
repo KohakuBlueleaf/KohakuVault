@@ -3109,3 +3109,6 @@ impl _ColumnVault {
         Ok(())
     }
 }
+
+// Variable-size column operations in separate file
+mod var;
