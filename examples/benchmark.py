@@ -29,7 +29,7 @@ class BenchmarkConfig:
         cache_sizes_mb: List[int] = None,
         column_sizes: List[int] = None,  # Column-specific data sizes (for bytes columns)
         min_chunk_kb: int = 16,  # Minimum chunk size in KB (default 16KB)
-        max_chunk_mb: int = 16,  # Maximum chunk size in MB (default 16MB)
+        max_chunk_kb: int = 1024,  # Maximum chunk size in KB (default 1024KB)
     ):
         # Use sorted(set()) to remove duplicates and sort
         self.entries = sorted(set(entries or [1000, 10000]))
@@ -37,7 +37,7 @@ class BenchmarkConfig:
         self.cache_sizes_mb = sorted(set(cache_sizes_mb or [0, 64]))  # No cache, 64MB cache
         self.column_sizes = sorted(set(column_sizes or []))  # Additional column sizes (bytes:N)
         self.min_chunk_kb = min_chunk_kb  # Min chunk size (default 16KB)
-        self.max_chunk_mb = max_chunk_mb  # Max chunk size (default 16MB)
+        self.max_chunk_kb = max_chunk_kb  # Max chunk size (default 16MB)
         self.temp_dir = tempfile.mkdtemp()
 
     def get_db_path(self, name: str) -> str:
@@ -251,7 +251,7 @@ def benchmark_column_append_extend(config: BenchmarkConfig):
         cv = ColumnVault(
             db_path,
             min_chunk_bytes=config.min_chunk_kb * 1024,
-            max_chunk_bytes=config.max_chunk_mb * 1024 * 1024,
+            max_chunk_bytes=config.max_chunk_kb * 1024,
         )
         col = cv.create_column("test", dtype)
 
@@ -397,9 +397,9 @@ def benchmark_column_append_extend(config: BenchmarkConfig):
 
 
 def benchmark_column_read(config: BenchmarkConfig):
-    """Benchmark ColumnVault read: single vs slice (v0.5.0 optimized)."""
+    """Benchmark ColumnVault read: single vs slice (v0.4.2 optimized)."""
     print("\n" + "=" * 80)
-    print("4. ColumnVault Read Performance (single vs slice - v0.5.0)")
+    print("4. ColumnVault Read Performance (single vs slice - v0.4.2)")
     print("=" * 80)
 
     results = []
@@ -431,7 +431,7 @@ def benchmark_column_read(config: BenchmarkConfig):
         cv = ColumnVault(
             db_path,
             min_chunk_bytes=config.min_chunk_kb * 1024,
-            max_chunk_bytes=config.max_chunk_mb * 1024 * 1024,
+            max_chunk_bytes=config.max_chunk_kb * 1024,
         )
         col = cv.create_column("test", dtype)
 
@@ -461,7 +461,7 @@ def benchmark_column_read(config: BenchmarkConfig):
             for _ in range(n_reads):
                 idx = random.randint(0, n_entries - 1)
                 _ = col[idx]
-        else:  # slice (v0.5.0 optimized!)
+        else:  # slice (v0.4.2 optimized!)
             # Batch slice reads using optimized col[a:b] syntax
             chunk_size = 100
             for start_idx in range(0, n_reads, chunk_size):
@@ -552,9 +552,9 @@ def benchmark_column_read(config: BenchmarkConfig):
 
 
 def benchmark_column_slice_write(config: BenchmarkConfig):
-    """Benchmark ColumnVault slice write: loop vs batch (v0.5.0)."""
+    """Benchmark ColumnVault slice write: loop vs batch (v0.4.2)."""
     print("\n" + "=" * 80)
-    print("5. ColumnVault Slice Write Performance (loop vs slice - v0.5.0)")
+    print("5. ColumnVault Slice Write Performance (loop vs slice - v0.4.2)")
     print("=" * 80)
 
     results = []
@@ -583,7 +583,7 @@ def benchmark_column_slice_write(config: BenchmarkConfig):
         cv = ColumnVault(
             db_path,
             min_chunk_bytes=config.min_chunk_kb * 1024,
-            max_chunk_bytes=config.max_chunk_mb * 1024 * 1024,
+            max_chunk_bytes=config.max_chunk_kb * 1024,
         )
         col = cv.create_column("test", dtype)
 
@@ -692,18 +692,26 @@ def benchmark_column_slice_write(config: BenchmarkConfig):
                 elif dtype == "bytes":
                     dtype_display = "bytes(~15B)"
 
-                # Print loop (baseline)
-                print(
-                    f"{loop_r['entries']:<10,d} {dtype_display:<18s} {loop_r['write_type']:<12s} {loop_r['n_updates']:<10,d} "
-                    f"{format_time(loop_r['time']):<12s} {loop_r['ops_per_sec']:<15,.0f} {loop_r['mb_per_sec']:<10.2f} {'1.00x':<10s}"
-                )
+                # Check if loop was skipped
+                if loop_r["time"] is None:
+                    # Loop skipped (too slow) - just show slice performance
+                    print(
+                        f"{slice_r['entries']:<10,d} {dtype_display:<18s} {'slice':<12s} {slice_r['n_updates']:<10,d} "
+                        f"{format_time(slice_r['time']):<12s} {slice_r['ops_per_sec']:<15,.0f} {slice_r['mb_per_sec']:<10.2f} {'N/A (loop too slow)'}"
+                    )
+                else:
+                    # Print loop (baseline)
+                    print(
+                        f"{loop_r['entries']:<10,d} {dtype_display:<18s} {loop_r['write_type']:<12s} {loop_r['n_updates']:<10,d} "
+                        f"{format_time(loop_r['time']):<12s} {loop_r['ops_per_sec']:<15,.0f} {loop_r['mb_per_sec']:<10.2f} {'1.00x':<10s}"
+                    )
 
-                # Print slice with speedup
-                speedup = slice_r["ops_per_sec"] / loop_r["ops_per_sec"]
-                print(
-                    f"{slice_r['entries']:<10,d} {dtype_display:<18s} {slice_r['write_type']:<12s} {slice_r['n_updates']:<10,d} "
-                    f"{format_time(slice_r['time']):<12s} {slice_r['ops_per_sec']:<15,.0f} {slice_r['mb_per_sec']:<10.2f} {speedup:<10.1f}x"
-                )
+                    # Print slice with speedup
+                    speedup = slice_r["ops_per_sec"] / loop_r["ops_per_sec"]
+                    print(
+                        f"{slice_r['entries']:<10,d} {dtype_display:<18s} {slice_r['write_type']:<12s} {slice_r['n_updates']:<10,d} "
+                        f"{format_time(slice_r['time']):<12s} {slice_r['ops_per_sec']:<15,.0f} {slice_r['mb_per_sec']:<10.2f} {speedup:<10.1f}x"
+                    )
                 print()  # Empty line between groups
 
 
@@ -849,7 +857,7 @@ def run_benchmark(
     cache_sizes_mb: List[int] = None,
     column_sizes: List[int] = None,
     min_chunk_kb: int = 16,
-    max_chunk_mb: int = 16,
+    max_chunk_kb: int = 16,
 ):
     """
     Run comprehensive benchmark suite.
@@ -866,11 +874,11 @@ def run_benchmark(
         Additional column data sizes (bytes:N), e.g., [128, 1024]
     min_chunk_kb : int
         Minimum chunk size in KB (default: 16)
-    max_chunk_mb : int
+    max_chunk_kb : int
         Maximum chunk size in MB (default: 16)
     """
     config = BenchmarkConfig(
-        entries, entry_sizes, cache_sizes_mb, column_sizes, min_chunk_kb, max_chunk_mb
+        entries, entry_sizes, cache_sizes_mb, column_sizes, min_chunk_kb, max_chunk_kb
     )
 
     print("=" * 80)
@@ -880,7 +888,7 @@ def run_benchmark(
     print(f"  Entries: {config.entries}")
     print(f"  Entry sizes (KVault): {[format_size(s) for s in config.entry_sizes]}")
     print(f"  Cache sizes: {config.cache_sizes_mb} MB")
-    print(f"  Column chunk: {config.min_chunk_kb}KB - {config.max_chunk_mb}MB")
+    print(f"  Column chunk: {config.min_chunk_kb}KB - {config.max_chunk_kb}KB")
     print(
         f"  Column sizes: i64, f64"
         + (
@@ -918,7 +926,7 @@ def run_quick_benchmark():
         cache_sizes_mb=[0, 64],
         column_sizes=[],  # Just i64/f64
         min_chunk_kb=16,  # 16KB
-        max_chunk_mb=16,  # 16MB
+        max_chunk_kb=16,  # 16MB
     )
 
 
@@ -935,7 +943,7 @@ Examples:
   python benchmark.py --sizes 1024 16384 65536          # KVault entry sizes
   python benchmark.py --cache 0 16 64                    # Custom cache sizes
   python benchmark.py --column-sizes 128 1024 16384     # Test bytes:128, bytes:1024, bytes:16384
-  python benchmark.py --min-chunk 128 --max-chunk 64    # 128KB min, 64MB max chunks
+  python benchmark.py --min-chunk 128 --max-chunk 16384    # 128KB min, 16MB max chunks
   python benchmark.py --entries 10000 --column-sizes 4096  # Specific config
         """,
     )
@@ -982,8 +990,8 @@ Examples:
     parser.add_argument(
         "--max-chunk",
         type=int,
-        default=16,
-        help="Maximum chunk size in MB (default: 16)",
+        default=1024,
+        help="Maximum chunk size in KB (default: 1024)",
     )
 
     parser.add_argument(
@@ -1003,5 +1011,5 @@ Examples:
             cache_sizes_mb=args.cache,
             column_sizes=args.column_sizes,
             min_chunk_kb=args.min_chunk,
-            max_chunk_mb=args.max_chunk,
+            max_chunk_kb=args.max_chunk,
         )

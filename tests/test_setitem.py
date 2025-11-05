@@ -1,5 +1,5 @@
 """
-Test suite for setitem operations (v0.5.0).
+Test suite for setitem operations (v0.4.2).
 
 Tests both fixed-size and variable-size columns with slice setitem support.
 """

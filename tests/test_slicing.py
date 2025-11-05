@@ -1,5 +1,5 @@
 """
-Test suite for efficient slice-based column reading (v0.5.0).
+Test suite for efficient slice-based column reading (v0.4.2).
 
 Tests both fixed-size and variable-size columns with batch reading.
 """
