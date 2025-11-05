@@ -2,7 +2,40 @@
 
 Complete API documentation for KohakuVault's columnar storage.
 
-## 🚀 New in v0.5.0: Efficient Slice Reading
+## 🚀 New in v0.5.0: Critical Performance Fixes & Code Reorganization
+
+**Fixed deadlocks and massive performance issues in slice operations:**
+
+### Slice Write Performance
+- **Fixed-size arrays**: Now uses incremental BLOB I/O instead of read-modify-write
+  - **Before**: Hung indefinitely or took minutes for 5000 elements
+  - **After**: 20+ million updates/sec for large batch writes
+- **Variable-size arrays**: Optimized chunk rebuild with headroom
+  - **Before**: O(n²) behavior - each update triggered full chunk rebuild
+  - **After**: One rebuild with power-of-2 headroom, then fast updates
+
+### Memory Usage Fixes
+- Eliminated all `vec![0u8; size]` allocations for large chunks
+- Now uses SQLite's `zeroblob()` function (zero memory overhead)
+- Fixed chunk growth to use BLOB API instead of allocating MB+ Vecs
+
+### Database Cleanup
+- Added automatic WAL checkpoint in `ColumnVault.__del__`
+- Prevents hangs when garbage collecting database objects
+- Set 5-second busy timeout to prevent infinite lock waits
+
+### Code Organization
+- **Modularized entire Rust codebase** for better maintainability:
+  - **common.rs**: Shared infrastructure (errors, cache, SQLite helpers)
+  - **kv/**: Key-value storage (mod.rs + ops.rs + stream.rs)
+  - **col/**: Columnar storage (6 files: mod.rs, cache.rs, chunks.rs, fixed.rs, varsize_ops.rs, varsize_index.rs)
+  - **packer/**: Serialization layer (mod.rs + primitives.rs + structured.rs)
+- Implementation + Proxy pattern: logic in separate files, thin wrappers in #[pymethods]
+- Largest file reduced from 3,111 → 1,100 lines (64% reduction)
+
+---
+
+## 🚀 v0.4.2: Efficient Slice Operations
 
 **20-237x faster range access** with batch read + batch unpack in Rust!
 
@@ -16,7 +49,7 @@ data = col[100:200]  # 20-237x faster!
 
 **Performance (M1 Max MacBook Pro, 50K entries, 1000 reads):**
 
-| Type | Single Loop | Slice (v0.5.0) | Speedup |
+| Type | Single Loop | Slice (v0.4.2) | Speedup |
 |------|------------|----------------|---------|
 | **i64** | 0.11 MB/s | 15 MB/s | **135x** |
 | **f64** | 0.07 MB/s | 17 MB/s | **237x** |
@@ -456,7 +489,7 @@ List-like interface for fixed-size elements.
 value = col[0]
 value = col[-1]        # Negative indexing supported
 
-# Get slice (v0.5.0 - FAST!)
+# Get slice (v0.4.2 - FAST!)
 values = col[100:200]  # 20-237x faster than loop!
 values = col[:50]      # First 50 elements
 values = col[-10:]     # Last 10 elements
@@ -465,7 +498,7 @@ values = col[-10:]     # Last 10 elements
 col[0] = 42
 col[-1] = 99
 
-# Set slice (NEW in v0.5.0 - FAST!)
+# Set slice (NEW in v0.4.2 - FAST!)
 col[100:200] = [i * 10 for i in range(100)]  # Batch write!
 col[:5] = [10, 20, 30, 40, 50]
 
@@ -473,7 +506,7 @@ col[:5] = [10, 20, 30, 40, 50]
 del col[0]
 ```
 
-**Performance (v0.5.0):**
+**Performance (v0.4.2):**
 
 | Operation | Method | Speedup |
 |-----------|--------|---------|
@@ -585,13 +618,13 @@ List-like interface for variable-length byte strings.
 
 **Supported:**
 - ✅ `col[i]` get (O(1))
-- ✅ `col[a:b]` slice read (v0.5.0 - **20-100x faster!**)
-- ✅ `col[i] = value` setitem (NEW in v0.5.0 - **size-aware!**)
-- ✅ `col[a:b] = values` slice setitem (NEW in v0.5.0 - **batch update!**)
+- ✅ `col[a:b]` slice read (v0.4.2 - **20-100x faster!**)
+- ✅ `col[i] = value` setitem (NEW in v0.4.2 - **size-aware!**)
+- ✅ `col[a:b] = values` slice setitem (NEW in v0.4.2 - **batch update!**)
 - ✅ `len(col)` (O(1))
 - ✅ `append(value)` (O(1))
 - ✅ `extend(values)` (O(k))
-- ✅ Iteration (O(n) - **optimized in v0.5.0!**)
+- ✅ Iteration (O(n) - **optimized in v0.4.2!**)
 - ✅ `clear()` (O(1))
 
 **Not supported:**
@@ -614,19 +647,19 @@ print(msgs[0])   # b'short' (exact size, no padding)
 print(msgs[1])   # b'this is a much longer message'
 print(msgs[-1])  # b'x'
 
-# Slice read (v0.5.0 - FAST!)
+# Slice read (v0.4.2 - FAST!)
 batch = msgs[10:110]  # 20-100x faster than loop!
 print(len(batch))     # 100
 
-# Single element setitem (NEW in v0.5.0 - size-aware!)
+# Single element setitem (NEW in v0.4.2 - size-aware!)
 msgs[0] = b"Updated short"      # Smaller - direct replace, leaves fragment
 msgs[1] = b"Updated to longer message"  # Larger - may rebuild chunk
 msgs[2] = b"Same size text"      # Same size - direct replace
 
-# Slice setitem (NEW in v0.5.0 - FAST!)
+# Slice setitem (NEW in v0.4.2 - FAST!)
 msgs[10:15] = [b"a", b"bb", b"ccc", b"dddd", b"eeeee"]  # Batch update!
 
-# Iterate (automatically optimized in v0.5.0)
+# Iterate (automatically optimized in v0.4.2)
 for msg in msgs:
     print(msg.decode())
 
@@ -635,23 +668,27 @@ with msgs.cache():
     msgs.extend(large_data_list)  # 2-10x faster
 ```
 
-**Variable-Size Setitem Strategy (v0.5.0):**
+**Variable-Size Setitem Strategy (v0.4.2):**
 
 **Single Element (`col[i] = value`):**
 - **new_size ≤ old_size**: Direct BLOB replace, update index end_byte, **DON'T update bytes_used** (leave fragment for vacuum)
 - **new_size > old_size (fits)**: Shift subsequent elements in chunk, update affected indices, update bytes_used
 - **new_size > old_size (rebuild)**: Rebuild entire chunk, update all indices, update bytes_used
 
+**⚠️ IMPORTANT: Single element updates are O(n) where n = elements after it in chunk!**
+- Each larger update shifts all subsequent indices
+- Loop of 1000 updates = O(k×n) complexity (very slow!)
+- **For batch updates, ALWAYS use slice operations: `col[a:b] = values`**
+
 **Slice Update (`col[a:b] = values`):**
 - **total_new ≤ total_old**: Direct mode - sequential write from first update, update indices, **DON'T update bytes_used** (fragments)
 - **total_new > total_old**: Rebuild mode - reconstruct affected chunks, update indices, update bytes_used
 
 **Performance:**
-- Same/smaller: < 1ms (50x faster than delete+insert)
-- Larger (fits): 5-20ms (2-5x faster)
-- Larger (rebuild): 50-200ms per chunk
-- Slice (direct): 5-10x faster than loop
-- Slice (rebuild): 8-10x faster than loop
+- **Single (same/smaller)**: < 1ms
+- **Single (larger)**: 5-200ms depending on elements after it
+- **Slice (contiguous)**: 1-10ms for 1000s of updates (**100-1000x faster than loop!**)
+- **Loop of singles**: O(k×n) - **DO NOT USE for batch updates**
 
 **Fragment Management:**
 - Fragments accumulate when using smaller replacements

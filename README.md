@@ -43,11 +43,11 @@ with temps.cache():
     for temp in sensor_readings:
         temps.append(temp)  # 10-100x faster!
 
-# Efficient slice reading (NEW in v0.5.0!)
+# Efficient slice reading (NEW in v0.4.2!)
 values = temps[100:200]  # 20-237x faster than loops!
 print(len(values))  # 100
 
-# Efficient slice writing (NEW in v0.5.0!)
+# Efficient slice writing (NEW in v0.4.2!)
 temps[100:200] = [25.0 + i * 0.1 for i in range(100)]  # Batch update!
 
 # Structured data (v0.3.0!)
@@ -68,10 +68,14 @@ print(messages[0])  # 'Hello, 世界!'
 ```python
 from kohakuvault import DataPacker
 
-# MessagePack for structured data
+# MessagePack for structured data (variable-size)
 packer = DataPacker("msgpack")
 packed = packer.pack({"user": "alice", "score": 95.5})
 data = packer.unpack(packed, 0)
+
+# MessagePack with fixed size (NEW in v0.5.0!)
+packer_fixed = DataPacker("msgpack:128")  # Fixed 128 bytes (pads if smaller, errors if larger)
+packed = packer_fixed.pack({"small": "data"})  # Padded to 128 bytes
 
 # Bulk operations
 records = [{"id": i, "val": i*1.5} for i in range(1000)]
@@ -90,8 +94,8 @@ unpacked = packer.unpack_many(packed_all, offsets=offsets)
 - **Type-safe columnar**: Fixed-size (i64, f64, bytes:N) and variable-size (bytes, str, msgpack, cbor)
 - **Rust performance**: Native speed with Pythonic ergonomics
 - **Smart caching**: Write-back cache for 10-100x faster bulk writes (v0.4.1!)
-- **Efficient slicing**: Batch read/write for 20-237x faster range access (NEW in v0.5.0!)
-- **Variable-size setitem**: Size-aware updates with fragment management (NEW in v0.5.0!)
+- **Efficient slicing**: Batch read/write for 20-237x faster range access (NEW in v0.4.2!)
+- **Variable-size setitem**: Size-aware updates with fragment management (NEW in v0.4.2!)
 - **Structured data**: Store dicts/lists directly with MessagePack/CBOR (v0.3.0)
 - **DataPacker**: Rust-based serialization with multi-encoding support (v0.3.0)
 
@@ -111,7 +115,7 @@ unpacked = packer.unpack_many(packed_all, offsets=offsets)
 - **f64**: **12.5M ops/sec**, 95 MB/s (**468x** faster than uncached append)
 - **msgpack**: 1.3M ops/sec, 22 MB/s (**1168x** faster than uncached append)
 
-### ColumnVault Slice Read (v0.5.0)
+### ColumnVault Slice Read (v0.4.2)
 - **f64**: **2.3M ops/sec**, 17 MB/s (**237x faster** than single-element loop)
 - **i64**: **2.0M ops/sec**, 15 MB/s (**135x faster** than single-element loop)
 - **bytes:32**: 99K ops/sec, 3 MB/s (**101x faster** than single-element loop)
@@ -301,7 +305,7 @@ temps.append(23.5)
 temps.extend([24.1, 25.0, 25.3])
 print(temps[0], temps[-1], len(temps))  # 23.5, 25.3, 4
 
-# Efficient slice operations (NEW in v0.5.0!)
+# Efficient slice operations (NEW in v0.4.2!)
 values = temps[10:20]  # Batch read - 237x faster!
 temps[10:20] = [25.0 + i * 0.1 for i in range(10)]  # Batch write - 20-50x faster!
 
@@ -312,7 +316,7 @@ logs.append(b"Short message")
 logs.append(b"This is a much longer log entry with details...")
 print(logs[0])  # Exact bytes, no padding
 
-# Variable-size setitem with size-aware logic (NEW in v0.5.0!)
+# Variable-size setitem with size-aware logic (NEW in v0.4.2!)
 logs[0] = b"Updated message"  # Works even if size different!
 logs[5:10] = [b"batch", b"update", b"works", b"too", b"!"]  # Batch update!
 
