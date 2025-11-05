@@ -291,21 +291,76 @@ class Column(MutableSequence):
         else:
             raise TypeError("Column indices must be integers or slices")
 
-    def __setitem__(self, idx: int, value: ValueType) -> None:
-        """Set element at index."""
-        if not isinstance(idx, int):
-            raise TypeError("Column indices must be integers")
+    def __setitem__(self, key, value):
+        """
+        Set element(s) at index or slice.
 
-        idx = self._normalize_index(idx)
+        Single element:
+            col[42] = 100
 
-        # Pack value: use Rust packer if available
-        if self._use_rust_packer:
-            packed = self._rust_packer.pack(value)
+        Slice (NEW in v0.5.0):
+            col[10:20] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # Batch write!
+            col[:5] = [100, 200, 300, 400, 500]
+        """
+        if isinstance(key, slice):
+            # Slice setitem - batch write
+            return self._setitem_slice(key, value)
+        elif isinstance(key, int):
+            # Single element setitem (existing logic)
+            key = self._normalize_index(key)
+
+            # Pack value: use Rust packer if available
+            if self._use_rust_packer:
+                packed = self._rust_packer.pack(value)
+            else:
+                packed = self._pack(value)
+
+            # Write one element
+            self._inner.write_range(self._col_id, key, packed, self._elem_size, self._chunk_bytes)
         else:
-            packed = self._pack(value)
+            raise TypeError("Column indices must be integers or slices")
 
-        # Write one element
-        self._inner.write_range(self._col_id, idx, packed, self._elem_size, self._chunk_bytes)
+    def _setitem_slice(self, key: slice, values) -> None:
+        """
+        Set multiple elements via slice using batch write.
+
+        Args:
+            key: slice object
+            values: list of values matching column dtype
+
+        Raises:
+            ValueError: If step != 1 or length mismatch
+            TypeError: If values don't match dtype
+        """
+        length = len(self)
+        start, stop, step = key.indices(length)
+
+        if step != 1:
+            raise ValueError("Step slicing not supported for setitem")
+
+        count = stop - start
+        if count <= 0:
+            # Empty slice - nothing to do
+            return
+
+        # Validate values length
+        if len(values) != count:
+            raise ValueError(
+                f"Slice length mismatch: slice has {count} elements, "
+                f"but {len(values)} values provided"
+            )
+
+        # Pack all values (batch in Rust for speed!)
+        if self._use_rust_packer:
+            packed_data = self._rust_packer.pack_many(values)
+        else:
+            # Python fallback
+            packed_data = b"".join(self._pack(v) for v in values)
+
+        # Write using existing write_range (handles multi-chunk automatically)
+        self._inner.write_range(
+            self._col_id, start, packed_data, self._elem_size, self._chunk_bytes
+        )
 
     def __delitem__(self, idx: int) -> None:
         """
@@ -725,11 +780,117 @@ class VarSizeColumn(MutableSequence):
         else:
             raise TypeError("Column indices must be integers or slices")
 
-    def __setitem__(self, idx: int, value: bytes) -> None:
-        """Set element at index (must be same size as existing element)."""
-        raise NotImplementedError(
-            "Setting individual elements in variable-size columns not supported. "
-            "Delete and re-insert instead."
+    def __setitem__(self, key, value):
+        """
+        Set element(s) at index (NEW in v0.5.0 with size-aware logic!).
+
+        Single element:
+            col[42] = b"new data"  # Works even if size different!
+
+        Strategy:
+        - new_size ≤ old_size: Direct replace (leaves fragment for vacuum)
+        - new_size > old_size: Insert-like rebuild (may need chunk rebuild)
+
+        Note: Slice setitem not yet implemented.
+        """
+        if isinstance(key, slice):
+            # Slice setitem - batch update
+            return self._setitem_slice(key, value)
+        elif isinstance(key, int):
+            # Flush cache before modification
+            if self._cache_enabled:
+                self._inner.flush_cache(self._data_col_id)
+
+            # Validate index
+            length = len(self)
+            if key < 0:
+                key += length
+            if key < 0 or key >= length:
+                raise IndexError(f"Index out of range: {key}")
+
+            # Pack new value
+            if self._use_rust_packer and self._packer:
+                new_data = self._packer.pack(value)
+            else:
+                if not isinstance(value, bytes):
+                    raise TypeError("Value must be bytes")
+                new_data = value
+
+            # Read current index entry
+            index_data = self._inner.read_range(self._idx_col_id, key, 1, 12, self._idx_chunk_bytes)
+            chunk_id = unpack_i32(index_data, 0)
+            old_start = unpack_i32(index_data, 4)
+            old_end = unpack_i32(index_data, 8)
+
+            # Delegate to Rust for size-aware update
+            self._inner.update_varsize_element(
+                self._data_col_id,
+                self._idx_col_id,
+                key,
+                new_data,
+                chunk_id,
+                old_start,
+                old_end,
+                self._data_max_chunk,
+            )
+        else:
+            raise TypeError("Column indices must be integers or slices")
+
+    def _setitem_slice(self, key: slice, values) -> None:
+        """
+        Set multiple variable-size elements via slice using batch update.
+
+        Strategy:
+        - total_new ≤ total_old: Direct replace (leaves fragments)
+        - total_new > total_old: Rebuild chunks
+
+        Args:
+            key: slice object
+            values: list of new values
+
+        Raises:
+            ValueError: If step != 1 or length mismatch
+        """
+        # Flush cache before modification
+        if self._cache_enabled:
+            self._inner.flush_cache(self._data_col_id)
+
+        length = len(self)
+        start, stop, step = key.indices(length)
+
+        if step != 1:
+            raise ValueError("Step slicing not supported for setitem")
+
+        count = stop - start
+        if count <= 0:
+            # Empty slice - nothing to do
+            return
+
+        # Validate values length
+        if len(values) != count:
+            raise ValueError(
+                f"Slice length mismatch: slice has {count} elements, "
+                f"but {len(values)} values provided"
+            )
+
+        # Pack all values
+        packed_values = []
+        for v in values:
+            if self._use_rust_packer and self._packer:
+                packed_values.append(self._packer.pack(v))
+            else:
+                if not isinstance(v, bytes):
+                    raise TypeError("Value must be bytes")
+                packed_values.append(v)
+
+        # Delegate to Rust for efficient batch update
+        self._inner.update_varsize_slice(
+            self._data_col_id,
+            self._idx_col_id,
+            start,
+            count,
+            packed_values,
+            self._data_max_chunk,
         )
 
     def __delitem__(self, idx: int) -> None:

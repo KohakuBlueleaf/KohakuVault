@@ -1008,6 +1008,433 @@ impl _ColumnVault {
         Ok(())
     }
 
+    /// Update variable-size element with size-aware logic (v0.5.0).
+    ///
+    /// Strategy:
+    /// - new_size ≤ old_size: Direct replace, update index, DON'T change bytes_used (leave fragment!)
+    /// - new_size > old_size: Treat as "insert after delete", update bytes_used, may rebuild/split chunk
+    ///
+    /// # Arguments
+    /// * `data_col_id` - Data column ID
+    /// * `idx_col_id` - Index column ID
+    /// * `elem_idx` - Element index to update
+    /// * `new_data` - New element data
+    /// * `chunk_id` - Current chunk ID (from index)
+    /// * `old_start` - Current start byte (from index)
+    /// * `old_end` - Current end byte (from index)
+    /// * `max_chunk_bytes` - Max chunk size
+    ///
+    /// # Returns
+    /// (new_chunk_id, new_start, new_end)
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (data_col_id, idx_col_id, elem_idx, new_data, chunk_id, old_start, old_end, max_chunk_bytes))]
+    fn update_varsize_element(
+        &self,
+        _py: Python<'_>,
+        data_col_id: i64,
+        idx_col_id: i64,
+        elem_idx: i64,
+        new_data: &Bound<'_, PyBytes>,
+        chunk_id: i32,
+        old_start: i32,
+        old_end: i32,
+        max_chunk_bytes: i64,
+    ) -> PyResult<(i32, i32, i32)> {
+        let conn = self.conn.lock().unwrap();
+        let new_data_bytes = new_data.as_bytes();
+        let new_size = new_data_bytes.len() as i32;
+        let old_size = old_end - old_start;
+        let size_delta = new_size - old_size;
+
+        // Get chunk info
+        let (actual_size, bytes_used): (i64, i64) = conn
+            .query_row(
+                "SELECT actual_size, bytes_used FROM col_chunks
+                 WHERE col_id = ?1 AND chunk_idx = ?2",
+                params![data_col_id, chunk_id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(ColError::from)?;
+
+        // CASE 1: Same size or smaller - Direct replace
+        if size_delta <= 0 {
+            // Get rowid for BLOB API
+            let rowid: i64 = conn
+                .query_row(
+                    "SELECT rowid FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![data_col_id, chunk_id as i64],
+                    |row| row.get(0),
+                )
+                .map_err(ColError::from)?;
+
+            // Write new data using BLOB API
+            let mut blob = conn
+                .blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "col_chunks",
+                    "data",
+                    rowid,
+                    false, // writable
+                )
+                .map_err(ColError::from)?;
+
+            blob.write_at(new_data_bytes, old_start as usize)
+                .map_err(ColError::from)?;
+
+            drop(blob);
+
+            // Update index entry (new end_byte)
+            let new_index = Self::pack_index_triple(chunk_id, old_start, old_start + new_size);
+            Self::update_index_entry_internal(
+                &conn,
+                idx_col_id,
+                elem_idx,
+                &new_index,
+                max_chunk_bytes,
+            )?;
+
+            // IMPORTANT: DON'T update bytes_used (leave fragment for vacuum!)
+
+            return Ok((chunk_id, old_start, old_start + new_size));
+        }
+
+        // CASE 2: Larger - treat as "delete old + insert new"
+        // This requires rebuilding the chunk section after this element
+
+        // Check if delta fits in remaining space
+        let available = actual_size - bytes_used;
+
+        if size_delta as i64 <= available {
+            // Fits - shift elements after this one
+            let rowid: i64 = conn
+                .query_row(
+                    "SELECT rowid FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![data_col_id, chunk_id as i64],
+                    |row| row.get(0),
+                )
+                .map_err(ColError::from)?;
+
+            // Read data after old element
+            let data_after_len = (bytes_used as i32 - old_end) as usize;
+            let mut data_after = vec![0u8; data_after_len];
+
+            let blob_r = conn
+                .blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "col_chunks",
+                    "data",
+                    rowid,
+                    true, // read-only
+                )
+                .map_err(ColError::from)?;
+
+            blob_r
+                .read_at(&mut data_after, old_end as usize)
+                .map_err(ColError::from)?;
+            drop(blob_r);
+
+            // Write new data + shifted data
+            let mut blob_w = conn
+                .blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "col_chunks",
+                    "data",
+                    rowid,
+                    false, // writable
+                )
+                .map_err(ColError::from)?;
+
+            blob_w
+                .write_at(new_data_bytes, old_start as usize)
+                .map_err(ColError::from)?;
+            blob_w
+                .write_at(&data_after, (old_start + new_size) as usize)
+                .map_err(ColError::from)?;
+
+            drop(blob_w);
+
+            // Update THIS element's index
+            let new_index = Self::pack_index_triple(chunk_id, old_start, old_start + new_size);
+            Self::update_index_entry_internal(
+                &conn,
+                idx_col_id,
+                elem_idx,
+                &new_index,
+                max_chunk_bytes,
+            )?;
+
+            // Shift all subsequent elements' indices in this chunk
+            Self::shift_chunk_indices_after(
+                &conn,
+                idx_col_id,
+                elem_idx + 1,
+                chunk_id,
+                size_delta,
+                max_chunk_bytes,
+            )?;
+
+            // Update bytes_used (grew by delta)
+            let new_bytes_used = bytes_used + size_delta as i64;
+            conn.execute(
+                "UPDATE col_chunks SET bytes_used = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
+                params![new_bytes_used, data_col_id, chunk_id as i64],
+            )
+            .map_err(ColError::from)?;
+
+            return Ok((chunk_id, old_start, old_start + new_size));
+        }
+
+        // CASE 3: Doesn't fit - rebuild chunk
+        // Get all elements in this chunk
+        let chunk_elements =
+            Self::get_chunk_elements(&conn, idx_col_id, chunk_id, max_chunk_bytes)?;
+
+        // Build new chunk data by reading all elements and replacing the updated one
+        let mut all_data = Vec::new();
+        let mut all_indices = Vec::new();
+
+        for (e_idx, start, end) in chunk_elements.iter() {
+            if *e_idx == elem_idx {
+                // Add NEW data for this element
+                all_data.push(new_data_bytes.to_vec());
+            } else {
+                // Read existing data
+                let data =
+                    Self::read_element_from_chunk(&conn, data_col_id, chunk_id, *start, *end)?;
+                all_data.push(data);
+            }
+        }
+
+        // Calculate total size
+        let total_size: i64 = all_data.iter().map(|d| d.len() as i64).sum();
+
+        // Get min_chunk_bytes for sizing
+        let min_chunk_bytes: i64 = conn
+            .query_row(
+                "SELECT min_chunk_bytes FROM col_meta WHERE col_id = ?1",
+                params![data_col_id],
+                |row| row.get(0),
+            )
+            .map_err(ColError::from)?;
+
+        // Check if chunk would be too large (> 2x max) - need to split
+        if total_size > max_chunk_bytes * 2 {
+            return Err(ColError::Col(format!(
+                "Update would create chunk larger than 2x max ({}MB > {}MB). \
+                 Chunk splitting not yet implemented in single setitem. \
+                 Consider using slice operations or vacuum.",
+                total_size / 1024 / 1024,
+                (max_chunk_bytes * 2) / 1024 / 1024
+            ))
+            .into());
+        }
+
+        // Find appropriate new chunk size
+        let mut new_capacity = min_chunk_bytes;
+        while new_capacity < total_size && new_capacity < max_chunk_bytes {
+            new_capacity *= 2;
+        }
+
+        // Allow up to 1.5x max for small overflows (matches append_raw_adaptive pattern)
+        if total_size <= max_chunk_bytes * 3 / 2 {
+            new_capacity = total_size;
+        } else {
+            new_capacity = std::cmp::min(new_capacity, max_chunk_bytes);
+        }
+
+        // Rewrite chunk with new data
+        let rowid: i64 = conn
+            .query_row(
+                "SELECT rowid FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                params![data_col_id, chunk_id as i64],
+                |row| row.get(0),
+            )
+            .map_err(ColError::from)?;
+
+        let mut new_blob = vec![0u8; new_capacity as usize];
+        let mut offset = 0usize;
+
+        // Write all elements sequentially
+        for (i, data) in all_data.iter().enumerate() {
+            new_blob[offset..offset + data.len()].copy_from_slice(data);
+
+            let e_idx = chunk_elements[i].0;
+            let start = offset as i32;
+            let end = (offset + data.len()) as i32;
+
+            all_indices.push((e_idx, start, end));
+            offset += data.len();
+        }
+
+        // Update chunk using BLOB API
+        let blob = conn
+            .blob_open(
+                rusqlite::DatabaseName::Main,
+                "col_chunks",
+                "data",
+                rowid,
+                false, // writable
+            )
+            .map_err(ColError::from)?;
+
+        // Grow chunk if needed
+        drop(blob);
+        if new_capacity > actual_size {
+            conn.execute(
+                "UPDATE col_chunks SET data = zeroblob(?1), actual_size = ?1
+                 WHERE col_id = ?2 AND chunk_idx = ?3",
+                params![new_capacity, data_col_id, chunk_id as i64],
+            )
+            .map_err(ColError::from)?;
+        }
+
+        // Reopen and write data
+        let mut blob = conn
+            .blob_open(
+                rusqlite::DatabaseName::Main,
+                "col_chunks",
+                "data",
+                rowid,
+                false, // writable
+            )
+            .map_err(ColError::from)?;
+
+        blob.write_at(&new_blob[..offset], 0)
+            .map_err(ColError::from)?;
+        drop(blob);
+
+        // Update bytes_used
+        conn.execute(
+            "UPDATE col_chunks SET bytes_used = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
+            params![total_size, data_col_id, chunk_id as i64],
+        )
+        .map_err(ColError::from)?;
+
+        // Update ALL index entries for this chunk
+        for (e_idx, start, end) in all_indices.iter() {
+            let new_index = Self::pack_index_triple(chunk_id, *start, *end);
+            Self::update_index_entry_internal(
+                &conn,
+                idx_col_id,
+                *e_idx,
+                &new_index,
+                max_chunk_bytes,
+            )?;
+        }
+
+        // Return new position for the updated element
+        let updated_entry = all_indices
+            .iter()
+            .find(|(e_idx, _, _)| *e_idx == elem_idx)
+            .unwrap();
+
+        Ok((chunk_id, updated_entry.1, updated_entry.2))
+    }
+
+    /// Update multiple variable-size elements via slice (v0.5.0).
+    ///
+    /// Strategy:
+    /// - If total_new_bytes ≤ total_old_bytes: Direct replace, update indices, DON'T touch bytes_used
+    /// - If total_new_bytes > total_old_bytes: Rebuild affected chunks, update bytes_used, split if > 2x max
+    ///
+    /// # Arguments
+    /// * `data_col_id` - Data column ID
+    /// * `idx_col_id` - Index column ID
+    /// * `start_idx` - Starting element index
+    /// * `count` - Number of elements to update
+    /// * `new_values` - List of new values (PyBytes)
+    /// * `max_chunk_bytes` - Max chunk size
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (data_col_id, idx_col_id, start_idx, count, new_values, max_chunk_bytes))]
+    fn update_varsize_slice(
+        &self,
+        _py: Python<'_>,
+        data_col_id: i64,
+        idx_col_id: i64,
+        start_idx: i64,
+        count: i64,
+        new_values: &Bound<'_, PyList>,
+        max_chunk_bytes: i64,
+    ) -> PyResult<()> {
+        if count == 0 {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        // 1. Read all affected index entries
+        let index_data =
+            self._read_range_internal(&conn, idx_col_id, start_idx, count, 12, max_chunk_bytes)?;
+
+        // Parse old indices and calculate total old size
+        let mut old_indices: Vec<(i64, i32, i32, i32)> = Vec::new(); // (elem_idx, chunk_id, start, end)
+        let mut total_old_size = 0i64;
+
+        for i in 0..count as usize {
+            let offset = i * 12;
+            let chunk_id = i32::from_le_bytes([
+                index_data[offset],
+                index_data[offset + 1],
+                index_data[offset + 2],
+                index_data[offset + 3],
+            ]);
+            let start = i32::from_le_bytes([
+                index_data[offset + 4],
+                index_data[offset + 5],
+                index_data[offset + 6],
+                index_data[offset + 7],
+            ]);
+            let end = i32::from_le_bytes([
+                index_data[offset + 8],
+                index_data[offset + 9],
+                index_data[offset + 10],
+                index_data[offset + 11],
+            ]);
+
+            old_indices.push((start_idx + i as i64, chunk_id, start, end));
+            total_old_size += (end - start) as i64;
+        }
+
+        // Calculate total new size
+        let mut new_values_vec: Vec<Vec<u8>> = Vec::new();
+        let mut total_new_size = 0i64;
+
+        for i in 0..count as usize {
+            let val = new_values
+                .get_item(i)?
+                .downcast::<PyBytes>()?
+                .as_bytes()
+                .to_vec();
+            total_new_size += val.len() as i64;
+            new_values_vec.push(val);
+        }
+
+        // 2. Decide strategy based on total size comparison
+        if total_new_size <= total_old_size {
+            // DIRECT REPLACEMENT MODE - write in place, leave fragments
+            Self::update_slice_direct_mode(
+                &conn,
+                data_col_id,
+                idx_col_id,
+                &old_indices,
+                &new_values_vec,
+                max_chunk_bytes,
+            )?;
+        } else {
+            // REBUILD MODE - reconstruct affected chunks
+            Self::update_slice_rebuild_mode(
+                &conn,
+                data_col_id,
+                idx_col_id,
+                &old_indices,
+                &new_values_vec,
+                max_chunk_bytes,
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Append raw bytes to the end of a column with dynamic chunk growth.
     /// Most performance-critical operation.
     ///
@@ -2008,5 +2435,477 @@ impl _ColumnVault {
             .map_err(ColError::from)?;
 
         Ok(total)
+    }
+
+    /// Update a single index entry (12 bytes) in the index column.
+    fn update_index_entry_internal(
+        conn: &Connection,
+        idx_col_id: i64,
+        elem_idx: i64,
+        new_index: &[u8; 12],
+        idx_max_chunk: i64,
+    ) -> Result<(), ColError> {
+        let byte_offset = elem_idx * 12;
+        let chunk_idx = byte_offset / idx_max_chunk;
+        let offset_in_chunk = (byte_offset % idx_max_chunk) as usize;
+
+        // Read index chunk
+        let mut chunk_data: Vec<u8> = conn
+            .query_row(
+                "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                params![idx_col_id, chunk_idx],
+                |row| row.get(0),
+            )
+            .map_err(ColError::from)?;
+
+        // Modify the 12-byte entry
+        chunk_data[offset_in_chunk..offset_in_chunk + 12].copy_from_slice(new_index);
+
+        // Write back
+        conn.execute(
+            "UPDATE col_chunks SET data = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
+            params![chunk_data, idx_col_id, chunk_idx],
+        )
+        .map_err(ColError::from)?;
+
+        Ok(())
+    }
+
+    /// Shift start/end bytes for all index entries after elem_idx in the same chunk.
+    fn shift_chunk_indices_after(
+        conn: &Connection,
+        idx_col_id: i64,
+        start_elem_idx: i64,
+        target_chunk_id: i32,
+        delta: i32,
+        idx_max_chunk: i64,
+    ) -> Result<(), ColError> {
+        // Get column length to know when to stop
+        let length: i64 = conn
+            .query_row(
+                "SELECT length FROM col_meta WHERE col_id = ?1",
+                params![idx_col_id],
+                |row| row.get(0),
+            )
+            .map_err(ColError::from)?;
+
+        // Process each element from start_elem_idx to end
+        for elem_idx in start_elem_idx..length {
+            let byte_offset = elem_idx * 12;
+            let chunk_idx = byte_offset / idx_max_chunk;
+            let offset_in_chunk = (byte_offset % idx_max_chunk) as usize;
+
+            // Read index chunk
+            let mut chunk_data: Vec<u8> = conn
+                .query_row(
+                    "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![idx_col_id, chunk_idx],
+                    |row| row.get(0),
+                )
+                .map_err(ColError::from)?;
+
+            // Parse current entry
+            let cid = i32::from_le_bytes([
+                chunk_data[offset_in_chunk],
+                chunk_data[offset_in_chunk + 1],
+                chunk_data[offset_in_chunk + 2],
+                chunk_data[offset_in_chunk + 3],
+            ]);
+
+            // Only update if in target chunk
+            if cid == target_chunk_id {
+                let start = i32::from_le_bytes([
+                    chunk_data[offset_in_chunk + 4],
+                    chunk_data[offset_in_chunk + 5],
+                    chunk_data[offset_in_chunk + 6],
+                    chunk_data[offset_in_chunk + 7],
+                ]);
+                let end = i32::from_le_bytes([
+                    chunk_data[offset_in_chunk + 8],
+                    chunk_data[offset_in_chunk + 9],
+                    chunk_data[offset_in_chunk + 10],
+                    chunk_data[offset_in_chunk + 11],
+                ]);
+
+                // Shift both start and end
+                let new_start = start + delta;
+                let new_end = end + delta;
+                let new_index = Self::pack_index_triple(cid, new_start, new_end);
+
+                // Update in chunk_data buffer
+                chunk_data[offset_in_chunk..offset_in_chunk + 12].copy_from_slice(&new_index);
+
+                // Write back
+                conn.execute(
+                    "UPDATE col_chunks SET data = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
+                    params![chunk_data, idx_col_id, chunk_idx],
+                )
+                .map_err(ColError::from)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get all elements in a specific data chunk by scanning the index column.
+    /// Returns Vec<(elem_idx, start_byte, end_byte)> sorted by start_byte.
+    fn get_chunk_elements(
+        conn: &Connection,
+        idx_col_id: i64,
+        target_chunk_id: i32,
+        idx_max_chunk: i64,
+    ) -> Result<Vec<(i64, i32, i32)>, ColError> {
+        let length: i64 = conn
+            .query_row(
+                "SELECT length FROM col_meta WHERE col_id = ?1",
+                params![idx_col_id],
+                |row| row.get(0),
+            )
+            .map_err(ColError::from)?;
+
+        let mut elements = Vec::new();
+
+        for elem_idx in 0..length {
+            let byte_offset = elem_idx * 12;
+            let chunk_idx = byte_offset / idx_max_chunk;
+            let offset_in_chunk = (byte_offset % idx_max_chunk) as usize;
+
+            let chunk_data: Vec<u8> = conn
+                .query_row(
+                    "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![idx_col_id, chunk_idx],
+                    |row| row.get(0),
+                )
+                .map_err(ColError::from)?;
+
+            let cid = i32::from_le_bytes([
+                chunk_data[offset_in_chunk],
+                chunk_data[offset_in_chunk + 1],
+                chunk_data[offset_in_chunk + 2],
+                chunk_data[offset_in_chunk + 3],
+            ]);
+
+            if cid == target_chunk_id {
+                let start = i32::from_le_bytes([
+                    chunk_data[offset_in_chunk + 4],
+                    chunk_data[offset_in_chunk + 5],
+                    chunk_data[offset_in_chunk + 6],
+                    chunk_data[offset_in_chunk + 7],
+                ]);
+                let end = i32::from_le_bytes([
+                    chunk_data[offset_in_chunk + 8],
+                    chunk_data[offset_in_chunk + 9],
+                    chunk_data[offset_in_chunk + 10],
+                    chunk_data[offset_in_chunk + 11],
+                ]);
+
+                elements.push((elem_idx, start, end));
+            }
+        }
+
+        // Sort by start_byte to maintain order
+        elements.sort_by_key(|(_, start, _)| *start);
+
+        Ok(elements)
+    }
+
+    /// Read element data from chunk given start/end bytes.
+    fn read_element_from_chunk(
+        conn: &Connection,
+        data_col_id: i64,
+        chunk_id: i32,
+        start_byte: i32,
+        end_byte: i32,
+    ) -> Result<Vec<u8>, ColError> {
+        let rowid: i64 = conn
+            .query_row(
+                "SELECT rowid FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                params![data_col_id, chunk_id as i64],
+                |row| row.get(0),
+            )
+            .map_err(ColError::from)?;
+
+        let blob = conn
+            .blob_open(
+                rusqlite::DatabaseName::Main,
+                "col_chunks",
+                "data",
+                rowid,
+                true, // read-only
+            )
+            .map_err(ColError::from)?;
+
+        let len = (end_byte - start_byte) as usize;
+        let mut result = vec![0u8; len];
+        blob.read_at(&mut result, start_byte as usize)
+            .map_err(ColError::from)?;
+
+        Ok(result)
+    }
+
+    /// Direct replacement mode for slice update (total_new ≤ total_old).
+    /// Writes new data sequentially, updates indices, leaves fragments.
+    ///
+    /// IMPORTANT: Can't write at old positions independently because elements are contiguous!
+    /// Must rebuild the sequence starting from first updated element.
+    fn update_slice_direct_mode(
+        conn: &Connection,
+        data_col_id: i64,
+        idx_col_id: i64,
+        old_indices: &[(i64, i32, i32, i32)], // (elem_idx, chunk_id, start, end)
+        new_values: &[Vec<u8>],
+        idx_max_chunk: i64,
+    ) -> Result<(), ColError> {
+        // Create update map
+        let update_map: HashMap<i64, &Vec<u8>> = old_indices
+            .iter()
+            .enumerate()
+            .map(|(i, (elem_idx, _, _, _))| (*elem_idx, &new_values[i]))
+            .collect();
+
+        // Group old_indices by chunk
+        let mut chunks_affected: HashMap<i32, Vec<i64>> = HashMap::new();
+        for (elem_idx, chunk_id, _, _) in old_indices {
+            chunks_affected
+                .entry(*chunk_id)
+                .or_default()
+                .push(*elem_idx);
+        }
+
+        // Process each affected chunk
+        for (chunk_id, _) in chunks_affected {
+            // Get ALL elements in this chunk
+            let all_elements = Self::get_chunk_elements(conn, idx_col_id, chunk_id, idx_max_chunk)?;
+
+            // Find the first element being updated in this chunk
+            let first_updated_idx = all_elements
+                .iter()
+                .position(|(elem_idx, _, _)| update_map.contains_key(elem_idx))
+                .unwrap_or(all_elements.len());
+
+            if first_updated_idx == all_elements.len() {
+                // No updates in this chunk, skip
+                continue;
+            }
+
+            // Start writing from the first updated element's position
+            let write_start = all_elements[first_updated_idx].1;
+
+            // Build new data starting from first updated element
+            let mut new_data_from_update = Vec::new();
+            let mut updated_indices = Vec::new();
+
+            for (elem_idx, old_start, old_end) in all_elements.iter().skip(first_updated_idx) {
+                let offset = new_data_from_update.len() as i32;
+                let start = write_start + offset;
+
+                if let Some(new_val) = update_map.get(elem_idx) {
+                    // Use new value
+                    new_data_from_update.extend_from_slice(new_val);
+                } else {
+                    // Keep old value
+                    let old_data = Self::read_element_from_chunk(
+                        conn,
+                        data_col_id,
+                        chunk_id,
+                        *old_start,
+                        *old_end,
+                    )?;
+                    new_data_from_update.extend_from_slice(&old_data);
+                }
+
+                let end = write_start + new_data_from_update.len() as i32;
+                updated_indices.push((*elem_idx, start, end));
+            }
+
+            // Write the rebuilt section
+            let rowid: i64 = conn
+                .query_row(
+                    "SELECT rowid FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![data_col_id, chunk_id as i64],
+                    |row| row.get(0),
+                )
+                .map_err(ColError::from)?;
+
+            let mut blob = conn
+                .blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "col_chunks",
+                    "data",
+                    rowid,
+                    false, // writable
+                )
+                .map_err(ColError::from)?;
+
+            blob.write_at(&new_data_from_update, write_start as usize)
+                .map_err(ColError::from)?;
+            drop(blob);
+
+            // Update index entries for all affected elements
+            for (elem_idx, start, end) in updated_indices {
+                let new_index = Self::pack_index_triple(chunk_id, start, end);
+                Self::update_index_entry_internal(
+                    conn,
+                    idx_col_id,
+                    elem_idx,
+                    &new_index,
+                    idx_max_chunk,
+                )?;
+            }
+
+            // IMPORTANT: DON'T update bytes_used (fragments remain for vacuum!)
+        }
+
+        Ok(())
+    }
+
+    /// Rebuild mode for slice update (total_new > total_old).
+    /// Rebuilds affected chunks, updates bytes_used, splits if needed.
+    fn update_slice_rebuild_mode(
+        conn: &Connection,
+        data_col_id: i64,
+        idx_col_id: i64,
+        old_indices: &[(i64, i32, i32, i32)],
+        new_values: &[Vec<u8>],
+        max_chunk_bytes: i64,
+    ) -> Result<(), ColError> {
+        // Create map for quick lookup of which elements are being updated
+        let update_map: HashMap<i64, &Vec<u8>> = old_indices
+            .iter()
+            .enumerate()
+            .map(|(i, (elem_idx, _, _, _))| (*elem_idx, &new_values[i]))
+            .collect();
+
+        // Group old_indices by chunk
+        let mut chunks_affected: HashMap<i32, Vec<i64>> = HashMap::new();
+        for (elem_idx, chunk_id, _, _) in old_indices {
+            chunks_affected
+                .entry(*chunk_id)
+                .or_default()
+                .push(*elem_idx);
+        }
+
+        // Process each affected chunk
+        for (chunk_id, _) in chunks_affected {
+            // Get ALL elements in this chunk (not just updated ones)
+            let all_elements =
+                Self::get_chunk_elements(conn, idx_col_id, chunk_id, max_chunk_bytes)?;
+
+            // Build new chunk data
+            let mut new_chunk_data = Vec::new();
+            let mut new_indices_for_chunk: Vec<(i64, i32, i32)> = Vec::new();
+
+            for (elem_idx, old_start, old_end) in all_elements {
+                let start = new_chunk_data.len() as i32;
+
+                if let Some(new_data) = update_map.get(&elem_idx) {
+                    // Use new value
+                    new_chunk_data.extend_from_slice(new_data);
+                } else {
+                    // Keep old value
+                    let old_data = Self::read_element_from_chunk(
+                        conn,
+                        data_col_id,
+                        chunk_id,
+                        old_start,
+                        old_end,
+                    )?;
+                    new_chunk_data.extend_from_slice(&old_data);
+                }
+
+                let end = new_chunk_data.len() as i32;
+                new_indices_for_chunk.push((elem_idx, start, end));
+            }
+
+            let new_size = new_chunk_data.len() as i64;
+
+            // Check if chunk needs splitting (> 2x max)
+            if new_size > max_chunk_bytes * 2 {
+                return Err(ColError::Col(format!(
+                    "Slice update would create chunk larger than 2x max ({}MB > {}MB). \
+                     Chunk splitting not yet fully implemented. Consider smaller updates.",
+                    new_size / 1024 / 1024,
+                    (max_chunk_bytes * 2) / 1024 / 1024
+                ))
+                .into());
+            }
+
+            // Get min_chunk_bytes and current actual_size
+            let (min_chunk_bytes, actual_size): (i64, i64) = conn
+                .query_row(
+                    "SELECT min_chunk_bytes, actual_size FROM col_meta cm
+                     JOIN col_chunks cc ON cm.col_id = cc.col_id
+                     WHERE cc.col_id = ?1 AND cc.chunk_idx = ?2",
+                    params![data_col_id, chunk_id as i64],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(ColError::from)?;
+
+            // Find appropriate capacity
+            let mut new_capacity = min_chunk_bytes;
+            while new_capacity < new_size && new_capacity < max_chunk_bytes {
+                new_capacity *= 2;
+            }
+
+            // Allow up to 1.5x max for small overflows
+            if new_size <= max_chunk_bytes * 3 / 2 {
+                new_capacity = new_size;
+            } else {
+                new_capacity = std::cmp::min(new_capacity, max_chunk_bytes);
+            }
+
+            // Resize chunk if needed
+            if new_capacity > actual_size {
+                conn.execute(
+                    "UPDATE col_chunks SET data = zeroblob(?1), actual_size = ?1
+                     WHERE col_id = ?2 AND chunk_idx = ?3",
+                    params![new_capacity, data_col_id, chunk_id as i64],
+                )
+                .map_err(ColError::from)?;
+            }
+
+            // Write new chunk data
+            let rowid: i64 = conn
+                .query_row(
+                    "SELECT rowid FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![data_col_id, chunk_id as i64],
+                    |row| row.get(0),
+                )
+                .map_err(ColError::from)?;
+
+            let mut blob = conn
+                .blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "col_chunks",
+                    "data",
+                    rowid,
+                    false, // writable
+                )
+                .map_err(ColError::from)?;
+
+            blob.write_at(&new_chunk_data, 0).map_err(ColError::from)?;
+            drop(blob);
+
+            // Update bytes_used
+            conn.execute(
+                "UPDATE col_chunks SET bytes_used = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
+                params![new_size, data_col_id, chunk_id as i64],
+            )
+            .map_err(ColError::from)?;
+
+            // Update ALL index entries for this chunk
+            for (elem_idx, start, end) in new_indices_for_chunk {
+                let new_index = Self::pack_index_triple(chunk_id, start, end);
+                Self::update_index_entry_internal(
+                    conn,
+                    idx_col_id,
+                    elem_idx,
+                    &new_index,
+                    max_chunk_bytes,
+                )?;
+            }
+        }
+
+        Ok(())
     }
 }
