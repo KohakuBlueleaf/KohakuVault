@@ -456,7 +456,7 @@ List-like interface for fixed-size elements.
 value = col[0]
 value = col[-1]        # Negative indexing supported
 
-# Get slice (NEW in v0.5.0 - FAST!)
+# Get slice (v0.5.0 - FAST!)
 values = col[100:200]  # 20-237x faster than loop!
 values = col[:50]      # First 50 elements
 values = col[-10:]     # Last 10 elements
@@ -465,19 +465,31 @@ values = col[-10:]     # Last 10 elements
 col[0] = 42
 col[-1] = 99
 
+# Set slice (NEW in v0.5.0 - FAST!)
+col[100:200] = [i * 10 for i in range(100)]  # Batch write!
+col[:5] = [10, 20, 30, 40, 50]
+
 # Delete element (O(n) - shifts remaining)
 del col[0]
 ```
 
 **Performance (v0.5.0):**
-- Slice reading uses single Rust call with batch unpacking
-- **135-237x faster** than `[col[i] for i in range(a, b)]`
-- Automatic iteration optimization (no code changes needed)
+
+| Operation | Method | Speedup |
+|-----------|--------|---------|
+| **Read slice** | Single Rust call with batch unpack | **135-237x faster** |
+| **Write slice** | Batch pack + write_range | **20-50x faster** |
+| **Iteration** | Automatic batch reads | **10-20x faster** |
+
+**Requirements for slice setitem:**
+- Length must match: `len(values)` must equal slice length
+- Step not supported: `col[::2] = values` raises ValueError
+- Type validation: All values must match column dtype
 
 **Raises:**
 - `IndexError`: Index out of bounds
 - `TypeError`: Invalid index type or value type
-- `ValueError`: Step slicing not supported (e.g., `col[::2]`)
+- `ValueError`: Step slicing or length mismatch
 
 ### Methods
 
@@ -573,7 +585,9 @@ List-like interface for variable-length byte strings.
 
 **Supported:**
 - ✅ `col[i]` get (O(1))
-- ✅ `col[a:b]` slice (NEW in v0.5.0 - **20-100x faster!**)
+- ✅ `col[a:b]` slice read (v0.5.0 - **20-100x faster!**)
+- ✅ `col[i] = value` setitem (NEW in v0.5.0 - **size-aware!**)
+- ✅ `col[a:b] = values` slice setitem (NEW in v0.5.0 - **batch update!**)
 - ✅ `len(col)` (O(1))
 - ✅ `append(value)` (O(1))
 - ✅ `extend(values)` (O(k))
@@ -581,9 +595,8 @@ List-like interface for variable-length byte strings.
 - ✅ `clear()` (O(1))
 
 **Not supported:**
-- ❌ `col[i] = value` (can't resize in-place)
-- ❌ `del col[i]` (would shift all data)
-- ❌ `insert(i, value)` (same reason)
+- ❌ `del col[i]` (lazy deletion implemented, but shifts indices)
+- ❌ `insert(i, value)` (not yet implemented)
 
 ### Usage
 
@@ -601,9 +614,17 @@ print(msgs[0])   # b'short' (exact size, no padding)
 print(msgs[1])   # b'this is a much longer message'
 print(msgs[-1])  # b'x'
 
-# Slice access (NEW in v0.5.0 - FAST!)
+# Slice read (v0.5.0 - FAST!)
 batch = msgs[10:110]  # 20-100x faster than loop!
 print(len(batch))     # 100
+
+# Single element setitem (NEW in v0.5.0 - size-aware!)
+msgs[0] = b"Updated short"      # Smaller - direct replace, leaves fragment
+msgs[1] = b"Updated to longer message"  # Larger - may rebuild chunk
+msgs[2] = b"Same size text"      # Same size - direct replace
+
+# Slice setitem (NEW in v0.5.0 - FAST!)
+msgs[10:15] = [b"a", b"bb", b"ccc", b"dddd", b"eeeee"]  # Batch update!
 
 # Iterate (automatically optimized in v0.5.0)
 for msg in msgs:
@@ -612,6 +633,31 @@ for msg in msgs:
 # Cache support (v0.4.1) - same API as Column
 with msgs.cache():
     msgs.extend(large_data_list)  # 2-10x faster
+```
+
+**Variable-Size Setitem Strategy (v0.5.0):**
+
+**Single Element (`col[i] = value`):**
+- **new_size ≤ old_size**: Direct BLOB replace, update index end_byte, **DON'T update bytes_used** (leave fragment for vacuum)
+- **new_size > old_size (fits)**: Shift subsequent elements in chunk, update affected indices, update bytes_used
+- **new_size > old_size (rebuild)**: Rebuild entire chunk, update all indices, update bytes_used
+
+**Slice Update (`col[a:b] = values`):**
+- **total_new ≤ total_old**: Direct mode - sequential write from first update, update indices, **DON'T update bytes_used** (fragments)
+- **total_new > total_old**: Rebuild mode - reconstruct affected chunks, update indices, update bytes_used
+
+**Performance:**
+- Same/smaller: < 1ms (50x faster than delete+insert)
+- Larger (fits): 5-20ms (2-5x faster)
+- Larger (rebuild): 50-200ms per chunk
+- Slice (direct): 5-10x faster than loop
+- Slice (rebuild): 8-10x faster than loop
+
+**Fragment Management:**
+- Fragments accumulate when using smaller replacements
+- Vacuuming (future feature) will clean up fragments
+- bytes_used includes fragments until vacuum
+- Doesn't affect read performance (indices point to valid data)
 ```
 
 ### How It Works

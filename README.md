@@ -47,6 +47,9 @@ with temps.cache():
 values = temps[100:200]  # 20-237x faster than loops!
 print(len(values))  # 100
 
+# Efficient slice writing (NEW in v0.5.0!)
+temps[100:200] = [25.0 + i * 0.1 for i in range(100)]  # Batch update!
+
 # Structured data (v0.3.0!)
 cv.create_column("users", "msgpack")
 users = cv["users"]
@@ -87,7 +90,8 @@ unpacked = packer.unpack_many(packed_all, offsets=offsets)
 - **Type-safe columnar**: Fixed-size (i64, f64, bytes:N) and variable-size (bytes, str, msgpack, cbor)
 - **Rust performance**: Native speed with Pythonic ergonomics
 - **Smart caching**: Write-back cache for 10-100x faster bulk writes (v0.4.1!)
-- **Efficient slicing**: Batch reads for 20-237x faster range access (NEW in v0.5.0!)
+- **Efficient slicing**: Batch read/write for 20-237x faster range access (NEW in v0.5.0!)
+- **Variable-size setitem**: Size-aware updates with fragment management (NEW in v0.5.0!)
 - **Structured data**: Store dicts/lists directly with MessagePack/CBOR (v0.3.0)
 - **DataPacker**: Rust-based serialization with multi-encoding support (v0.3.0)
 
@@ -278,7 +282,7 @@ vault = KVault(
 )
 ```
 
-### Columnar Storage (NEW!)
+### Columnar Storage
 
 List-like interface for typed sequences (timeseries, logs, events):
 
@@ -297,12 +301,20 @@ temps.append(23.5)
 temps.extend([24.1, 25.0, 25.3])
 print(temps[0], temps[-1], len(temps))  # 23.5, 25.3, 4
 
+# Efficient slice operations (NEW in v0.5.0!)
+values = temps[10:20]  # Batch read - 237x faster!
+temps[10:20] = [25.0 + i * 0.1 for i in range(10)]  # Batch write - 20-50x faster!
+
 # Variable-size bytes (for strings, JSON, etc.)
 cv.create_column("log_messages", "bytes")  # No size = variable!
 logs = cv["log_messages"]
 logs.append(b"Short message")
 logs.append(b"This is a much longer log entry with details...")
 print(logs[0])  # Exact bytes, no padding
+
+# Variable-size setitem with size-aware logic (NEW in v0.5.0!)
+logs[0] = b"Updated message"  # Works even if size different!
+logs[5:10] = [b"batch", b"update", b"works", b"too", b"!"]  # Batch update!
 
 # Iterate
 for temp in temps:
