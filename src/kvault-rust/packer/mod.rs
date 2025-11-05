@@ -161,10 +161,7 @@ impl PackerDType {
                 } else {
                     None
                 };
-                Ok(Self::Cbor {
-                    schema: None,
-                    fixed_size,
-                })
+                Ok(Self::Cbor { schema: None, fixed_size })
             }
 
             _ => Err(PackerError::InvalidDtype(format!("Unknown dtype: {}", dtype_str))),
@@ -248,10 +245,7 @@ impl DataPacker {
     #[pyo3(signature = (schema=None))]
     fn with_cddl_schema(schema: Option<&str>) -> PyResult<Self> {
         Ok(Self {
-            dtype: PackerDType::Cbor {
-                schema: schema.map(|s| s.to_string()),
-                fixed_size: None,
-            },
+            dtype: PackerDType::Cbor { schema: schema.map(|s| s.to_string()), fixed_size: None },
         })
     }
 
@@ -442,7 +436,9 @@ impl DataPacker {
                 if let Some(size) = fixed_size {
                     // Fixed-size: read exact bytes
                     if offset + size > data.len() {
-                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Not enough data"));
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                            "Not enough data",
+                        ));
                     }
                     // MessagePack is self-delimiting, so just try to decode
                     // The deserializer will stop at the end of the msgpack data
@@ -460,7 +456,9 @@ impl DataPacker {
                 if let Some(size) = fixed_size {
                     // Fixed-size: read exact bytes
                     if offset + size > data.len() {
-                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Not enough data"));
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                            "Not enough data",
+                        ));
                     }
                     // CBOR is self-delimiting, so just try to decode
                     // The deserializer will stop at the end of the cbor data
