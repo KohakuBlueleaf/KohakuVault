@@ -160,6 +160,11 @@ impl _ColumnVault {
         let _ = conn.pragma_update(None, "wal_autocheckpoint", 1000);
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
 
+        // CRITICAL: Set busy timeout to prevent infinite hangs when closing
+        // If database is locked, SQLite will retry for up to 5 seconds
+        conn.busy_timeout(std::time::Duration::from_millis(5000))
+            .map_err(ColError::from)?;
+
         // Create schema for columnar storage
         conn.execute_batch(
             "
@@ -232,13 +237,12 @@ impl _ColumnVault {
     ///
     /// Returns:
     ///     col_id: Integer ID of created column
-    #[pyo3(signature = (name, dtype, elem_size, chunk_bytes, min_chunk_bytes=131072, max_chunk_bytes=16777216))]
+    #[pyo3(signature = (name, dtype, elem_size, min_chunk_bytes=131072, max_chunk_bytes=16777216))]
     fn create_column(
         &self,
         name: &str,
         dtype: &str,
         elem_size: i64,
-        chunk_bytes: i64,
         min_chunk_bytes: i64,
         max_chunk_bytes: i64,
     ) -> PyResult<i64> {
@@ -257,7 +261,7 @@ impl _ColumnVault {
             INSERT INTO col_meta (name, dtype, elem_size, length, chunk_bytes, min_chunk_bytes, max_chunk_bytes)
             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
             ",
-            params![name, dtype, elem_size, chunk_bytes, aligned_min, aligned_max],
+            params![name, dtype, elem_size, aligned_min, aligned_min, aligned_max],
         )
         .map_err(ColError::from)?;
 
@@ -981,26 +985,93 @@ impl _ColumnVault {
 
             let offset_in_chunk = (write_start - chunk_start_byte) as usize;
 
-            // Ensure chunk exists
-            self.ensure_chunk(&conn, col_id, chunk_idx, false)?;
-
-            // Update chunk data
-            let mut chunk_data: Vec<u8> = conn
+            // Ensure chunk exists and has enough capacity
+            // For setitem operations, we might need to grow the chunk
+            let chunk_exists: bool = conn
                 .query_row(
-                    "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    "SELECT 1 FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![col_id, chunk_idx],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+
+            if !chunk_exists {
+                // Create chunk at appropriate size
+                let (min_chunk, _max_chunk): (i64, i64) = conn
+                    .query_row(
+                        "SELECT min_chunk_bytes, max_chunk_bytes FROM col_meta WHERE col_id = ?1",
+                        params![col_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(ColError::from)?;
+
+                // For random writes, start with min and grow as needed
+                let initial_size = min_chunk;
+                // CRITICAL FIX: Use SQLite's zeroblob() to avoid memory allocation
+                conn.execute(
+                    "INSERT INTO col_chunks (col_id, chunk_idx, data, actual_size)
+                     VALUES (?1, ?2, zeroblob(?3), ?3)",
+                    params![col_id, chunk_idx, initial_size],
+                )
+                .map_err(ColError::from)?;
+            }
+
+            // Check if chunk needs to grow to accommodate this write
+            let actual_size: i64 = conn
+                .query_row(
+                    "SELECT actual_size FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
                     params![col_id, chunk_idx],
                     |row| row.get(0),
                 )
                 .map_err(ColError::from)?;
 
-            chunk_data[offset_in_chunk..offset_in_chunk + bytes_to_write]
-                .copy_from_slice(&data_bytes[data_offset..data_offset + bytes_to_write]);
+            let needed_size = offset_in_chunk + bytes_to_write;
 
-            conn.execute(
-                "UPDATE col_chunks SET data = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
-                params![chunk_data, col_id, chunk_idx],
-            )
-            .map_err(ColError::from)?;
+            if needed_size > actual_size as usize {
+                // Need to grow chunk
+                let (_min_chunk, max_chunk): (i64, i64) = conn
+                    .query_row(
+                        "SELECT min_chunk_bytes, max_chunk_bytes FROM col_meta WHERE col_id = ?1",
+                        params![col_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(ColError::from)?;
+
+                // Grow to next power of 2 or max
+                let mut new_size = actual_size;
+                while new_size < needed_size as i64 && new_size < max_chunk {
+                    new_size *= 2;
+                }
+                new_size = std::cmp::min(new_size, max_chunk);
+
+                if needed_size > new_size as usize {
+                    new_size = needed_size as i64; // Use exact size if still not enough
+                }
+
+                self.grow_chunk_to_size(&conn, col_id, chunk_idx, new_size)?;
+            }
+
+            // Use BLOB API for efficient write (doesn't read entire chunk!)
+            let rowid: i64 = conn
+                .query_row(
+                    "SELECT rowid FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![col_id, chunk_idx],
+                    |row| row.get(0),
+                )
+                .map_err(ColError::from)?;
+
+            let mut blob = conn
+                .blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "col_chunks",
+                    "data",
+                    rowid,
+                    false, // writable
+                )
+                .map_err(ColError::from)?;
+
+            blob.write_at(&data_bytes[data_offset..data_offset + bytes_to_write], offset_in_chunk)
+                .map_err(ColError::from)?;
 
             data_offset += bytes_to_write;
         }
@@ -1229,20 +1300,27 @@ impl _ColumnVault {
             .into());
         }
 
-        // Find appropriate new chunk size
+        // Find appropriate new chunk size with headroom
         let mut new_capacity = min_chunk_bytes;
-        while new_capacity < total_size && new_capacity < max_chunk_bytes {
+        while new_capacity < total_size {
             new_capacity *= 2;
         }
 
-        // Allow up to 1.5x max for small overflows (matches append_raw_adaptive pattern)
-        if total_size <= max_chunk_bytes * 3 / 2 {
-            new_capacity = total_size;
+        // Cap at max, but allow up to 1.5x max for small overflows
+        if total_size > max_chunk_bytes {
+            if total_size <= max_chunk_bytes * 3 / 2 {
+                new_capacity = total_size; // Small overflow, use exact size
+            } else {
+                new_capacity = max_chunk_bytes; // Large, cap at max
+            }
         } else {
+            // CRITICAL: Keep the power-of-2 size for headroom!
+            // Don't use exact total_size or next update will trigger rebuild again
             new_capacity = std::cmp::min(new_capacity, max_chunk_bytes);
         }
 
         // Rewrite chunk with new data
+        // CRITICAL FIX: Use zeroblob() and BLOB API to avoid huge Vec allocation
         let rowid: i64 = conn
             .query_row(
                 "SELECT rowid FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
@@ -1251,44 +1329,15 @@ impl _ColumnVault {
             )
             .map_err(ColError::from)?;
 
-        let mut new_blob = vec![0u8; new_capacity as usize];
-        let mut offset = 0usize;
+        // Update chunk size using zeroblob
+        conn.execute(
+            "UPDATE col_chunks SET data = zeroblob(?1), actual_size = ?1, bytes_used = ?2
+             WHERE col_id = ?3 AND chunk_idx = ?4",
+            params![new_capacity, total_size, data_col_id, chunk_id as i64],
+        )
+        .map_err(ColError::from)?;
 
-        // Write all elements sequentially
-        for (i, data) in all_data.iter().enumerate() {
-            new_blob[offset..offset + data.len()].copy_from_slice(data);
-
-            let e_idx = chunk_elements[i].0;
-            let start = offset as i32;
-            let end = (offset + data.len()) as i32;
-
-            all_indices.push((e_idx, start, end));
-            offset += data.len();
-        }
-
-        // Update chunk using BLOB API
-        let blob = conn
-            .blob_open(
-                rusqlite::DatabaseName::Main,
-                "col_chunks",
-                "data",
-                rowid,
-                false, // writable
-            )
-            .map_err(ColError::from)?;
-
-        // Grow chunk if needed
-        drop(blob);
-        if new_capacity > actual_size {
-            conn.execute(
-                "UPDATE col_chunks SET data = zeroblob(?1), actual_size = ?1
-                 WHERE col_id = ?2 AND chunk_idx = ?3",
-                params![new_capacity, data_col_id, chunk_id as i64],
-            )
-            .map_err(ColError::from)?;
-        }
-
-        // Reopen and write data
+        // Open blob for writing
         let mut blob = conn
             .blob_open(
                 rusqlite::DatabaseName::Main,
@@ -1299,16 +1348,20 @@ impl _ColumnVault {
             )
             .map_err(ColError::from)?;
 
-        blob.write_at(&new_blob[..offset], 0)
-            .map_err(ColError::from)?;
-        drop(blob);
+        // Write all elements sequentially using BLOB API
+        let mut offset = 0usize;
+        for (i, data) in all_data.iter().enumerate() {
+            blob.write_at(data, offset).map_err(ColError::from)?;
 
-        // Update bytes_used
-        conn.execute(
-            "UPDATE col_chunks SET bytes_used = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
-            params![total_size, data_col_id, chunk_id as i64],
-        )
-        .map_err(ColError::from)?;
+            let e_idx = chunk_elements[i].0;
+            let start = offset as i32;
+            let end = (offset + data.len()) as i32;
+
+            all_indices.push((e_idx, start, end));
+            offset += data.len();
+        }
+
+        drop(blob);
 
         // Update ALL index entries for this chunk
         for (e_idx, start, end) in all_indices.iter() {
@@ -1959,9 +2012,9 @@ impl _ColumnVault {
                 // Write buffered data as full chunk
                 let chunk_data: Vec<u8> = buffer.concat();
 
-                // Create chunk with legal size (capacity)
+                // Create chunk with legal size (capacity) - find smallest power of 2
                 let mut chunk_capacity = min_chunk_bytes;
-                while chunk_capacity < buffer_size && chunk_capacity < max_chunk_bytes {
+                while chunk_capacity < buffer_size {
                     chunk_capacity *= 2;
                 }
                 chunk_capacity = std::cmp::min(chunk_capacity, max_chunk_bytes);
@@ -2015,9 +2068,9 @@ impl _ColumnVault {
         if !buffer.is_empty() {
             let chunk_data: Vec<u8> = buffer.concat();
 
-            // Find legal chunk size (capacity)
+            // Find legal chunk size (capacity) - find smallest power of 2
             let mut chunk_capacity = min_chunk_bytes;
-            while chunk_capacity < buffer_size && chunk_capacity < max_chunk_bytes {
+            while chunk_capacity < buffer_size {
                 chunk_capacity *= 2;
             }
             chunk_capacity = std::cmp::min(chunk_capacity, max_chunk_bytes);
@@ -2284,6 +2337,9 @@ impl _ColumnVault {
 
     /// Calculate appropriate size for new chunk based on remaining data.
     /// Uses exponential growth: 2^k * min_chunk_bytes, capped at max_chunk_bytes.
+    ///
+    /// CRITICAL FIX: Only allocate the smallest power-of-2 that fits the data.
+    /// This prevents extend() from creating max-sized chunks for small data.
     fn calculate_new_chunk_size(
         &self,
         remaining_bytes: usize,
@@ -2292,17 +2348,19 @@ impl _ColumnVault {
     ) -> i64 {
         let remaining = remaining_bytes as i64;
 
-        // If remaining fits in max, find nearest power of 2
-        if remaining <= max_chunk {
-            let mut size = min_chunk;
-            while size < remaining && size < max_chunk {
-                size *= 2;
-            }
-            std::cmp::min(size, max_chunk)
-        } else {
-            // Remaining is larger than max, use max
-            max_chunk
+        // If remaining fits in min_chunk, just use min_chunk
+        if remaining <= min_chunk {
+            return min_chunk;
         }
+
+        // Find the smallest power of 2 that fits remaining data
+        let mut size = min_chunk;
+        while size < remaining {
+            size *= 2;
+        }
+
+        // Cap at max_chunk_bytes
+        std::cmp::min(size, max_chunk)
     }
 
     /// Create a chunk with specific size.
@@ -2313,10 +2371,10 @@ impl _ColumnVault {
         chunk_idx: i64,
         size: i64,
     ) -> PyResult<()> {
-        let zeroblob = vec![0u8; size as usize];
+        // CRITICAL FIX: Use SQLite's zeroblob() to avoid memory allocation
         conn.execute(
-            "INSERT INTO col_chunks (col_id, chunk_idx, data, actual_size) VALUES (?1, ?2, ?3, ?4)",
-            params![col_id, chunk_idx, zeroblob, size],
+            "INSERT INTO col_chunks (col_id, chunk_idx, data, actual_size) VALUES (?1, ?2, zeroblob(?3), ?3)",
+            params![col_id, chunk_idx, size],
         )
         .map_err(ColError::from)?;
         Ok(())
@@ -2345,67 +2403,50 @@ impl _ColumnVault {
             return Ok(());
         }
 
-        // Read blob data for growing
-        let old_data: Vec<u8> = conn
+        // CRITICAL FIX: Don't read entire blob into memory, use BLOB API
+        // First, get rowid and old data size
+        let (rowid, old_size): (i64, i64) = conn
             .query_row(
-                "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                "SELECT rowid, actual_size FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
                 params![col_id, chunk_idx],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(ColError::from)?;
 
-        let mut new_data = vec![0u8; target_size as usize];
-        new_data[..old_data.len()].copy_from_slice(&old_data);
+        // Read old data using BLOB API
+        let old_blob = conn
+            .blob_open(
+                rusqlite::DatabaseName::Main,
+                "col_chunks",
+                "data",
+                rowid,
+                true, // readonly
+            )
+            .map_err(ColError::from)?;
 
+        let mut old_data = vec![0u8; old_size as usize];
+        old_blob.read_at(&mut old_data, 0).map_err(ColError::from)?;
+        drop(old_blob);
+
+        // Update chunk with new size using zeroblob, then write old data back
         conn.execute(
-            "UPDATE col_chunks SET data = ?1, actual_size = ?2 WHERE col_id = ?3 AND chunk_idx = ?4",
-            params![new_data, target_size, col_id, chunk_idx],
+            "UPDATE col_chunks SET data = zeroblob(?1), actual_size = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
+            params![target_size, col_id, chunk_idx],
         )
         .map_err(ColError::from)?;
 
-        Ok(())
-    }
-
-    /// Get or create a chunk.
-    /// For append operations (use_min_size=true): start with min_chunk_bytes
-    /// For random access (use_min_size=false): create at max_chunk_bytes for immediate use
-    fn ensure_chunk(
-        &self,
-        conn: &Connection,
-        col_id: i64,
-        chunk_idx: i64,
-        use_min_size: bool,
-    ) -> PyResult<()> {
-        let exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
-                params![col_id, chunk_idx],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if !exists {
-            // Get chunk size settings for this column
-            let (min_chunk, max_chunk): (i64, i64) = conn
-                .query_row(
-                    "SELECT min_chunk_bytes, max_chunk_bytes FROM col_meta WHERE col_id = ?1",
-                    params![col_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(ColError::from)?;
-
-            // Create new chunk at min or max size depending on use case
-            let chunk_size = if use_min_size { min_chunk } else { max_chunk };
-            let zeroblob = vec![0u8; chunk_size as usize];
-            conn.execute(
-                "
-                INSERT INTO col_chunks (col_id, chunk_idx, data, actual_size)
-                VALUES (?1, ?2, ?3, ?4)
-                ",
-                params![col_id, chunk_idx, zeroblob, chunk_size],
+        // Write old data back using BLOB API
+        let mut new_blob = conn
+            .blob_open(
+                rusqlite::DatabaseName::Main,
+                "col_chunks",
+                "data",
+                rowid,
+                false, // writable
             )
             .map_err(ColError::from)?;
-        }
+
+        new_blob.write_at(&old_data, 0).map_err(ColError::from)?;
 
         Ok(())
     }
@@ -2438,6 +2479,8 @@ impl _ColumnVault {
     }
 
     /// Update a single index entry (12 bytes) in the index column.
+    ///
+    /// Uses internal write logic that handles chunk boundaries properly.
     fn update_index_entry_internal(
         conn: &Connection,
         idx_col_id: i64,
@@ -2445,28 +2488,92 @@ impl _ColumnVault {
         new_index: &[u8; 12],
         idx_max_chunk: i64,
     ) -> Result<(), ColError> {
-        let byte_offset = elem_idx * 12;
-        let chunk_idx = byte_offset / idx_max_chunk;
-        let offset_in_chunk = (byte_offset % idx_max_chunk) as usize;
+        // Index column is fixed-size (12 bytes per entry)
+        // Use the same logic as write_range for proper chunk handling
+        let start_byte = elem_idx * 12;
+        let end_byte = start_byte + 12;
 
-        // Read index chunk
-        let mut chunk_data: Vec<u8> = conn
-            .query_row(
-                "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
-                params![idx_col_id, chunk_idx],
-                |row| row.get(0),
+        // Calculate which chunk(s) this spans
+        let start_chunk = start_byte / idx_max_chunk;
+        let end_chunk = (end_byte - 1) / idx_max_chunk;
+
+        // For a 12-byte write, it should only span 1 chunk unless at boundary
+        for chunk_idx in start_chunk..=end_chunk {
+            let chunk_start_byte = chunk_idx * idx_max_chunk;
+            let chunk_end_byte = chunk_start_byte + idx_max_chunk;
+
+            let write_start = std::cmp::max(start_byte, chunk_start_byte);
+            let write_end = std::cmp::min(end_byte, chunk_end_byte);
+            let bytes_to_write = (write_end - write_start) as usize;
+
+            if bytes_to_write == 0 {
+                continue;
+            }
+
+            let offset_in_chunk = (write_start - chunk_start_byte) as usize;
+            let offset_in_data = (write_start - start_byte) as usize;
+
+            // Ensure chunk exists (create if needed)
+            let chunk_exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![idx_col_id, chunk_idx],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+
+            if !chunk_exists {
+                // Create chunk at max size for random access
+                // CRITICAL FIX: Use SQLite's zeroblob() to avoid memory allocation
+                conn.execute(
+                    "INSERT INTO col_chunks (col_id, chunk_idx, data, actual_size)
+                     VALUES (?1, ?2, zeroblob(?3), ?3)",
+                    params![idx_col_id, chunk_idx, idx_max_chunk],
+                )
+                .map_err(ColError::from)?;
+            }
+
+            // CRITICAL FIX: Use BLOB API instead of read-modify-write pattern
+            // This is called in a loop for variable-size updates, so performance is critical!
+
+            // Check current chunk size
+            let (rowid, actual_size): (i64, i64) = conn
+                .query_row(
+                    "SELECT rowid, actual_size FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![idx_col_id, chunk_idx],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(ColError::from)?;
+
+            // Grow chunk if needed
+            let needed_size = offset_in_chunk + bytes_to_write;
+            if needed_size > actual_size as usize {
+                // Grow to idx_max_chunk
+                conn.execute(
+                    "UPDATE col_chunks SET data = zeroblob(?1), actual_size = ?1
+                     WHERE col_id = ?2 AND chunk_idx = ?3",
+                    params![idx_max_chunk, idx_col_id, chunk_idx],
+                )
+                .map_err(ColError::from)?;
+            }
+
+            // Write using BLOB API (only writes the 12 bytes we need!)
+            let mut blob = conn
+                .blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "col_chunks",
+                    "data",
+                    rowid,
+                    false, // writable
+                )
+                .map_err(ColError::from)?;
+
+            blob.write_at(
+                &new_index[offset_in_data..offset_in_data + bytes_to_write],
+                offset_in_chunk,
             )
             .map_err(ColError::from)?;
-
-        // Modify the 12-byte entry
-        chunk_data[offset_in_chunk..offset_in_chunk + 12].copy_from_slice(new_index);
-
-        // Write back
-        conn.execute(
-            "UPDATE col_chunks SET data = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
-            params![chunk_data, idx_col_id, chunk_idx],
-        )
-        .map_err(ColError::from)?;
+        }
 
         Ok(())
     }
@@ -2929,17 +3036,22 @@ impl _ColumnVault {
                 )
                 .map_err(ColError::from)?;
 
-            // Find appropriate capacity
+            // Find appropriate capacity - use smallest power of 2 that fits
             let mut new_capacity = min_chunk_bytes;
-            while new_capacity < new_size && new_capacity < max_chunk_bytes {
+            while new_capacity < new_size {
                 new_capacity *= 2;
             }
 
-            // Allow up to 1.5x max for small overflows
-            if new_size <= max_chunk_bytes * 3 / 2 {
+            // Cap at reasonable limits
+            if new_size <= max_chunk_bytes {
+                // Fits in max, use the calculated power of 2
+                new_capacity = std::cmp::min(new_capacity, max_chunk_bytes);
+            } else if new_size <= max_chunk_bytes * 3 / 2 {
+                // Small overflow, allow exact size up to 1.5x max
                 new_capacity = new_size;
             } else {
-                new_capacity = std::cmp::min(new_capacity, max_chunk_bytes);
+                // Large overflow - use max (will be capped at 2x max by check above)
+                new_capacity = max_chunk_bytes;
             }
 
             // Resize chunk if needed

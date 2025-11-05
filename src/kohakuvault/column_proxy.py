@@ -242,7 +242,7 @@ class Column(MutableSequence):
         Single element access:
             value = col[42]
 
-        Slice access (v0.5.0 - FAST batch read with integrated unpacking!):
+        Slice access (v0.4.2 - FAST batch read with integrated unpacking!):
             values = col[10:100]    # Read 90 elements in single Rust call
             values = col[:50]        # First 50 elements
             values = col[-10:]       # Last 10 elements
@@ -298,7 +298,7 @@ class Column(MutableSequence):
         Single element:
             col[42] = 100
 
-        Slice (NEW in v0.5.0):
+        Slice (NEW in v0.4.2):
             col[10:20] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # Batch write!
             col[:5] = [100, 200, 300, 400, 500]
         """
@@ -398,7 +398,7 @@ class Column(MutableSequence):
         self._length = length - 1
 
     def __iter__(self) -> Iterator[ValueType]:
-        """Iterate over all elements using optimized batch unpacking (v0.5.0)."""
+        """Iterate over all elements using optimized batch unpacking (v0.4.2)."""
         length = len(self)
         if length == 0:
             return
@@ -711,7 +711,7 @@ class VarSizeColumn(MutableSequence):
         Single element access:
             value = col[42]
 
-        Slice access (v0.5.0 - FAST batch read!):
+        Slice access (v0.4.2 - FAST batch read!):
             values = col[10:100]    # Read 90 elements in single Rust call
             values = col[:50]        # First 50 elements
             values = col[-10:]       # Last 10 elements
@@ -782,7 +782,7 @@ class VarSizeColumn(MutableSequence):
 
     def __setitem__(self, key, value):
         """
-        Set element(s) at index (NEW in v0.5.0 with size-aware logic!).
+        Set element(s) at index (NEW in v0.4.2 with size-aware logic!).
 
         Single element:
             col[42] = b"new data"  # Works even if size different!
@@ -924,7 +924,7 @@ class VarSizeColumn(MutableSequence):
         # (actual cleanup happens in vacuum)
 
     def __iter__(self) -> Iterator[bytes]:
-        """Iterate over all elements using optimized batch reads (v0.5.0)."""
+        """Iterate over all elements using optimized batch reads (v0.4.2)."""
         length = len(self)
         batch_size = 100  # Batch size for variable-size columns
 
@@ -1104,7 +1104,6 @@ class ColumnVault:
     def __init__(
         self,
         kvault_or_path: Union[Any, str],
-        chunk_bytes: int = 1024 * 1024,
         min_chunk_bytes: int = 128 * 1024,
         max_chunk_bytes: int = 16 * 1024 * 1024,
     ):
@@ -1117,7 +1116,6 @@ class ColumnVault:
             min_chunk_bytes: Minimum chunk size (128KB, first chunk starts here)
             max_chunk_bytes: Maximum chunk size (16MB, chunks don't grow beyond this)
         """
-        self._default_chunk_bytes = chunk_bytes
         self._min_chunk_bytes = min_chunk_bytes
         self._max_chunk_bytes = max_chunk_bytes
 
@@ -1132,6 +1130,15 @@ class ColumnVault:
         self._columns = {}  # Cache of Column instances
         self._daemon_thread = None  # Cache flush daemon thread
         self._daemon_stop = threading.Event()  # Signal to stop daemon
+
+    def __del__(self):
+        """Clean up: checkpoint WAL before closing to prevent hangs on database cleanup."""
+        try:
+            # CRITICAL: Checkpoint WAL before Python garbage collects the Rust connection
+            # This prevents SQLite from hanging when trying to close connections with large WAL files
+            self.checkpoint()
+        except Exception:
+            pass  # Ignore errors in destructor
 
     def create_column(
         self, name: str, dtype: str, chunk_bytes: int = None, use_rust_packer: bool = True
@@ -1154,16 +1161,13 @@ class ColumnVault:
         """
         _, elem_size, is_varsize = parse_dtype(dtype)
 
-        if chunk_bytes is None:
-            chunk_bytes = self._default_chunk_bytes
-
         if is_varsize:
             # Create variable-size column (bytes, strings, msgpack, cbor)
-            return self._create_varsize_column(name, dtype, chunk_bytes, use_rust_packer)
+            return self._create_varsize_column(name, dtype, use_rust_packer)
 
         # Create fixed-size column
         col_id = self._inner.create_column(
-            name, dtype, elem_size, chunk_bytes, self._min_chunk_bytes, self._max_chunk_bytes
+            name, dtype, elem_size, self._min_chunk_bytes, self._max_chunk_bytes
         )
 
         # IMPORTANT: Get the ALIGNED max_chunk_bytes from database (v0.4.0: element-aligned)
@@ -1175,13 +1179,13 @@ class ColumnVault:
         return col
 
     def _create_varsize_column(
-        self, name: str, dtype: str, chunk_bytes: int, use_rust_packer: bool = True
+        self, name: str, dtype: str, use_rust_packer: bool = True
     ) -> "VarSizeColumn":
         """Create a variable-size column using adaptive chunking (v0.4.0+)."""
         # Data column stores packed bytes (elem_size=1)
         # Store the original dtype in the data column's metadata
         data_col_id = self._inner.create_column(
-            f"{name}_data", dtype, 1, chunk_bytes, self._min_chunk_bytes, self._max_chunk_bytes
+            f"{name}_data", dtype, 1, self._min_chunk_bytes, self._max_chunk_bytes
         )
 
         # Index column stores 12-byte triples: (i32 chunk_id, i32 start, i32 end)
@@ -1189,7 +1193,6 @@ class ColumnVault:
             f"{name}_idx",
             "adaptive_idx",
             12,
-            chunk_bytes,
             self._min_chunk_bytes,
             self._max_chunk_bytes,
         )
