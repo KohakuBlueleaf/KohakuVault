@@ -9,6 +9,8 @@ Features:
 - Thread-safe with retry logic
 """
 
+__version__ = "0.5.0"
+
 from .proxy import KVault
 from .column_proxy import Column, ColumnVault, VarSizeColumn
 from .errors import (

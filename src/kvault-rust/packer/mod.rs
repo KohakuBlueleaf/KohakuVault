@@ -9,6 +9,16 @@
 //! - CBOR: With optional CDDL schema validation
 //! - JSON Schema: Validation for MessagePack
 
+mod primitives;
+mod structured;
+
+// Re-export public types
+pub use primitives::{pack_bytes, pack_string, unpack_bytes, unpack_string, StringEncoding};
+pub use structured::{pack_cbor, pack_messagepack, unpack_cbor, unpack_messagepack};
+
+#[cfg(feature = "schema-validation")]
+pub use structured::pack_messagepack_validated;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use thiserror::Error;
@@ -34,29 +44,6 @@ pub enum PackerError {
 impl From<PackerError> for PyErr {
     fn from(err: PackerError) -> PyErr {
         PyErr::new::<pyo3::exceptions::PyValueError, _>(err.to_string())
-    }
-}
-
-/// String encoding options
-#[derive(Debug, Clone, Copy)]
-pub enum StringEncoding {
-    Utf8,
-    Utf16Le,
-    Utf16Be,
-    Ascii,
-    Latin1,
-}
-
-impl StringEncoding {
-    fn from_str(s: &str) -> Result<Self, PackerError> {
-        match s.to_lowercase().as_str() {
-            "utf8" | "utf-8" => Ok(Self::Utf8),
-            "utf16le" | "utf-16le" => Ok(Self::Utf16Le),
-            "utf16be" | "utf-16be" => Ok(Self::Utf16Be),
-            "ascii" => Ok(Self::Ascii),
-            "latin1" | "iso-8859-1" => Ok(Self::Latin1),
-            _ => Err(PackerError::InvalidDtype(format!("Unknown encoding: {}", s))),
-        }
     }
 }
 
@@ -113,14 +100,19 @@ impl PackerDType {
                         (Some(size), StringEncoding::Utf8)
                     } else {
                         // "str:utf8" - variable size, specified encoding
-                        (None, StringEncoding::from_str(parts[1])?)
+                        (
+                            None,
+                            StringEncoding::from_str(parts[1])
+                                .map_err(PackerError::InvalidDtype)?,
+                        )
                     }
                 } else if parts.len() == 3 {
                     // "str:32:utf8" - fixed size with encoding
                     let size = parts[1].parse().map_err(|_| {
                         PackerError::InvalidDtype(format!("Invalid size: {}", parts[1]))
                     })?;
-                    let encoding = StringEncoding::from_str(parts[2])?;
+                    let encoding =
+                        StringEncoding::from_str(parts[2]).map_err(PackerError::InvalidDtype)?;
                     (Some(size), encoding)
                 } else {
                     return Err(PackerError::InvalidDtype(format!(
@@ -352,22 +344,22 @@ impl DataPacker {
 
             PackerDType::String { encoding, fixed_size } => {
                 let s: String = value.extract()?;
-                self.pack_string(&s, *encoding, *fixed_size)
+                pack_string(&s, *encoding, *fixed_size)
             }
 
             PackerDType::Bytes { fixed_size } => {
                 let bytes: Vec<u8> = value.extract()?;
-                self.pack_bytes(&bytes, *fixed_size)
+                pack_bytes(&bytes, *fixed_size)
             }
 
-            PackerDType::MessagePack => self.pack_messagepack(value),
+            PackerDType::MessagePack => pack_messagepack(value),
 
             #[cfg(feature = "schema-validation")]
             PackerDType::MessagePackValidated { schema: _schema, compiled_schema } => {
-                self.pack_messagepack_validated(value, compiled_schema)
+                pack_messagepack_validated(value, compiled_schema)
             }
 
-            PackerDType::Cbor { schema } => self.pack_cbor(value, schema.as_deref()),
+            PackerDType::Cbor { schema } => pack_cbor(value, schema.as_deref()),
         }
     }
 
@@ -392,254 +384,18 @@ impl DataPacker {
             }
 
             PackerDType::String { encoding, fixed_size } => {
-                self.unpack_string(py, data, offset, *encoding, *fixed_size)
+                unpack_string(py, data, offset, *encoding, *fixed_size)
             }
 
-            PackerDType::Bytes { fixed_size } => self.unpack_bytes(py, data, offset, *fixed_size),
+            PackerDType::Bytes { fixed_size } => unpack_bytes(py, data, offset, *fixed_size),
 
-            PackerDType::MessagePack => self.unpack_messagepack(py, &data[offset..]),
+            PackerDType::MessagePack => unpack_messagepack(py, &data[offset..]),
 
             #[cfg(feature = "schema-validation")]
-            PackerDType::MessagePackValidated { .. } => {
-                self.unpack_messagepack(py, &data[offset..])
-            }
+            PackerDType::MessagePackValidated { .. } => unpack_messagepack(py, &data[offset..]),
 
-            PackerDType::Cbor { .. } => self.unpack_cbor(py, &data[offset..]),
+            PackerDType::Cbor { .. } => unpack_cbor(py, &data[offset..]),
         }
-    }
-
-    // Helper methods for specific types
-
-    fn pack_string(
-        &self,
-        s: &str,
-        encoding: StringEncoding,
-        fixed_size: Option<usize>,
-    ) -> Result<Vec<u8>, PyErr> {
-        let encoded = match encoding {
-            StringEncoding::Utf8 => s.as_bytes().to_vec(),
-            StringEncoding::Utf16Le => s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect(),
-            StringEncoding::Utf16Be => s.encode_utf16().flat_map(|c| c.to_be_bytes()).collect(),
-            StringEncoding::Ascii => {
-                if s.is_ascii() {
-                    s.as_bytes().to_vec()
-                } else {
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        "String contains non-ASCII characters",
-                    ));
-                }
-            }
-            StringEncoding::Latin1 => {
-                // Latin1 maps code points 0-255 directly to bytes
-                if s.chars().all(|c| (c as u32) <= 255) {
-                    s.chars().map(|c| c as u8).collect()
-                } else {
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        "String contains characters outside Latin1 range",
-                    ));
-                }
-            }
-        };
-
-        if let Some(size) = fixed_size {
-            self.pack_bytes(&encoded, Some(size))
-        } else {
-            Ok(encoded)
-        }
-    }
-
-    fn pack_bytes(&self, bytes: &[u8], fixed_size: Option<usize>) -> Result<Vec<u8>, PyErr> {
-        if let Some(size) = fixed_size {
-            if bytes.len() > size {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Data too long: {} > {}",
-                    bytes.len(),
-                    size
-                )));
-            }
-
-            // Pad with zeros
-            let mut result = bytes.to_vec();
-            result.resize(size, 0);
-            Ok(result)
-        } else {
-            Ok(bytes.to_vec())
-        }
-    }
-
-    fn unpack_string(
-        &self,
-        py: Python,
-        data: &[u8],
-        offset: usize,
-        encoding: StringEncoding,
-        fixed_size: Option<usize>,
-    ) -> Result<PyObject, PyErr> {
-        let size = fixed_size.unwrap_or(data.len() - offset);
-        if offset + size > data.len() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Not enough data"));
-        }
-
-        let bytes = &data[offset..offset + size];
-
-        let string = match encoding {
-            StringEncoding::Utf8 => String::from_utf8(bytes.to_vec()).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "UTF-8 decode error: {}",
-                    e
-                ))
-            })?,
-            StringEncoding::Utf16Le => {
-                let u16_vec: Vec<u16> = bytes
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                String::from_utf16(&u16_vec).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "UTF-16 decode error: {}",
-                        e
-                    ))
-                })?
-            }
-            StringEncoding::Utf16Be => {
-                let u16_vec: Vec<u16> = bytes
-                    .chunks_exact(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                    .collect();
-                String::from_utf16(&u16_vec).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "UTF-16 decode error: {}",
-                        e
-                    ))
-                })?
-            }
-            StringEncoding::Ascii => {
-                if bytes.iter().all(|&b| b <= 127) {
-                    String::from_utf8(bytes.to_vec()).unwrap()
-                } else {
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        "Data contains non-ASCII bytes",
-                    ));
-                }
-            }
-            StringEncoding::Latin1 => bytes.iter().map(|&b| b as char).collect(),
-        };
-
-        // Trim null padding for fixed-size strings
-        let trimmed = if fixed_size.is_some() {
-            string.trim_end_matches('\0').to_string()
-        } else {
-            string
-        };
-
-        Ok(trimmed.into_py(py))
-    }
-
-    fn unpack_bytes(
-        &self,
-        py: Python,
-        data: &[u8],
-        offset: usize,
-        fixed_size: Option<usize>,
-    ) -> Result<PyObject, PyErr> {
-        let size = fixed_size.unwrap_or(data.len() - offset);
-        if offset + size > data.len() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Not enough data"));
-        }
-
-        let bytes = &data[offset..offset + size];
-        Ok(PyBytes::new_bound(py, bytes).into())
-    }
-
-    fn pack_messagepack(&self, value: &Bound<PyAny>) -> Result<Vec<u8>, PyErr> {
-        // Convert Python object to serde_json::Value
-        let json_value: serde_json::Value =
-            pythonize::depythonize(value.as_any()).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Failed to convert Python object: {}",
-                    e
-                ))
-            })?;
-
-        // Serialize to MessagePack
-        rmp_serde::to_vec(&json_value).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "MessagePack encoding failed: {}",
-                e
-            ))
-        })
-    }
-
-    #[cfg(feature = "schema-validation")]
-    fn pack_messagepack_validated(
-        &self,
-        value: &Bound<PyAny>,
-        schema: &jsonschema::JSONSchema,
-    ) -> Result<Vec<u8>, PyErr> {
-        let json_value: serde_json::Value = pythonize::depythonize(value.as_any())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-
-        // Validate against schema
-        if let Err(errors) = schema.validate(&json_value) {
-            let error_msgs: Vec<String> = errors.map(|e| e.to_string()).collect();
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Validation errors: {}",
-                error_msgs.join(", ")
-            )));
-        }
-
-        // Serialize to MessagePack
-        rmp_serde::to_vec(&json_value).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "MessagePack encoding failed: {}",
-                e
-            ))
-        })
-    }
-
-    fn unpack_messagepack(&self, py: Python, data: &[u8]) -> Result<PyObject, PyErr> {
-        // Deserialize from MessagePack
-        let json_value: serde_json::Value = rmp_serde::from_slice(data).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "MessagePack decoding failed: {}",
-                e
-            ))
-        })?;
-
-        // Convert to Python object
-        pythonize::pythonize(py, &json_value)
-            .map(|bound| bound.unbind())
-            .map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Failed to convert to Python: {}",
-                    e
-                ))
-            })
-    }
-
-    fn pack_cbor(&self, value: &Bound<PyAny>, _schema: Option<&str>) -> Result<Vec<u8>, PyErr> {
-        let json_value: serde_json::Value = pythonize::depythonize(value.as_any())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-
-        // Serialize to CBOR
-        let mut buf = Vec::new();
-        ciborium::ser::into_writer(&json_value, &mut buf).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("CBOR encoding failed: {}", e))
-        })?;
-
-        // TODO: CDDL validation if schema provided
-
-        Ok(buf)
-    }
-
-    fn unpack_cbor(&self, py: Python, data: &[u8]) -> Result<PyObject, PyErr> {
-        let json_value: serde_json::Value = ciborium::de::from_reader(data).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("CBOR decoding failed: {}", e))
-        })?;
-
-        pythonize::pythonize(py, &json_value)
-            .map(|bound| bound.unbind())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
     }
 }
 
@@ -675,13 +431,5 @@ mod tests {
         // Test msgpack
         let dtype = PackerDType::from_str("msgpack").unwrap();
         assert!(dtype.is_varsize());
-    }
-
-    #[test]
-    fn test_string_encoding_from_str() {
-        assert!(matches!(StringEncoding::from_str("utf8").unwrap(), StringEncoding::Utf8));
-        assert!(matches!(StringEncoding::from_str("UTF-8").unwrap(), StringEncoding::Utf8));
-        assert!(matches!(StringEncoding::from_str("ascii").unwrap(), StringEncoding::Ascii));
-        assert!(StringEncoding::from_str("invalid").is_err());
     }
 }

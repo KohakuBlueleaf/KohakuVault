@@ -11,6 +11,7 @@
 use pyo3::prelude::*;
 
 mod col;
+mod common;
 mod kv;
 mod packer;
 
