@@ -2472,6 +2472,8 @@ impl _ColumnVault {
     }
 
     /// Shift start/end bytes for all index entries after elem_idx in the same chunk.
+    ///
+    /// OPTIMIZED: Reads index chunks in batches, only updates affected ones.
     fn shift_chunk_indices_after(
         conn: &Connection,
         idx_col_id: i64,
@@ -2480,7 +2482,6 @@ impl _ColumnVault {
         delta: i32,
         idx_max_chunk: i64,
     ) -> Result<(), ColError> {
-        // Get column length to know when to stop
         let length: i64 = conn
             .query_row(
                 "SELECT length FROM col_meta WHERE col_id = ?1",
@@ -2489,56 +2490,83 @@ impl _ColumnVault {
             )
             .map_err(ColError::from)?;
 
-        // Process each element from start_elem_idx to end
-        for elem_idx in start_elem_idx..length {
-            let byte_offset = elem_idx * 12;
-            let chunk_idx = byte_offset / idx_max_chunk;
-            let offset_in_chunk = (byte_offset % idx_max_chunk) as usize;
+        if start_elem_idx >= length {
+            return Ok(());
+        }
 
-            // Read index chunk
-            let mut chunk_data: Vec<u8> = conn
-                .query_row(
-                    "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
-                    params![idx_col_id, chunk_idx],
-                    |row| row.get(0),
-                )
-                .map_err(ColError::from)?;
+        // Determine which index chunks we need to process
+        let start_byte = start_elem_idx * 12;
+        let end_byte = length * 12;
+        let start_chunk = start_byte / idx_max_chunk;
+        let end_chunk = (end_byte - 1) / idx_max_chunk;
 
-            // Parse current entry
-            let cid = i32::from_le_bytes([
-                chunk_data[offset_in_chunk],
-                chunk_data[offset_in_chunk + 1],
-                chunk_data[offset_in_chunk + 2],
-                chunk_data[offset_in_chunk + 3],
-            ]);
+        // Process each index chunk that might contain affected elements
+        for idx_chunk_idx in start_chunk..=end_chunk {
+            // Read this index chunk
+            let chunk_data: Vec<u8> = match conn.query_row(
+                "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                params![idx_col_id, idx_chunk_idx],
+                |row| row.get(0),
+            ) {
+                Ok(data) => data,
+                Err(_) => continue, // Chunk doesn't exist, skip
+            };
 
-            // Only update if in target chunk
-            if cid == target_chunk_id {
-                let start = i32::from_le_bytes([
-                    chunk_data[offset_in_chunk + 4],
-                    chunk_data[offset_in_chunk + 5],
-                    chunk_data[offset_in_chunk + 6],
-                    chunk_data[offset_in_chunk + 7],
+            let mut modified = false;
+            let mut new_chunk_data = chunk_data.clone();
+
+            // Calculate elem_idx range for this chunk
+            let chunk_start_byte = idx_chunk_idx * idx_max_chunk;
+            let first_elem_in_chunk = chunk_start_byte / 12;
+            let num_entries = chunk_data.len() / 12;
+
+            for i in 0..num_entries {
+                let elem_idx = first_elem_in_chunk + i as i64;
+
+                if elem_idx < start_elem_idx || elem_idx >= length {
+                    continue;
+                }
+
+                let offset = i * 12;
+
+                let cid = i32::from_le_bytes([
+                    chunk_data[offset],
+                    chunk_data[offset + 1],
+                    chunk_data[offset + 2],
+                    chunk_data[offset + 3],
                 ]);
-                let end = i32::from_le_bytes([
-                    chunk_data[offset_in_chunk + 8],
-                    chunk_data[offset_in_chunk + 9],
-                    chunk_data[offset_in_chunk + 10],
-                    chunk_data[offset_in_chunk + 11],
-                ]);
 
-                // Shift both start and end
-                let new_start = start + delta;
-                let new_end = end + delta;
-                let new_index = Self::pack_index_triple(cid, new_start, new_end);
+                // Only update if in target chunk
+                if cid == target_chunk_id {
+                    let start = i32::from_le_bytes([
+                        chunk_data[offset + 4],
+                        chunk_data[offset + 5],
+                        chunk_data[offset + 6],
+                        chunk_data[offset + 7],
+                    ]);
+                    let end = i32::from_le_bytes([
+                        chunk_data[offset + 8],
+                        chunk_data[offset + 9],
+                        chunk_data[offset + 10],
+                        chunk_data[offset + 11],
+                    ]);
 
-                // Update in chunk_data buffer
-                chunk_data[offset_in_chunk..offset_in_chunk + 12].copy_from_slice(&new_index);
+                    // Shift both start and end
+                    let new_start = start + delta;
+                    let new_end = end + delta;
+                    let new_index = Self::pack_index_triple(cid, new_start, new_end);
 
-                // Write back
+                    // Update in buffer
+                    new_chunk_data[offset..offset + 12].copy_from_slice(&new_index);
+                    modified = true;
+                }
+            }
+
+            // Write back only if modified
+            if modified {
                 conn.execute(
                     "UPDATE col_chunks SET data = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
-                    params![chunk_data, idx_col_id, chunk_idx],
+                    params![new_chunk_data, idx_col_id, idx_chunk_idx],
                 )
                 .map_err(ColError::from)?;
             }
@@ -2549,11 +2577,13 @@ impl _ColumnVault {
 
     /// Get all elements in a specific data chunk by scanning the index column.
     /// Returns Vec<(elem_idx, start_byte, end_byte)> sorted by start_byte.
+    ///
+    /// OPTIMIZED: Reads all index chunks once, parses in memory.
     fn get_chunk_elements(
         conn: &Connection,
         idx_col_id: i64,
         target_chunk_id: i32,
-        idx_max_chunk: i64,
+        _idx_max_chunk: i64,
     ) -> Result<Vec<(i64, i32, i32)>, ColError> {
         let length: i64 = conn
             .query_row(
@@ -2563,43 +2593,63 @@ impl _ColumnVault {
             )
             .map_err(ColError::from)?;
 
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+
         let mut elements = Vec::new();
 
-        for elem_idx in 0..length {
-            let byte_offset = elem_idx * 12;
-            let chunk_idx = byte_offset / idx_max_chunk;
-            let offset_in_chunk = (byte_offset % idx_max_chunk) as usize;
+        // Read ALL index chunks at once
+        let mut stmt = conn
+            .prepare("SELECT chunk_idx, data FROM col_chunks WHERE col_id = ?1 ORDER BY chunk_idx")
+            .map_err(ColError::from)?;
 
-            let chunk_data: Vec<u8> = conn
-                .query_row(
-                    "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
-                    params![idx_col_id, chunk_idx],
-                    |row| row.get(0),
-                )
-                .map_err(ColError::from)?;
+        let chunks = stmt
+            .query_map(params![idx_col_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(ColError::from)?;
 
-            let cid = i32::from_le_bytes([
-                chunk_data[offset_in_chunk],
-                chunk_data[offset_in_chunk + 1],
-                chunk_data[offset_in_chunk + 2],
-                chunk_data[offset_in_chunk + 3],
-            ]);
+        let mut elem_idx = 0i64;
 
-            if cid == target_chunk_id {
-                let start = i32::from_le_bytes([
-                    chunk_data[offset_in_chunk + 4],
-                    chunk_data[offset_in_chunk + 5],
-                    chunk_data[offset_in_chunk + 6],
-                    chunk_data[offset_in_chunk + 7],
+        for chunk_result in chunks {
+            let (_chunk_idx, chunk_data) = chunk_result.map_err(ColError::from)?;
+
+            // Parse all 12-byte entries in this chunk
+            let num_entries = chunk_data.len() / 12;
+
+            for i in 0..num_entries {
+                if elem_idx >= length {
+                    break;
+                }
+
+                let offset = i * 12;
+
+                let cid = i32::from_le_bytes([
+                    chunk_data[offset],
+                    chunk_data[offset + 1],
+                    chunk_data[offset + 2],
+                    chunk_data[offset + 3],
                 ]);
-                let end = i32::from_le_bytes([
-                    chunk_data[offset_in_chunk + 8],
-                    chunk_data[offset_in_chunk + 9],
-                    chunk_data[offset_in_chunk + 10],
-                    chunk_data[offset_in_chunk + 11],
-                ]);
 
-                elements.push((elem_idx, start, end));
+                if cid == target_chunk_id {
+                    let start = i32::from_le_bytes([
+                        chunk_data[offset + 4],
+                        chunk_data[offset + 5],
+                        chunk_data[offset + 6],
+                        chunk_data[offset + 7],
+                    ]);
+                    let end = i32::from_le_bytes([
+                        chunk_data[offset + 8],
+                        chunk_data[offset + 9],
+                        chunk_data[offset + 10],
+                        chunk_data[offset + 11],
+                    ]);
+
+                    elements.push((elem_idx, start, end));
+                }
+
+                elem_idx += 1;
             }
         }
 
@@ -2674,51 +2724,37 @@ impl _ColumnVault {
 
         // Process each affected chunk
         for (chunk_id, _) in chunks_affected {
-            // Get ALL elements in this chunk
-            let all_elements = Self::get_chunk_elements(conn, idx_col_id, chunk_id, idx_max_chunk)?;
+            // Get elements we're updating in this chunk from old_indices
+            let mut chunk_updates: Vec<(i64, i32, i32, &Vec<u8>)> = Vec::new();
 
-            // Find the first element being updated in this chunk
-            let first_updated_idx = all_elements
-                .iter()
-                .position(|(elem_idx, _, _)| update_map.contains_key(elem_idx))
-                .unwrap_or(all_elements.len());
+            for (elem_idx, cid, old_start, old_end) in old_indices {
+                if *cid == chunk_id {
+                    let new_val = update_map.get(elem_idx).unwrap();
+                    chunk_updates.push((*elem_idx, *old_start, *old_end, new_val));
+                }
+            }
 
-            if first_updated_idx == all_elements.len() {
-                // No updates in this chunk, skip
+            if chunk_updates.is_empty() {
                 continue;
             }
 
-            // Start writing from the first updated element's position
-            let write_start = all_elements[first_updated_idx].1;
+            // Sort by old_start to process in order
+            chunk_updates.sort_by_key(|(_, start, _, _)| *start);
 
-            // Build new data starting from first updated element
-            let mut new_data_from_update = Vec::new();
-            let mut updated_indices = Vec::new();
+            // For direct mode (total_new ≤ total_old):
+            // Build contiguous new data, write sequentially starting from first element
+            let write_start = chunk_updates.first().unwrap().1;
+            let mut new_section = Vec::new();
+            let mut new_indices = Vec::new();
 
-            for (elem_idx, old_start, old_end) in all_elements.iter().skip(first_updated_idx) {
-                let offset = new_data_from_update.len() as i32;
-                let start = write_start + offset;
-
-                if let Some(new_val) = update_map.get(elem_idx) {
-                    // Use new value
-                    new_data_from_update.extend_from_slice(new_val);
-                } else {
-                    // Keep old value
-                    let old_data = Self::read_element_from_chunk(
-                        conn,
-                        data_col_id,
-                        chunk_id,
-                        *old_start,
-                        *old_end,
-                    )?;
-                    new_data_from_update.extend_from_slice(&old_data);
-                }
-
-                let end = write_start + new_data_from_update.len() as i32;
-                updated_indices.push((*elem_idx, start, end));
+            for (elem_idx, _old_start, _old_end, new_val) in chunk_updates {
+                let start = write_start + new_section.len() as i32;
+                new_section.extend_from_slice(new_val);
+                let end = write_start + new_section.len() as i32;
+                new_indices.push((elem_idx, start, end));
             }
 
-            // Write the rebuilt section
+            // Write the new section
             let rowid: i64 = conn
                 .query_row(
                     "SELECT rowid FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
@@ -2737,23 +2773,75 @@ impl _ColumnVault {
                 )
                 .map_err(ColError::from)?;
 
-            blob.write_at(&new_data_from_update, write_start as usize)
+            blob.write_at(&new_section, write_start as usize)
                 .map_err(ColError::from)?;
             drop(blob);
 
-            // Update index entries for all affected elements
-            for (elem_idx, start, end) in updated_indices {
-                let new_index = Self::pack_index_triple(chunk_id, start, end);
-                Self::update_index_entry_internal(
-                    conn,
-                    idx_col_id,
-                    elem_idx,
-                    &new_index,
-                    idx_max_chunk,
-                )?;
-            }
+            // Batch update indices (much faster than one-by-one)
+            Self::batch_update_index_entries(
+                conn,
+                idx_col_id,
+                &new_indices
+                    .iter()
+                    .map(|(elem_idx, start, end)| {
+                        (*elem_idx, Self::pack_index_triple(chunk_id, *start, *end))
+                    })
+                    .collect::<Vec<_>>(),
+                idx_max_chunk,
+            )?;
 
             // IMPORTANT: DON'T update bytes_used (fragments remain for vacuum!)
+        }
+
+        Ok(())
+    }
+
+    /// Batch update multiple index entries efficiently.
+    /// Groups updates by index chunk to minimize I/O.
+    fn batch_update_index_entries(
+        conn: &Connection,
+        idx_col_id: i64,
+        updates: &[(i64, [u8; 12])], // (elem_idx, new_index_data)
+        idx_max_chunk: i64,
+    ) -> Result<(), ColError> {
+        // Group updates by which index chunk they're in
+        let mut by_idx_chunk: HashMap<i64, Vec<(usize, i64)>> = HashMap::new();
+
+        for (i, (elem_idx, _)) in updates.iter().enumerate() {
+            let byte_offset = elem_idx * 12;
+            let idx_chunk_idx = byte_offset / idx_max_chunk;
+            by_idx_chunk
+                .entry(idx_chunk_idx)
+                .or_default()
+                .push((i, *elem_idx));
+        }
+
+        // Process each index chunk
+        for (idx_chunk_idx, entries) in by_idx_chunk {
+            // Read index chunk once
+            let mut chunk_data: Vec<u8> = conn
+                .query_row(
+                    "SELECT data FROM col_chunks WHERE col_id = ?1 AND chunk_idx = ?2",
+                    params![idx_col_id, idx_chunk_idx],
+                    |row| row.get(0),
+                )
+                .map_err(ColError::from)?;
+
+            // Update all entries in this chunk
+            for (update_idx, elem_idx) in entries {
+                let byte_offset = elem_idx * 12;
+                let offset_in_chunk = (byte_offset % idx_max_chunk) as usize;
+                let new_index = &updates[update_idx].1;
+
+                chunk_data[offset_in_chunk..offset_in_chunk + 12].copy_from_slice(new_index);
+            }
+
+            // Write back once
+            conn.execute(
+                "UPDATE col_chunks SET data = ?1 WHERE col_id = ?2 AND chunk_idx = ?3",
+                params![chunk_data, idx_col_id, idx_chunk_idx],
+            )
+            .map_err(ColError::from)?;
         }
 
         Ok(())

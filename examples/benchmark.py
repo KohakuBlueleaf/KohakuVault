@@ -547,14 +547,175 @@ def benchmark_column_read(config: BenchmarkConfig):
 
 
 # =============================================================================
-# 5. DataPacker Benchmarks
+# 5. ColumnVault Slice Write Benchmarks
+# =============================================================================
+
+
+def benchmark_column_slice_write(config: BenchmarkConfig):
+    """Benchmark ColumnVault slice write: loop vs batch (v0.5.0)."""
+    print("\n" + "=" * 80)
+    print("5. ColumnVault Slice Write Performance (loop vs slice - v0.5.0)")
+    print("=" * 80)
+
+    results = []
+
+    # Test i64, f64, bytes, msgpack
+    dtypes_to_test = [
+        ("i64", 8),
+        ("f64", 8),
+        ("bytes:32", 32),
+        ("bytes", 15),  # Variable, ~15 bytes average
+        # ("msgpack", 32),  # Variable, ~32 bytes average
+    ]
+
+    # Test configurations
+    test_configs = []
+    for n_entries in config.entries:
+        for dtype, elem_size in dtypes_to_test:
+            test_configs.append((n_entries, dtype, elem_size, "loop"))
+            test_configs.append((n_entries, dtype, elem_size, "slice"))
+
+    # Run benchmarks
+    for n_entries, dtype, elem_size, write_type in tqdm(test_configs, desc="Column Slice Write"):
+        safe_dtype = dtype.replace(":", "_")
+        db_path = config.get_db_path(f"col_slicewrite_{n_entries}_{safe_dtype}_{write_type}")
+
+        cv = ColumnVault(
+            db_path,
+            min_chunk_bytes=config.min_chunk_kb * 1024,
+            max_chunk_bytes=config.max_chunk_mb * 1024 * 1024,
+        )
+        col = cv.create_column("test", dtype)
+
+        # Populate with initial data
+        if dtype == "i64":
+            col.extend(list(range(n_entries)))
+        elif dtype == "f64":
+            col.extend([float(i) * 1.5 for i in range(n_entries)])
+        elif dtype == "bytes:32":
+            col.extend([b"x" * 32 for _ in range(n_entries)])
+        elif dtype == "bytes":
+            col.extend([f"string_{i}".encode() for i in range(n_entries)])
+        elif dtype == "msgpack":
+            col.extend([{"id": i, "val": i * 1.5} for i in range(n_entries)])
+
+        # Prepare update data
+        n_updates = min(5000, n_entries // 2)  # Update larger subset
+        start_idx = n_entries // 4
+
+        if dtype == "i64":
+            update_data = [i * 100 for i in range(n_updates)]
+        elif dtype == "f64":
+            update_data = [float(i) * 100.0 for i in range(n_updates)]
+        elif dtype == "bytes:32":
+            update_data = [b"U" * 32 for _ in range(n_updates)]
+        elif dtype == "bytes":
+            # Use random sizes for realistic variable-size testing
+            import random
+
+            random.seed(42)
+            update_data = [b"x" * random.randint(5, 30) for _ in range(n_updates)]
+        elif dtype == "msgpack":
+            # Use variable-size msgpack objects
+            import random
+
+            random.seed(42)
+            update_data = [
+                {"id": i, "val": i * 100.0, "data": "x" * random.randint(10, 50)}
+                for i in range(n_updates)
+            ]
+
+        # Benchmark updates
+        start = time.perf_counter()
+        if write_type == "loop":
+            # Old way: loop of individual setitem
+            for i, val in enumerate(update_data):
+                col[start_idx + i] = val
+        else:  # slice
+            # New way: batch slice setitem
+            col[start_idx : start_idx + n_updates] = update_data
+
+        elapsed = time.perf_counter() - start
+
+        # Calculate throughput
+        total_bytes = n_updates * elem_size
+        mb_per_sec = (total_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+
+        results.append(
+            {
+                "entries": n_entries,
+                "dtype": dtype,
+                "elem_size": elem_size,
+                "write_type": write_type,
+                "n_updates": n_updates,
+                "time": elapsed,
+                "ops_per_sec": n_updates / elapsed,
+                "mb_per_sec": mb_per_sec,
+            }
+        )
+
+    # Print results table with speedup
+    print(
+        f"\n{'Entries':<10s} {'Type':<18s} {'Write Type':<12s} {'Updates':<10s} {'Time':<12s} {'Updates/Sec':<15s} {'MB/s':<10s} {'vs loop':<10s}"
+    )
+    print("-" * 100)
+
+    # Group by dtype and entries to show speedup
+    for n_entries in config.entries:
+        for dtype, elem_size in dtypes_to_test:
+            loop_r = next(
+                (
+                    r
+                    for r in results
+                    if r["dtype"] == dtype
+                    and r["entries"] == n_entries
+                    and r["write_type"] == "loop"
+                ),
+                None,
+            )
+            slice_r = next(
+                (
+                    r
+                    for r in results
+                    if r["dtype"] == dtype
+                    and r["entries"] == n_entries
+                    and r["write_type"] == "slice"
+                ),
+                None,
+            )
+
+            if loop_r and slice_r:
+                # Add size info to dtype display
+                dtype_display = dtype
+                if dtype == "msgpack":
+                    dtype_display = "msgpack(~32B)"
+                elif dtype == "bytes":
+                    dtype_display = "bytes(~15B)"
+
+                # Print loop (baseline)
+                print(
+                    f"{loop_r['entries']:<10,d} {dtype_display:<18s} {loop_r['write_type']:<12s} {loop_r['n_updates']:<10,d} "
+                    f"{format_time(loop_r['time']):<12s} {loop_r['ops_per_sec']:<15,.0f} {loop_r['mb_per_sec']:<10.2f} {'1.00x':<10s}"
+                )
+
+                # Print slice with speedup
+                speedup = slice_r["ops_per_sec"] / loop_r["ops_per_sec"]
+                print(
+                    f"{slice_r['entries']:<10,d} {dtype_display:<18s} {slice_r['write_type']:<12s} {slice_r['n_updates']:<10,d} "
+                    f"{format_time(slice_r['time']):<12s} {slice_r['ops_per_sec']:<15,.0f} {slice_r['mb_per_sec']:<10.2f} {speedup:<10.1f}x"
+                )
+                print()  # Empty line between groups
+
+
+# =============================================================================
+# 6. DataPacker Benchmarks
 # =============================================================================
 
 
 def benchmark_datapacker(config: BenchmarkConfig):
     """Benchmark DataPacker pack/unpack performance."""
     print("\n" + "=" * 80)
-    print("5. DataPacker Performance (pack/unpack/pack_many/unpack_many)")
+    print("6. DataPacker Performance (pack/unpack/pack_many/unpack_many)")
     print("=" * 80)
 
     results = []
@@ -736,6 +897,7 @@ def run_benchmark(
         benchmark_kvault_read(config)
         benchmark_column_append_extend(config)
         benchmark_column_read(config)
+        benchmark_column_slice_write(config)
         benchmark_datapacker(config)
 
         print("\n" + "=" * 80)
