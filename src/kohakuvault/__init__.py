@@ -21,7 +21,7 @@ from .errors import (
     IoError,
 )
 
-# Try to import DataPacker (will be available after maturin build)
+# Try to import DataPacker and CSBTree (will be available after maturin build)
 try:
     from ._kvault import DataPacker
 
@@ -30,6 +30,14 @@ except ImportError:
     _DATAPACKER_AVAILABLE = False
     DataPacker = None
 
+try:
+    from ._kvault import CSBTree
+
+    _CSBTREE_AVAILABLE = True
+except ImportError:
+    _CSBTREE_AVAILABLE = False
+    CSBTree = None
+
 __version__ = "0.4.2"
 __all__ = [
     "KVault",
@@ -37,9 +45,12 @@ __all__ = [
     "ColumnVault",
     "VarSizeColumn",
     "DataPacker",
+    "CSBTree",
     "KohakuVaultError",
     "NotFound",
     "DatabaseBusy",
     "InvalidArgument",
     "IoError",
+    "_CSBTREE_AVAILABLE",
+    "_DATAPACKER_AVAILABLE",
 ]
