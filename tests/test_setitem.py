@@ -4,6 +4,8 @@ Test suite for setitem operations (v0.4.2).
 Tests both fixed-size and variable-size columns with slice setitem support.
 """
 
+import random
+
 import pytest
 from kohakuvault import ColumnVault
 
@@ -243,8 +245,6 @@ class TestVariableSizeSingleSetitem:
         """Test with randomly sized elements."""
         vault = ColumnVault(str(tmp_path / "test.db"))
         col = vault.create_column("data", "bytes")
-
-        import random
 
         random.seed(42)
 

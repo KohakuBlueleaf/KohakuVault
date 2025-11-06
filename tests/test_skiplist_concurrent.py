@@ -5,8 +5,9 @@ Demonstrates that SkipList can be safely accessed from multiple Python threads
 without explicit locking, thanks to atomic CAS operations in Rust.
 """
 
-import threading
 import random
+import threading
+import time
 from kohakuvault import SkipList
 
 
@@ -164,7 +165,6 @@ def test_lock_free_properties():
             key = thread_id * items_per_thread + i
             skiplist[key] = f"t{thread_id}_v{i}"
 
-    import time
     start = time.perf_counter()
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]

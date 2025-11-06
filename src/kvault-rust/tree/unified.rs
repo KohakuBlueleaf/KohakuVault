@@ -1,11 +1,12 @@
 //! Unified CSBTree class with configurable key and value types
 
+use pyo3::ffi;
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyList};
+
 use super::csbtree::CSBPlusTree;
 use super::pyobject_key::PyObjectKey;
 use super::python::PyValue;
-use pyo3::prelude::*;
-use pyo3::ffi;
-use pyo3::types::{PyBytes, PyList};
 
 /// Internal tree storage enum
 enum TreeStorage {

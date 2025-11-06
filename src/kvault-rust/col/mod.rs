@@ -9,12 +9,13 @@
 //! - Write-back caching for append operations
 //! - Efficient batch operations
 
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyBytesMethods, PyList};
-use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyBytesMethods, PyList};
+use rusqlite::{params, Connection};
 use thiserror::Error;
 
 // Submodules

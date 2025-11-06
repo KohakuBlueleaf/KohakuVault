@@ -1,11 +1,12 @@
 //! Factory for creating CSBTree with different key/value type combinations
 
+use pyo3::ffi;
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyList};
+
 use super::csbtree::CSBPlusTree;
 use super::pyobject_key::PyObjectKey;
 use super::python::PyValue;
-use pyo3::prelude::*;
-use pyo3::ffi;
-use pyo3::types::{PyBytes, PyList};
 
 /// Internal tree storage enum - not exposed to Python
 pub(crate) enum TreeStorage {

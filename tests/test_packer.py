@@ -5,6 +5,7 @@ Tests Rust-based data packing/unpacking for columnar storage.
 """
 
 import pytest
+from kohakuvault import ColumnVault
 from kohakuvault._kvault import DataPacker
 
 
@@ -543,8 +544,6 @@ class TestPackerIntegration:
 
     def test_column_uses_rust_packer(self):
         """Verify that Column uses Rust packer by default."""
-        from kohakuvault import ColumnVault
-
         vault = ColumnVault(":memory:")
         col = vault.create_column("test", "i64")
 
@@ -558,8 +557,6 @@ class TestPackerIntegration:
 
     def test_column_python_packer_fallback(self):
         """Test that Python packer fallback works."""
-        from kohakuvault import ColumnVault
-
         vault = ColumnVault(":memory:")
         col = vault.create_column("test", "i64", use_rust_packer=False)
 

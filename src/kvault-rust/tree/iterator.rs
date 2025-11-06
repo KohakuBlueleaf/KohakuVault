@@ -1,8 +1,9 @@
 //! Iterators for CSB+Tree traversal
 
+use std::ops::{Bound, RangeBounds};
+
 use super::arena::NodeArena;
 use super::node::{NodeChildren, NodeId};
-use std::ops::{Bound, RangeBounds};
 
 /// Iterator over all key-value pairs in sorted order
 pub struct Iter<'a, K, V> {

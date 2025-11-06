@@ -366,8 +366,6 @@ def test_performance_with_cache(temp_db):
     cv = ColumnVault(temp_db)
     col = cv.create_column("nums", "i64")
 
-    import time
-
     # Test with cache
     start = time.time()
     with cv.cache():
@@ -584,8 +582,6 @@ def test_variable_size_extend_still_fast(temp_db):
     messages = [f"msg_{i}".encode() for i in range(1000)]
 
     # extend() should be fast for variable-size (uses extend_adaptive)
-    import time
-
     start = time.time()
     col.extend(messages)
     elapsed = time.time() - start

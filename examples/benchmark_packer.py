@@ -5,10 +5,12 @@ Compare Python struct.pack vs Rust DataPacker performance.
 Run this to measure actual performance improvements on your system.
 """
 
-import time
-import struct
 import json
-from kohakuvault import DataPacker, ColumnVault
+import struct
+import time
+import traceback
+
+from kohakuvault import ColumnVault, DataPacker
 
 
 def benchmark_python_packing(n=10000):
@@ -272,8 +274,6 @@ def main():
 
     except Exception as e:
         print(f"\nError during benchmark: {e}")
-        import traceback
-
         traceback.print_exc()
 
 

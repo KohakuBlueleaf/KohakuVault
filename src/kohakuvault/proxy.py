@@ -1,13 +1,13 @@
 import io
 import os
-import time
 import threading
-from pathlib import Path
-from typing import Any, BinaryIO, Iterator, Optional, Union
+import time
 from collections.abc import Mapping
 from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, BinaryIO, Iterator, Optional, Union
 
-from kohakuvault import errors as E
+import kohakuvault.errors as E
 from kohakuvault._kvault import _KVault  # compiled PyO3 class
 
 

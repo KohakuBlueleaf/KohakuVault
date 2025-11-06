@@ -15,10 +15,12 @@ Each operation tested separately:
 - Range queries
 """
 
-import time
+import argparse
 import random
 import string
+import time
 from datetime import datetime, timedelta
+
 from kohakuvault import CSBTree, SkipList
 
 
@@ -81,7 +83,9 @@ class RealisticBenchmark:
 
         # Benchmark
         print()
-        print(f"{'Operation':<30} | {'dict':>12} | {'CSBTree':>12} | {'SkipList':>12} | {'Ratio (Tree)':>15} | {'Ratio (Skip)':>15}")
+        print(
+            f"{'Operation':<30} | {'dict':>12} | {'CSBTree':>12} | {'SkipList':>12} | {'Ratio (Tree)':>15} | {'Ratio (Skip)':>15}"
+        )
         print("-" * 110)
 
         # Insert
@@ -103,9 +107,19 @@ class RealisticBenchmark:
             skiplist[ts] = msg
         skip_insert = time.perf_counter() - start
 
-        tree_ratio = f"{tree_insert/dict_insert:.2f}x slower" if tree_insert > dict_insert else f"{dict_insert/tree_insert:.2f}x faster"
-        skip_ratio = f"{skip_insert/dict_insert:.2f}x slower" if skip_insert > dict_insert else f"{dict_insert/skip_insert:.2f}x faster"
-        print(f"{'Insert (random order)':<30} | {format_time(dict_insert):>12} | {format_time(tree_insert):>12} | {format_time(skip_insert):>12} | {tree_ratio:>15} | {skip_ratio:>15}")
+        tree_ratio = (
+            f"{tree_insert/dict_insert:.2f}x slower"
+            if tree_insert > dict_insert
+            else f"{dict_insert/tree_insert:.2f}x faster"
+        )
+        skip_ratio = (
+            f"{skip_insert/dict_insert:.2f}x slower"
+            if skip_insert > dict_insert
+            else f"{dict_insert/skip_insert:.2f}x faster"
+        )
+        print(
+            f"{'Insert (random order)':<30} | {format_time(dict_insert):>12} | {format_time(tree_insert):>12} | {format_time(skip_insert):>12} | {tree_ratio:>15} | {skip_ratio:>15}"
+        )
 
         # Get sorted (by timestamp)
         start = time.perf_counter()
@@ -120,9 +134,19 @@ class RealisticBenchmark:
         _ = skiplist.keys()
         skip_sorted = time.perf_counter() - start
 
-        tree_ratio = f"{dict_sorted/tree_sorted:.2f}x faster" if tree_sorted < dict_sorted else f"{tree_sorted/dict_sorted:.2f}x slower"
-        skip_ratio = f"{dict_sorted/skip_sorted:.2f}x faster" if skip_sorted < dict_sorted else f"{skip_sorted/dict_sorted:.2f}x slower"
-        print(f"{'Get sorted timestamps':<30} | {format_time(dict_sorted):>12} | {format_time(tree_sorted):>12} | {format_time(skip_sorted):>12} | {tree_ratio:>15} | {skip_ratio:>15}")
+        tree_ratio = (
+            f"{dict_sorted/tree_sorted:.2f}x faster"
+            if tree_sorted < dict_sorted
+            else f"{tree_sorted/dict_sorted:.2f}x slower"
+        )
+        skip_ratio = (
+            f"{dict_sorted/skip_sorted:.2f}x faster"
+            if skip_sorted < dict_sorted
+            else f"{skip_sorted/dict_sorted:.2f}x slower"
+        )
+        print(
+            f"{'Get sorted timestamps':<30} | {format_time(dict_sorted):>12} | {format_time(tree_sorted):>12} | {format_time(skip_sorted):>12} | {tree_ratio:>15} | {skip_ratio:>15}"
+        )
 
         # Range query (events in time window)
         start_ts = timestamps[len(timestamps) // 4]
@@ -140,9 +164,19 @@ class RealisticBenchmark:
         result = skiplist.range(start_ts, end_ts)
         skip_range = time.perf_counter() - start
 
-        tree_ratio = f"{dict_range/tree_range:.2f}x faster" if tree_range < dict_range else f"{tree_range/dict_range:.2f}x slower"
-        skip_ratio = f"{dict_range/skip_range:.2f}x faster" if skip_range < dict_range else f"{skip_range/dict_range:.2f}x slower"
-        print(f"{'Range query (time window)':<30} | {format_time(dict_range):>12} | {format_time(tree_range):>12} | {format_time(skip_range):>12} | {tree_ratio:>15} | {skip_ratio:>15}")
+        tree_ratio = (
+            f"{dict_range/tree_range:.2f}x faster"
+            if tree_range < dict_range
+            else f"{tree_range/dict_range:.2f}x slower"
+        )
+        skip_ratio = (
+            f"{dict_range/skip_range:.2f}x faster"
+            if skip_range < dict_range
+            else f"{skip_range/dict_range:.2f}x slower"
+        )
+        print(
+            f"{'Range query (time window)':<30} | {format_time(dict_range):>12} | {format_time(tree_range):>12} | {format_time(skip_range):>12} | {tree_ratio:>15} | {skip_ratio:>15}"
+        )
 
     def scenario_tuples(self):
         """Scenario 2: Multi-dimensional keys (coordinates, IDs)"""
@@ -162,7 +196,9 @@ class RealisticBenchmark:
         values = [{"data": "x" * random.randint(10, 50), "count": i} for i in range(self.n)]
 
         print()
-        print(f"{'Operation':<30} | {'dict':>12} | {'CSBTree':>12} | {'SkipList':>12} | {'Ratio (Tree)':>15} | {'Ratio (Skip)':>15}")
+        print(
+            f"{'Operation':<30} | {'dict':>12} | {'CSBTree':>12} | {'SkipList':>12} | {'Ratio (Tree)':>15} | {'Ratio (Skip)':>15}"
+        )
         print("-" * 110)
 
         # Insert
@@ -184,9 +220,19 @@ class RealisticBenchmark:
             skiplist[k] = v
         skip_insert = time.perf_counter() - start
 
-        tree_ratio = f"{tree_insert/dict_insert:.2f}x slower" if tree_insert > dict_insert else f"{dict_insert/tree_insert:.2f}x faster"
-        skip_ratio = f"{skip_insert/dict_insert:.2f}x slower" if skip_insert > dict_insert else f"{dict_insert/skip_insert:.2f}x faster"
-        print(f"{'Insert (random order)':<30} | {format_time(dict_insert):>12} | {format_time(tree_insert):>12} | {format_time(skip_insert):>12} | {tree_ratio:>15} | {skip_ratio:>15}")
+        tree_ratio = (
+            f"{tree_insert/dict_insert:.2f}x slower"
+            if tree_insert > dict_insert
+            else f"{dict_insert/tree_insert:.2f}x faster"
+        )
+        skip_ratio = (
+            f"{skip_insert/dict_insert:.2f}x slower"
+            if skip_insert > dict_insert
+            else f"{dict_insert/skip_insert:.2f}x faster"
+        )
+        print(
+            f"{'Insert (random order)':<30} | {format_time(dict_insert):>12} | {format_time(tree_insert):>12} | {format_time(skip_insert):>12} | {tree_ratio:>15} | {skip_ratio:>15}"
+        )
 
         # Lookup
         n_lookup = min(1000, self.n)
@@ -207,9 +253,19 @@ class RealisticBenchmark:
             _ = skiplist[k]
         skip_lookup = time.perf_counter() - start
 
-        tree_ratio = f"{tree_lookup/dict_lookup:.2f}x slower" if tree_lookup > dict_lookup else f"{dict_lookup/tree_lookup:.2f}x faster"
-        skip_ratio = f"{skip_lookup/dict_lookup:.2f}x slower" if skip_lookup > dict_lookup else f"{dict_lookup/skip_lookup:.2f}x faster"
-        print(f"{'Lookup (' + str(n_lookup) + ' keys)':<30} | {format_time(dict_lookup):>12} | {format_time(tree_lookup):>12} | {format_time(skip_lookup):>12} | {tree_ratio:>15} | {skip_ratio:>15}")
+        tree_ratio = (
+            f"{tree_lookup/dict_lookup:.2f}x slower"
+            if tree_lookup > dict_lookup
+            else f"{dict_lookup/tree_lookup:.2f}x faster"
+        )
+        skip_ratio = (
+            f"{skip_lookup/dict_lookup:.2f}x slower"
+            if skip_lookup > dict_lookup
+            else f"{dict_lookup/skip_lookup:.2f}x faster"
+        )
+        print(
+            f"{'Lookup (' + str(n_lookup) + ' keys)':<30} | {format_time(dict_lookup):>12} | {format_time(tree_lookup):>12} | {format_time(skip_lookup):>12} | {tree_ratio:>15} | {skip_ratio:>15}"
+        )
 
         # Get sorted (automatically sorts by user_id then timestamp)
         start = time.perf_counter()
@@ -224,9 +280,19 @@ class RealisticBenchmark:
         _ = skiplist.keys()
         skip_sorted = time.perf_counter() - start
 
-        tree_ratio = f"{dict_sorted/tree_sorted:.2f}x faster" if tree_sorted < dict_sorted else f"{tree_sorted/dict_sorted:.2f}x slower"
-        skip_ratio = f"{dict_sorted/skip_sorted:.2f}x faster" if skip_sorted < dict_sorted else f"{skip_sorted/dict_sorted:.2f}x slower"
-        print(f"{'Get sorted tuples':<30} | {format_time(dict_sorted):>12} | {format_time(tree_sorted):>12} | {format_time(skip_sorted):>12} | {tree_ratio:>15} | {skip_ratio:>15}")
+        tree_ratio = (
+            f"{dict_sorted/tree_sorted:.2f}x faster"
+            if tree_sorted < dict_sorted
+            else f"{tree_sorted/dict_sorted:.2f}x slower"
+        )
+        skip_ratio = (
+            f"{dict_sorted/skip_sorted:.2f}x faster"
+            if skip_sorted < dict_sorted
+            else f"{skip_sorted/dict_sorted:.2f}x slower"
+        )
+        print(
+            f"{'Get sorted tuples':<30} | {format_time(dict_sorted):>12} | {format_time(tree_sorted):>12} | {format_time(skip_sorted):>12} | {tree_ratio:>15} | {skip_ratio:>15}"
+        )
 
     def scenario_strings(self):
         """Scenario 3: String keys (names, URLs, paths)"""
@@ -258,7 +324,9 @@ class RealisticBenchmark:
         ]
 
         print()
-        print(f"{'Operation':<30} | {'dict':>12} | {'CSBTree':>12} | {'SkipList':>12} | {'Ratio (Tree)':>15} | {'Ratio (Skip)':>15}")
+        print(
+            f"{'Operation':<30} | {'dict':>12} | {'CSBTree':>12} | {'SkipList':>12} | {'Ratio (Tree)':>15} | {'Ratio (Skip)':>15}"
+        )
         print("-" * 110)
 
         # Insert
@@ -280,9 +348,19 @@ class RealisticBenchmark:
             skiplist[path] = meta
         skip_insert = time.perf_counter() - start
 
-        tree_ratio = f"{tree_insert/dict_insert:.2f}x slower" if tree_insert > dict_insert else f"{dict_insert/tree_insert:.2f}x faster"
-        skip_ratio = f"{skip_insert/dict_insert:.2f}x slower" if skip_insert > dict_insert else f"{dict_insert/skip_insert:.2f}x faster"
-        print(f"{'Insert (random order)':<30} | {format_time(dict_insert):>12} | {format_time(tree_insert):>12} | {format_time(skip_insert):>12} | {tree_ratio:>15} | {skip_ratio:>15}")
+        tree_ratio = (
+            f"{tree_insert/dict_insert:.2f}x slower"
+            if tree_insert > dict_insert
+            else f"{dict_insert/tree_insert:.2f}x faster"
+        )
+        skip_ratio = (
+            f"{skip_insert/dict_insert:.2f}x slower"
+            if skip_insert > dict_insert
+            else f"{dict_insert/skip_insert:.2f}x faster"
+        )
+        print(
+            f"{'Insert (random order)':<30} | {format_time(dict_insert):>12} | {format_time(tree_insert):>12} | {format_time(skip_insert):>12} | {tree_ratio:>15} | {skip_ratio:>15}"
+        )
 
         # Get sorted paths
         start = time.perf_counter()
@@ -297,9 +375,19 @@ class RealisticBenchmark:
         _ = skiplist.keys()
         skip_sorted = time.perf_counter() - start
 
-        tree_ratio = f"{dict_sorted/tree_sorted:.2f}x faster" if tree_sorted < dict_sorted else f"{tree_sorted/dict_sorted:.2f}x slower"
-        skip_ratio = f"{dict_sorted/skip_sorted:.2f}x faster" if skip_sorted < dict_sorted else f"{skip_sorted/dict_sorted:.2f}x slower"
-        print(f"{'Get sorted paths':<30} | {format_time(dict_sorted):>12} | {format_time(tree_sorted):>12} | {format_time(skip_sorted):>12} | {tree_ratio:>15} | {skip_ratio:>15}")
+        tree_ratio = (
+            f"{dict_sorted/tree_sorted:.2f}x faster"
+            if tree_sorted < dict_sorted
+            else f"{tree_sorted/dict_sorted:.2f}x slower"
+        )
+        skip_ratio = (
+            f"{dict_sorted/skip_sorted:.2f}x faster"
+            if skip_sorted < dict_sorted
+            else f"{skip_sorted/dict_sorted:.2f}x slower"
+        )
+        print(
+            f"{'Get sorted paths':<30} | {format_time(dict_sorted):>12} | {format_time(tree_sorted):>12} | {format_time(skip_sorted):>12} | {tree_ratio:>15} | {skip_ratio:>15}"
+        )
 
         # Prefix search (all files under /abc/)
         prefix_paths = [p for p in paths if p.startswith("/a")]
@@ -319,9 +407,19 @@ class RealisticBenchmark:
             result = skiplist.range(prefix_start, prefix_end)
             skip_prefix = time.perf_counter() - start
 
-            tree_ratio = f"{dict_prefix/tree_prefix:.2f}x faster" if tree_prefix < dict_prefix else f"{tree_prefix/dict_prefix:.2f}x slower"
-            skip_ratio = f"{dict_prefix/skip_prefix:.2f}x faster" if skip_prefix < dict_prefix else f"{skip_prefix/dict_prefix:.2f}x slower"
-            print(f"{'Prefix search (/a*)':<30} | {format_time(dict_prefix):>12} | {format_time(tree_prefix):>12} | {format_time(skip_prefix):>12} | {tree_ratio:>15} | {skip_ratio:>15}")
+            tree_ratio = (
+                f"{dict_prefix/tree_prefix:.2f}x faster"
+                if tree_prefix < dict_prefix
+                else f"{tree_prefix/dict_prefix:.2f}x slower"
+            )
+            skip_ratio = (
+                f"{dict_prefix/skip_prefix:.2f}x faster"
+                if skip_prefix < dict_prefix
+                else f"{skip_prefix/dict_prefix:.2f}x slower"
+            )
+            print(
+                f"{'Prefix search (/a*)':<30} | {format_time(dict_prefix):>12} | {format_time(tree_prefix):>12} | {format_time(skip_prefix):>12} | {tree_ratio:>15} | {skip_ratio:>15}"
+            )
 
     def scenario_variable_data(self):
         """Scenario 4: Variable-length data"""
@@ -349,7 +447,9 @@ class RealisticBenchmark:
             values.append(obj)
 
         print()
-        print(f"{'Operation':<30} | {'dict':>12} | {'CSBTree':>12} | {'SkipList':>12} | {'Ratio (Tree)':>15} | {'Ratio (Skip)':>15}")
+        print(
+            f"{'Operation':<30} | {'dict':>12} | {'CSBTree':>12} | {'SkipList':>12} | {'Ratio (Tree)':>15} | {'Ratio (Skip)':>15}"
+        )
         print("-" * 110)
 
         # Insert
@@ -371,9 +471,19 @@ class RealisticBenchmark:
             skiplist[k] = v
         skip_insert = time.perf_counter() - start
 
-        tree_ratio = f"{tree_insert/dict_insert:.2f}x slower" if tree_insert > dict_insert else f"{dict_insert/tree_insert:.2f}x faster"
-        skip_ratio = f"{skip_insert/dict_insert:.2f}x slower" if skip_insert > dict_insert else f"{dict_insert/skip_insert:.2f}x faster"
-        print(f"{'Insert (random order)':<30} | {format_time(dict_insert):>12} | {format_time(tree_insert):>12} | {format_time(skip_insert):>12} | {tree_ratio:>15} | {skip_ratio:>15}")
+        tree_ratio = (
+            f"{tree_insert/dict_insert:.2f}x slower"
+            if tree_insert > dict_insert
+            else f"{dict_insert/tree_insert:.2f}x faster"
+        )
+        skip_ratio = (
+            f"{skip_insert/dict_insert:.2f}x slower"
+            if skip_insert > dict_insert
+            else f"{dict_insert/skip_insert:.2f}x faster"
+        )
+        print(
+            f"{'Insert (random order)':<30} | {format_time(dict_insert):>12} | {format_time(tree_insert):>12} | {format_time(skip_insert):>12} | {tree_ratio:>15} | {skip_ratio:>15}"
+        )
 
         # Iterate and access values
         start = time.perf_counter()
@@ -388,16 +498,24 @@ class RealisticBenchmark:
         total = sum(len(v["data"]) for k, v in skiplist)
         skip_iter = time.perf_counter() - start
 
-        tree_ratio = f"{tree_iter/dict_iter:.2f}x slower" if tree_iter > dict_iter else f"{dict_iter/tree_iter:.2f}x faster"
-        skip_ratio = f"{skip_iter/dict_iter:.2f}x slower" if skip_iter > dict_iter else f"{dict_iter/skip_iter:.2f}x faster"
-        print(f"{'Iterate & process values':<30} | {format_time(dict_iter):>12} | {format_time(tree_iter):>12} | {format_time(skip_iter):>12} | {tree_ratio:>15} | {skip_ratio:>15}")
+        tree_ratio = (
+            f"{tree_iter/dict_iter:.2f}x slower"
+            if tree_iter > dict_iter
+            else f"{dict_iter/tree_iter:.2f}x faster"
+        )
+        skip_ratio = (
+            f"{skip_iter/dict_iter:.2f}x slower"
+            if skip_iter > dict_iter
+            else f"{dict_iter/skip_iter:.2f}x faster"
+        )
+        print(
+            f"{'Iterate & process values':<30} | {format_time(dict_iter):>12} | {format_time(tree_iter):>12} | {format_time(skip_iter):>12} | {tree_ratio:>15} | {skip_ratio:>15}"
+        )
 
         print("=" * 100)
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="CSBTree realistic benchmark")
     parser.add_argument("--ops", type=int, default=10000, help="Number of items (default: 10000)")
     parser.add_argument("--order", type=int, default=15, help="Tree order (default: 15)")

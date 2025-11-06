@@ -1,8 +1,9 @@
 //! Core CSB+Tree implementation with cache-optimized node storage
 
+use std::ops::RangeBounds;
+
 use super::arena::NodeArena;
 use super::node::{Node, NodeChildren, NodeId};
-use std::ops::RangeBounds;
 
 /// Cache-Sensitive B+Tree with generic key and value types
 pub struct CSBPlusTree<K, V>

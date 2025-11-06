@@ -1,8 +1,9 @@
 //! Wrapper for Python objects as keys with comparison support
 
+use std::cmp::Ordering;
+
 use pyo3::ffi;
 use pyo3::prelude::*;
-use std::cmp::Ordering;
 
 /// Wrapper for Python objects that implements Ord using Python's comparison protocol
 pub struct PyObjectKey {

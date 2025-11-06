@@ -5,13 +5,17 @@ Simplified benchmark suite with configurable parameters.
 Tests: KVault write/read, ColumnVault append/extend/read, DataPacker
 """
 
+import argparse
 import os
-import time
-import tempfile
+import random
 import shutil
+import tempfile
+import time
 from typing import List
+
 from tqdm import tqdm
-from kohakuvault import KVault, ColumnVault, DataPacker
+
+from kohakuvault import ColumnVault, DataPacker, KVault
 
 
 # =============================================================================
@@ -455,8 +459,6 @@ def benchmark_column_read(config: BenchmarkConfig):
         start = time.perf_counter()
         if read_type == "single":
             # Random single reads
-            import random
-
             random.seed(42)
             for _ in range(n_reads):
                 idx = random.randint(0, n_entries - 1)
@@ -611,14 +613,10 @@ def benchmark_column_slice_write(config: BenchmarkConfig):
             update_data = [b"U" * 32 for _ in range(n_updates)]
         elif dtype == "bytes":
             # Use random sizes for realistic variable-size testing
-            import random
-
             random.seed(42)
             update_data = [b"x" * random.randint(5, 30) for _ in range(n_updates)]
         elif dtype == "msgpack":
             # Use variable-size msgpack objects
-            import random
-
             random.seed(42)
             update_data = [
                 {"id": i, "val": i * 100.0, "data": "x" * random.randint(10, 50)}
@@ -931,8 +929,6 @@ def run_quick_benchmark():
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(
         description="KohakuVault Performance Benchmark",
         formatter_class=argparse.RawDescriptionHelpFormatter,

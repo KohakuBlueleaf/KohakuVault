@@ -2,9 +2,10 @@
 //!
 //! These avoid Python comparison overhead by using native Rust types
 
-use super::csbtree::CSBPlusTree;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
+
+use super::csbtree::CSBPlusTree;
 
 /// CSBTree with i64 keys and bytes values (FAST - no Python comparison overhead!)
 #[pyclass(name = "CSBTreeI64")]

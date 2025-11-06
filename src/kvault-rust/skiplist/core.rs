@@ -7,6 +7,7 @@
 //! This hybrid approach provides lock-free performance for hot paths (read/write)
 //! while ensuring safe deletion with a simple lock.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering as AtomicOrdering};
@@ -29,11 +30,7 @@ impl<K, V> Node<K, V> {
             forward.push(AtomicPtr::new(ptr::null_mut()));
         }
 
-        Self {
-            key,
-            value: Arc::new(value),
-            forward,
-        }
+        Self { key, value: Arc::new(value), forward }
     }
 
     fn new_head() -> Self
@@ -46,11 +43,7 @@ impl<K, V> Node<K, V> {
             forward.push(AtomicPtr::new(ptr::null_mut()));
         }
 
-        Self {
-            key: K::default(),
-            value: Arc::new(V::default()),
-            forward,
-        }
+        Self { key: K::default(), value: Arc::new(V::default()), forward }
     }
 }
 
@@ -85,7 +78,6 @@ where
     }
 
     fn random_level() -> usize {
-        use std::cell::RefCell;
         thread_local! {
             static RNG: RefCell<u64> = const { RefCell::new(0x123456789ABCDEF) };
         }
@@ -166,7 +158,8 @@ where
                 );
             }
 
-            let new_node = Box::into_raw(Box::new(Node::new(key.clone(), value.clone(), new_level + 1)));
+            let new_node =
+                Box::into_raw(Box::new(Node::new(key.clone(), value.clone(), new_level + 1)));
 
             // Set forward pointers
             unsafe {
@@ -182,14 +175,26 @@ where
                 unsafe {
                     let pred_ref = &*preds[i];
                     if pred_ref.forward[i]
-                        .compare_exchange(succs[i], new_node, AtomicOrdering::Release, AtomicOrdering::Relaxed)
+                        .compare_exchange(
+                            succs[i],
+                            new_node,
+                            AtomicOrdering::Release,
+                            AtomicOrdering::Relaxed,
+                        )
                         .is_err()
                     {
                         success = false;
                         // Rollback previous levels
                         for j in 0..i {
                             let pred_ref = &*preds[j];
-                            pred_ref.forward[j].compare_exchange(new_node, succs[j], AtomicOrdering::Release, AtomicOrdering::Relaxed).ok();
+                            pred_ref.forward[j]
+                                .compare_exchange(
+                                    new_node,
+                                    succs[j],
+                                    AtomicOrdering::Release,
+                                    AtomicOrdering::Relaxed,
+                                )
+                                .ok();
                         }
                         break;
                     }

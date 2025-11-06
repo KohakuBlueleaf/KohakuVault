@@ -9,13 +9,14 @@
 //! - SQLite connection helpers (WAL, pragmas, checkpointing)
 //! - BLOB API helpers
 
-use pyo3::prelude::*;
-use rusqlite::blob::Blob;
-use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+use pyo3::prelude::*;
+use rusqlite::blob::Blob;
+use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
 
 // ========================================

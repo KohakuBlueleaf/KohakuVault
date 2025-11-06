@@ -1,10 +1,11 @@
 //! PyO3 bindings for CSB+Tree with Python object support
 
-use super::csbtree::CSBPlusTree;
-use super::pyobject_key::PyObjectKey;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
+
+use super::csbtree::CSBPlusTree;
+use super::pyobject_key::PyObjectKey;
 
 /// Wrapper for Py<PyAny> that implements Clone using clone_ref
 pub struct PyValue {

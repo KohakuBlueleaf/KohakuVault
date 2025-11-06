@@ -4,8 +4,11 @@ DataPacker Demo
 Demonstrates the Rust-based DataPacker for efficient data serialization.
 """
 
-from kohakuvault import DataPacker, ColumnVault
 import json
+import time
+import traceback
+
+from kohakuvault import ColumnVault, DataPacker
 
 
 def demo_primitives():
@@ -181,8 +184,6 @@ def demo_bulk_operations():
     print("5. Bulk Operations Demo")
     print("=" * 60)
 
-    import time
-
     vault = ColumnVault(":memory:")
     col = vault.create_column("numbers", "i64")
 
@@ -222,8 +223,6 @@ def main():
 
     except Exception as e:
         print(f"\nError during demo: {e}")
-        import traceback
-
         traceback.print_exc()
 
 

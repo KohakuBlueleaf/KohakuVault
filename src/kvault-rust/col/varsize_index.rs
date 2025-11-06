@@ -6,10 +6,11 @@
 //! Handles updating, deleting, and managing index entries for variable-size columns.
 //! Index entries are 12-byte triples: (chunk_id, start_byte, end_byte)
 
+use std::collections::HashMap;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyBytesMethods, PyList};
 use rusqlite::{params, Connection};
-use std::collections::HashMap;
 
 use super::chunks::pack_index_triple;
 use super::ColError;

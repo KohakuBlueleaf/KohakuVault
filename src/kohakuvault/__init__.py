@@ -11,15 +11,9 @@ Features:
 
 __version__ = "0.5.0"
 
-from .proxy import KVault
 from .column_proxy import Column, ColumnVault, VarSizeColumn
-from .errors import (
-    KohakuVaultError,
-    NotFound,
-    DatabaseBusy,
-    InvalidArgument,
-    IoError,
-)
+from .errors import DatabaseBusy, InvalidArgument, IoError, KohakuVaultError, NotFound
+from .proxy import KVault
 
 # Try to import DataPacker and CSBTree (will be available after maturin build)
 try:
@@ -39,7 +33,6 @@ except ImportError:
     CSBTree = None
     SkipList = None
 
-__version__ = "0.4.2"
 __all__ = [
     "KVault",
     "Column",

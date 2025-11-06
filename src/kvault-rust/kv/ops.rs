@@ -6,10 +6,11 @@
 //! This module contains the actual implementation of KVault operations.
 //! The main KVault struct in mod.rs provides thin wrappers that delegate to these functions.
 
-use crate::common::{CacheError, VaultError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBytes, PyBytesMethods, PyString, PyStringMethods};
 use rusqlite::params;
+
+use crate::common::{CacheError, VaultError};
 
 use super::_KVault;
 

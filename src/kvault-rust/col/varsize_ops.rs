@@ -6,10 +6,11 @@
 //! Handles reading, writing, and extending variable-size data columns.
 //! Uses adaptive chunking strategy with bytes_used tracking.
 
+use std::collections::HashMap;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyBytesMethods, PyList};
 use rusqlite::params;
-use std::collections::HashMap;
 
 use super::chunks::pack_index_triple;
 use super::ColError;

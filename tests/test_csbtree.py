@@ -1,5 +1,7 @@
 """Tests for CSB+Tree implementation"""
 
+import dataclasses
+
 import pytest
 from kohakuvault import CSBTree
 
@@ -244,9 +246,8 @@ def test_bytes_keys():
 
 def test_custom_comparable_objects():
     """Test with custom comparable objects"""
-    from dataclasses import dataclass
 
-    @dataclass(order=True)
+    @dataclasses.dataclass(order=True)
     class Person:
         age: int
         name: str

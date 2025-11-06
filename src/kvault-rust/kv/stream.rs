@@ -6,10 +6,11 @@
 //! This module contains the actual implementation of streaming operations.
 //! The main KVault struct in mod.rs provides thin wrappers that delegate to these functions.
 
-use crate::common::{open_blob, VaultError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBytes, PyBytesMethods};
 use rusqlite::params;
+
+use crate::common::{open_blob, VaultError};
 
 use super::{_KVault, ops::to_key_bytes};
 

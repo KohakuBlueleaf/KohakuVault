@@ -9,10 +9,15 @@ import threading
 import time
 from collections.abc import MutableSequence
 from contextlib import contextmanager
-from typing import Any, Iterator, Union
+from typing import Any, Iterator, Optional, Union
 
+import kohakuvault.errors as E
 from kohakuvault._kvault import _ColumnVault
-from kohakuvault import errors as E
+
+try:
+    from kohakuvault._kvault import DataPacker
+except ImportError:  # pragma: no cover - optional extension
+    DataPacker = None
 
 # Type aliases
 ValueType = Union[int, float, bytes]
@@ -84,6 +89,16 @@ DTYPE_INFO = {
 }
 
 
+def _create_data_packer(dtype: str) -> Optional[Any]:
+    """Instantiate DataPacker when the Rust extension is available."""
+    if DataPacker is None:
+        return None
+    try:
+        return DataPacker(dtype)
+    except Exception:
+        return None
+
+
 def parse_dtype(dtype: str) -> tuple[str, int, bool]:
     """
     Parse dtype string and return (base_type, elem_size, is_varsize).
@@ -99,20 +114,13 @@ def parse_dtype(dtype: str) -> tuple[str, int, bool]:
     - "cbor" → ("cbor", 0, True) - variable-size structured
     """
     # Try to use DataPacker to determine if dtype is valid
-    try:
-        from kohakuvault._kvault import DataPacker
-
+    packer = _create_data_packer(dtype)
+    if packer is not None:
         # Create packer to validate dtype and get size info
-        packer = DataPacker(dtype)
         elem_size = packer.elem_size
         is_varsize = packer.is_varsize
-
         # Base type is the dtype itself (DataPacker handles it)
         return dtype, elem_size, is_varsize
-
-    except (ImportError, ValueError):
-        # Fallback to old behavior if DataPacker not available or dtype invalid
-        pass
 
     # Legacy parsing (for backward compatibility)
     if dtype in DTYPE_INFO:
@@ -190,13 +198,13 @@ class Column(MutableSequence):
         self._chunk_bytes = chunk_bytes  # max_chunk_bytes for addressing
 
         # NEW: Try to use Rust DataPacker
+        self._rust_packer = None
         self._use_rust_packer = use_rust_packer
-        if use_rust_packer:
-            try:
-                from kohakuvault._kvault import DataPacker
-
-                self._rust_packer = DataPacker(dtype)
-            except (ImportError, Exception):
+        if self._use_rust_packer:
+            packer = _create_data_packer(dtype)
+            if packer is not None:
+                self._rust_packer = packer
+            else:
                 # Fall back to Python packing if DataPacker not available
                 self._use_rust_packer = False
 
@@ -654,19 +662,14 @@ class VarSizeColumn(MutableSequence):
         self._length = None
 
         # NEW: Support DataPacker for structured types (msgpack, cbor, strings)
-        self._use_rust_packer = use_rust_packer
-        if use_rust_packer and dtype != "bytes":
-            # For non-bytes variable-size types, use DataPacker
-            try:
-                from kohakuvault._kvault import DataPacker
-
-                self._packer = DataPacker(dtype)
-            except (ImportError, Exception):
+        self._packer = None
+        self._use_rust_packer = use_rust_packer and dtype != "bytes"
+        if self._use_rust_packer:
+            packer = _create_data_packer(dtype)
+            if packer is not None:
+                self._packer = packer
+            else:
                 self._use_rust_packer = False
-                self._packer = None
-        else:
-            self._use_rust_packer = False
-            self._packer = None
 
         # Cache enablement flag
         self._cache_enabled = False

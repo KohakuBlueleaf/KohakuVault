@@ -1,11 +1,12 @@
 //! PyO3 bindings for SkipList
 
-use super::core::SkipList;
-use crate::tree::pyobject_key::PyObjectKey;
-use crate::tree::python::PyValue;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
+
+use super::core::SkipList;
+use crate::tree::pyobject_key::PyObjectKey;
+use crate::tree::python::PyValue;
 
 /// Skip List with Python object keys and values
 #[pyclass(name = "SkipList")]
