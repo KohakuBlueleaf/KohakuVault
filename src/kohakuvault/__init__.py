@@ -9,7 +9,7 @@ Features:
 - Thread-safe with retry logic
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from .column_proxy import Column, ColumnVault, VarSizeColumn
 from .errors import DatabaseBusy, InvalidArgument, IoError, KohakuVaultError, NotFound
