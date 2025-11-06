@@ -10,7 +10,7 @@ pub struct PyObjectKey {
 }
 
 impl PyObjectKey {
-    pub fn new(obj: Py<PyAny>) -> Self {
+    pub(crate) fn new(obj: Py<PyAny>) -> Self {
         Self { obj }
     }
 }
@@ -44,6 +44,12 @@ impl PartialEq for PyObjectKey {
 }
 
 impl Eq for PyObjectKey {}
+
+impl Default for PyObjectKey {
+    fn default() -> Self {
+        Python::with_gil(|py| Self { obj: py.None() })
+    }
+}
 
 impl PartialOrd for PyObjectKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {

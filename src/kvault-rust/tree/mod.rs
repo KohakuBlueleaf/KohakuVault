@@ -14,8 +14,8 @@ mod arena;
 mod csbtree;
 mod iterator;
 mod node;
-mod pyobject_key;
-mod python;
+pub(crate) mod pyobject_key;
+pub(crate) mod python;
 
 // Re-export Python types
 pub use python::register_tree_types;

@@ -15,6 +15,7 @@ mod col;
 mod common;
 mod kv;
 mod packer;
+mod skiplist;
 mod tree;
 
 #[pymodule]
@@ -25,6 +26,9 @@ fn _kvault(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register CSB+Tree (Python object keys & values)
     tree::register_tree_types(m)?;
+
+    // Register SkipList
+    skiplist::register_skiplist_types(m)?;
 
     Ok(())
 }

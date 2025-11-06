@@ -31,12 +31,13 @@ except ImportError:
     DataPacker = None
 
 try:
-    from ._kvault import CSBTree
+    from ._kvault import CSBTree, SkipList
 
     _CSBTREE_AVAILABLE = True
 except ImportError:
     _CSBTREE_AVAILABLE = False
     CSBTree = None
+    SkipList = None
 
 __version__ = "0.4.2"
 __all__ = [
@@ -46,6 +47,7 @@ __all__ = [
     "VarSizeColumn",
     "DataPacker",
     "CSBTree",
+    "SkipList",
     "KohakuVaultError",
     "NotFound",
     "DatabaseBusy",

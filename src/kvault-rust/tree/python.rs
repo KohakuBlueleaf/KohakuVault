@@ -8,15 +8,15 @@ use pyo3::types::PyList;
 
 /// Wrapper for Py<PyAny> that implements Clone using clone_ref
 pub struct PyValue {
-    obj: Py<PyAny>,
+    pub(crate) obj: Py<PyAny>,
 }
 
 impl PyValue {
-    fn new(obj: Py<PyAny>) -> Self {
+    pub(crate) fn new(obj: Py<PyAny>) -> Self {
         Self { obj }
     }
 
-    fn into_py(self) -> Py<PyAny> {
+    pub(crate) fn into_py(self) -> Py<PyAny> {
         self.obj
     }
 }
@@ -31,6 +31,12 @@ impl Clone for PyValue {
                     .expect("Clone failed"),
             }
         }
+    }
+}
+
+impl Default for PyValue {
+    fn default() -> Self {
+        Python::with_gil(|py| Self { obj: py.None() })
     }
 }
 
