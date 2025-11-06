@@ -58,18 +58,13 @@ impl _KVault {
         let conn = open_connection(path, enable_wal, page_size, mmap_size, cache_kb)
             .map_err(VaultError::from)?;
 
-        // Create schema
+        // Create schema - minimal design with key as primary key
         conn.execute_batch(&format!(
             "
             CREATE TABLE IF NOT EXISTS {t} (
-                id    INTEGER PRIMARY KEY,
-                key   BLOB    NOT NULL UNIQUE,
-                value BLOB    NOT NULL,
-                size  INTEGER NOT NULL
+                key   BLOB PRIMARY KEY NOT NULL,
+                value BLOB NOT NULL
             );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS {t}_key_idx
-            ON {t}(key);
             ",
             t = rusqlite::types::ValueRef::from(table)
                 .as_str()
@@ -136,12 +131,11 @@ impl _KVault {
 
         let sql = format!(
             "
-            INSERT INTO {t}(key, value, size)
-            VALUES (?1, ?2, ?3)
+            INSERT INTO {t}(key, value)
+            VALUES (?1, ?2)
             ON CONFLICT(key)
             DO UPDATE SET
-                value = excluded.value,
-                size = excluded.size
+                value = excluded.value
             ",
             t = self.table
         );
@@ -150,8 +144,7 @@ impl _KVault {
         let mut stmt = tx.prepare(&sql).map_err(VaultError::from)?;
         let mut count = 0usize;
         for (k, v) in entries {
-            stmt.execute(params![k, &v, (v.len() as i64)])
-                .map_err(VaultError::from)?;
+            stmt.execute(params![k, &v]).map_err(VaultError::from)?;
             count += 1;
         }
         drop(stmt);
@@ -261,20 +254,18 @@ impl _KVault {
 impl _KVault {
     /// Write directly to database (bypass cache).
     pub(crate) fn write_direct(&self, k: &[u8], v: &[u8]) -> PyResult<()> {
-        let size = v.len() as i64;
         let sql = format!(
             "
-            INSERT INTO {t}(key, value, size)
-            VALUES (?1, ?2, ?3)
+            INSERT INTO {t}(key, value)
+            VALUES (?1, ?2)
             ON CONFLICT(key)
             DO UPDATE SET
-                value = excluded.value,
-                size = excluded.size
+                value = excluded.value
             ",
             t = self.table
         );
         let conn = self.conn.lock().unwrap();
-        conn.execute(&sql, params![k, v, size])
+        conn.execute(&sql, params![k, v])
             .map_err(VaultError::from)?;
         Ok(())
     }

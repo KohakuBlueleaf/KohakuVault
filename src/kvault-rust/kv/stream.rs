@@ -44,12 +44,11 @@ impl _KVault {
         // 1) Upsert a zeroblob of desired size
         let sql = format!(
             "
-            INSERT INTO {t}(key, value, size)
-            VALUES (?1, zeroblob(?2), ?2)
+            INSERT INTO {t}(key, value)
+            VALUES (?1, zeroblob(?2))
             ON CONFLICT(key)
             DO UPDATE SET
-                value = excluded.value,
-                size = excluded.size
+                value = excluded.value
             ",
             t = self.table
         );
@@ -144,13 +143,13 @@ impl _KVault {
             }
         }
 
-        // Fetch rowid & size
+        // Fetch rowid & size (using LENGTH() to get blob size without reading blob)
         let conn = self.conn.lock().unwrap();
         let (rowid, size): (i64, i64) = conn
             .query_row(
                 &format!(
                     "
-                    SELECT rowid, size
+                    SELECT rowid, LENGTH(value)
                     FROM {}
                     WHERE key = ?1
                     ",
