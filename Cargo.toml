@@ -14,6 +14,7 @@ pyo3 = { version = "0.22", features = ["extension-module"] }
 rusqlite = { version = "0.31", features = ["bundled", "blob", "unlock_notify"] }
 parking_lot = "0.12"
 thiserror = "1.0"
+crossbeam-epoch = "0.9"  # Epoch-based GC for lock-free deletion
 
 # Serialization support for DataPacker
 serde = { version = "1.0", features = ["derive"] }
