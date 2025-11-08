@@ -1,131 +1,93 @@
-# Structured Columns Guide
+# Structured Data Cookbook
 
-ColumnVault can store complex Python objects (dicts, lists, strings) using the bundled `DataPacker`. This guide focuses on best practices when working with structured and variable-size data.
+This page complements the [ColumnVault Guide](columnvault.md) with recipes focused on MessagePack/CBOR columns, schema validation, and hybrid layouts. Use it when you already know the basics of `ColumnVault` but need practical patterns.
 
-## Getting Started
+## Choosing the Right Dtype
 
-```python
-from kohakuvault import ColumnVault
+| Use case | Recommended dtype | Why |
+|----------|-------------------|-----|
+| JSON-like metadata with flexible keys | `msgpack` | Compact, schemaless, decoded transparently via `DataPacker`. |
+| IoT / IETF interoperability | `cbor` or `cbor:256` | Standardized, supports more numeric types, optional schema validation. |
+| Short human-readable tags | `str:32:utf8` | Fixed width keeps the column on the fast fixed-size path. |
+| Mixed binary/text payloads | `bytes` + companion `msgpack` column | Keeps heavy blobs separate from structured metadata. |
+| Deterministic record sizes | `msgpack:256`, `cbor:512` | Avoids `_idx` tables altogether by keeping every element the same width. |
 
-vault = ColumnVault("events.db")
-events = vault.ensure("events", "msgpack")
+## Schema Validation
 
-events.append({"type": "login", "user": 42})
-events.extend(
-    {"type": "purchase", "user": 42, "amount": 19.99}
-    for _ in range(10)
-)
-
-latest = events[-1]
-assert latest["type"] == "purchase"
-```
-
-`msgpack` and `cbor` dtypes automatically create a `DataPacker`; elements are packed/unpacked transparently in Rust.
-
-## Choosing a Format
-
-| Format | Use when | Pros | Cons |
-|--------|----------|------|------|
-| `msgpack` | General-purpose structured data | Compact, fast, schema-less | No enforced schema |
-| `cbor` | IETF compliance or IoT compatibility | Standardized, self-describing | Larger than MessagePack for some payloads |
-| `str:utf8` (variable) | Human-readable strings | Easy debugging | Requires manual parsing for complex structures |
-| Fixed strings (`str:32:utf8`) | Uniform short keys | Predictable chunk alignment | Truncation if over limit |
-
-For heterogeneous records with optional fields, MessagePack tends to offer the best balance.
-
-## Column Layout
-
-Structured columns are variable-size columns under the hood:
-
-```
-events_data (dtype stored as "msgpack")  -- raw bytes
-events_idx  (adaptive_idx)               -- chunk id + start/end offsets
-```
-
-`VarSizeColumn` handles:
-- Appends using `append_typed[_cached]`.
-- Slice reads via `batch_read_varsize_unpacked`.
-- Updates using size-aware operations (`update_varsize_element`, `update_varsize_slice`).
-
-## JSON Schema Validation
-
-Use `DataPacker.with_json_schema` when you need strict schemas:
+`DataPacker` can enforce JSON Schema when serializing MessagePack payloads:
 
 ```python
 from kohakuvault import ColumnVault, DataPacker
 
-schema = {"type": "object", "required": ["id", "name"]}
+schema = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "integer"},
+        "name": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["id", "name"],
+}
+
 packer = DataPacker.with_json_schema(schema)
-
 vault = ColumnVault("users.db")
-col = vault.ensure("users", "msgpack")
-
-col.append({"id": 1, "name": "Maki"})           # OK
-col.append({"id": 2})                           # ValueError
+users = vault.ensure("users", "msgpack")
+users.append({"id": 1, "name": "Rin"})
 ```
 
-For performance-critical paths, consider validating before writing to avoid runtime failures in hot loops.
+Failures raise `ValueError` before the write reaches SQLite, so consider validating in Python for hot loops and reserving schema enforcement for ingestion boundaries.
 
-## Hybrid Patterns
+## Hybrid Layouts
 
 ### Metadata + Blobs
 
 ```python
+from kohakuvault import KVault, ColumnVault
+
 kv = KVault("media.db")
 cols = ColumnVault(kv)
-
 meta = cols.ensure("media_meta", "msgpack")
 
 for asset in assets:
     kv[f"blob:{asset['id']}"] = asset["bytes"]
-    meta.append({"id": asset["id"], "size": len(asset["bytes"])})
+    meta.append({"id": asset["id"], "size": len(asset["bytes"]), "mime": asset["mime"]})
 ```
 
-Metadata remains queryable in `meta`, while the actual binary lives in KVault.
+Binary payloads stay in `KVault`, while structured metadata lands in MessagePack so you can filter, slice, or extend without reparsing blobs.
 
-### Secondary Indexes with CSBTree
+### Secondary Indexes
 
 ```python
-from kohakuvault import CSBTree
+from kohakuvault import ColumnVault, CSBTree
 
+cols = ColumnVault("events.db")
 events = cols.ensure("events", "msgpack")
 index = CSBTree()
 
 row_id = len(events)
-events.append({"id": row_id, "user": 42})
+events.append({"user": 42, "type": "login"})
 index.insert(42, row_id)
 
 for _, rid in index.range(42, 42):
     handle(events[rid])
 ```
 
-Use CSBTree or SkipList when you need ordered lookups by a derived key.
+CSBTree/SkipList live inside the same PyO3 module, so you can build in-memory indexes keyed by user id, timestamp buckets, or composite keys while keeping the canonical record in a column.
 
 ## Performance Tips
 
-- **Batch operations**: prefer `extend` and slice assignments over per-element loops.
-- **Cache wisely**: enable column caches when appending large batches. The `cache()` context manager flushes automatically.
-- **Slice size**: `VarSizeColumn.__getitem__` supports slices, batch reading in Rust; use this instead of iterating per element when scanning windows.
-- **Chunk sizing**: adjust `min_chunk_bytes`/`max_chunk_bytes` when creating the column if the default 128 KiB/16 MiB does not match your workload.
-- **Fixed-width structured types**: when payloads have a bounded size, choose dtypes like `msgpack:256` or `cbor:512` so the column can operate in the fixed-size fast path; truly variable-size structured columns rely on prefix-sum indexes and are slower to mutate.
+- Batch operations (`extend`, slice assignment) beat Python loops—every call crosses the PyO3 boundary.
+- Enable caches when appending many records: `with events.cache(cap_bytes=8 << 20): ...`.
+- Tune `min_chunk_bytes`/`max_chunk_bytes` if you store large, variable payloads. Smaller chunks reduce rewrite cost when editing random rows.
+- For large hot columns, occasionally call `ColumnVault.checkpoint()` to merge WAL changes and keep sqlite-vec (if you also use vectors) snappy.
 
-## Error Handling
+## Troubleshooting
 
-- Updating with incompatible types raises `TypeError`.
-- JSON Schema violations raise `ValueError`.
-- Accessing missing structured columns raises `errors.NotFound`.
-- Slice length mismatches (`col[a:b] = values`) raise `ValueError` before calling into Rust.
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `ValueError: Invalid dtype` | Typo in dtype string | Use `DataPacker(dtype)` in a REPL to validate before creating the column. |
+| `TypeError: Expected bytes` | Value not serializable under current dtype | Switch to a structured dtype (`msgpack`, `cbor`, etc.) or pre-serialize before appending (auto-pack wrappers only affect KVault). |
+| Slice assignment raises `ValueError` | Replacement batch length mismatch | Ensure `len(values) == high - low`. |
+| Updates are slow | Column is variable-size | Switch to fixed-size (`msgpack:NN`) where possible or increase chunk sizes. |
 
-## Testing
-
-- `tests/test_structured_columns.py` covers MessagePack/CBOR round trips, slice operations, and cache paths.
-- `tests/test_varsize_operations.py` ensures size-aware updates behave correctly.
-- `examples/datapacker_demo.py` and `examples/benchmark_container.py` illustrate real-world structured workloads.
-
-## When Not to Use Structured Columns
-
-- When the schema is extremely wide and better suited to a document database.
-- When you need ad-hoc field-level queries - KohakuVault does not index inside MessagePack payloads.
-- When multi-writer concurrency is required; SQLite WAL still enforces a single writer at a time.
-
-Structured columns shine when you need append-friendly storage with automatic serialization in a single-file deployment.
+See [ColumnVault Guide](columnvault.md) for base APIs and [vectors.md](vectors.md) for vector-specific advice.

@@ -1,238 +1,135 @@
-# Vector Storage and Search
+# Vector Storage & Search
 
-KohakuVault 0.7.0 adds comprehensive vector storage and similarity search capabilities.
+KohakuVault 0.7 ships two complementary vector features:
 
-## Vector Storage (ColumnVault + DataPacker)
+1. `vec:*` dtypes inside `ColumnVault` for storing dense arrays/tensors alongside other columns.
+2. `VectorKVault`, a sqlite-vec powered similarity search engine for k-NN queries.
 
-### Fixed-Shape Vectors (Recommended)
+Both live in the same SQLite file so you can ingest once and fan out to analytics, retrieval, and metadata workflows.
+
+## Vector Columns (`ColumnVault`)
+
+### Fixed-Shape Vectors
+
+Use fixed-shape dtypes when every vector shares the same dimensions:
 
 ```python
 from kohakuvault import ColumnVault
 import numpy as np
 
 cv = ColumnVault("vectors.db")
-
-# Text embeddings (768-dim)
-embeddings = cv.create_column("bert_embeddings", "vec:f32:768")
-embeddings.append(np.random.randn(768).astype(np.float32))
-embeddings.extend([np.random.randn(768).astype(np.float32) for _ in range(1000)])
-
-# Images (28x28 grayscale)
-images = cv.create_column("mnist", "vec:u8:28:28")
-
-# RGB images (224x224x3)
-photos = cv.create_column("imagenet", "vec:u8:3:224:224")
-
-# Matrices (10x20)
-matrices = cv.create_column("correlations", "vec:f64:10:20")
+embeddings = cv.create_column("bert", "vec:f32:768")
+embeddings.extend(np.random.randn(10_000, 768).astype(np.float32))
 ```
 
-**Overhead**: 1 byte per vector (type byte)
+Overhead: 1 byte per vector (type byte). Ideal for embeddings, image tensors, and matrices with stable shapes (`vec:u8:3:224:224`).
 
 ### Arbitrary-Shape Vectors
 
 ```python
-# Variable shapes
-generic_vectors = cv.create_column("generic", "vec:f32")
-
-# Store different shapes
-generic_vectors.append(np.random.randn(100).astype(np.float32))      # 1D
-generic_vectors.append(np.random.randn(10, 20).astype(np.float32))   # 2D
-generic_vectors.append(np.random.randn(5, 5, 5).astype(np.float32))  # 3D
+generic = cv.create_column("generic", "vec:f32")
+generic.append(np.random.randn(100).astype(np.float32))
+generic.append(np.random.randn(10, 20).astype(np.float32))
 ```
 
-**Overhead**: 2 + ndim*4 bytes (shape metadata included)
+Overhead: `2 + ndim * 4` bytes (stores ndim and each dimension). Use when shapes vary but you still want zero-copy serialization.
 
 ### Supported Element Types
 
-- `f32`, `f64` - Floating point
-- `i32`, `i64`, `i8`, `i16` - Signed integers
-- `u8`, `u16`, `u32`, `u64` - Unsigned integers
+`f32`, `f64`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` – matching `DataPacker`’s `ElementType` enum. Mixed precision? Convert before writing.
 
-### Bulk Operations (Optimized)
+### Batch Operations with DataPacker
 
 ```python
 from kohakuvault import DataPacker
 
 packer = DataPacker("vec:f32:768")
-
-# 35x faster than loop!
-vectors = [np.random.randn(768).astype(np.float32) for _ in range(10000)]
-packed = packer.pack_many(vectors)
-unpacked = packer.unpack_many(packed, count=10000)  # Returns list of numpy arrays
+vectors = [np.random.randn(768).astype(np.float32) for _ in range(10_000)]
+buffer = packer.pack_many(vectors)
+unpacked = packer.unpack_many(buffer, count=len(vectors))
 ```
 
-## Vector Similarity Search (VectorKVault)
+Use this when you need to preprocess vectors before inserting or when marshaling data over the network. Arbitrary-shape vectors use `offsets=` instead of `count=`.
 
-### Basic Usage
+## VectorKVault (Similarity Search)
+
+`VectorKVault` wraps sqlite-vec’s `vec0` virtual table and stores arbitrary values in a side table. It’s perfect for brute-force k-NN on tens of thousands of vectors.
 
 ```python
 from kohakuvault import VectorKVault
 import numpy as np
 
-# Create search index
-vkv = VectorKVault("search.db", dimensions=384, metric="cosine")
+vkv = VectorKVault("search.db", table="search", dimensions=384, metric="cosine", vector_type="f32")
 
-# Index documents
-for doc_id, (text, embedding) in enumerate(zip(documents, embeddings)):
-    vkv.insert(embedding, text.encode())
+vector = np.random.randn(384).astype(np.float32)
+doc_id = vkv.insert(vector, b"document payload")
 
-# k-NN search
-query_embedding = model.encode("search query")
-results = vkv.search(query_embedding, k=10)
+results = vkv.search(vector, k=10)
+for row_id, distance, payload in results:
+    print(row_id, distance, payload[:32])
 
-for rank, (id, distance, doc_bytes) in enumerate(results, 1):
-    print(f"{rank}. Distance={distance:.4f} | {doc_bytes.decode()}")
-
-# Single closest match
-closest_doc = vkv.get(query_embedding)
-```
-
-### Similarity Metrics
-
-- **cosine**: Cosine similarity (good for text embeddings)
-- **l2**: Euclidean distance (good for images)
-- **l1**: Manhattan distance
-- **hamming**: Hamming distance (for binary vectors)
-
-```python
-# Different metrics for different use cases
-text_search = VectorKVault("text.db", dimensions=384, metric="cosine")
-image_search = VectorKVault("images.db", dimensions=512, metric="l2")
-```
-
-### CRUD Operations
-
-```python
-# Insert
-doc_id = vkv.insert(vector, value)
-
-# Search k-nearest
-results = vkv.search(query_vector, k=10, metric=None)
-
-# Get single closest
-closest = vkv.get(query_vector)
-
-# Get by ID (returns numpy array for vector)
-vector, value = vkv.get_by_id(doc_id)
-
-# Update
-vkv.update(doc_id, vector=new_embedding)
-vkv.update(doc_id, value=new_content)
-
-# Delete
+closest = vkv.get(vector)
+vector2, payload2 = vkv.get_by_id(doc_id)
+vkv.update(doc_id, vector=new_vector)
 vkv.delete(doc_id)
-
-# Check existence
-if doc_id in vkv:
-    print("Exists!")
 ```
+
+### Configuration
+
+| Parameter | Meaning |
+|-----------|---------|
+| `dimensions` | Length of every vector you insert (enforced). |
+| `metric` | `"cosine"`, `"l2"`, `"l1"`, or `"hamming"`. Per-query overrides allowed via `search(..., metric="l2")`. |
+| `vector_type` | `"f32"`, `"int8"`, or `"bit"` depending on sqlite-vec support. Defaults to `f32`. |
+| `table` | Logical table name; both the vec0 virtual table and blob table derive from this. |
+
+### CRUD & Introspection
+
+| Method | Description |
+|--------|-------------|
+| `insert(vector, value, metadata=None)` | Inserts vector/value and returns rowid. `metadata` is reserved for future use. |
+| `search(query, k=10, metric=None)` | Returns list of `(row_id, distance, value)` sorted by distance. |
+| `get(query, metric=None)` | Shortcut for `k=1` that returns the value bytes. Raises `NotFound` if empty. |
+| `get_by_id(row_id)` | Returns `(numpy_vector, value)` so you can inspect stored vectors. |
+| `update(row_id, vector=None, value=None)` | Mutate stored vectors/values independently. |
+| `delete(row_id)` | Remove entry. |
+| `exists(row_id)` | Boolean check. |
+| `count()` | Number of rows inside the vec0 table. |
+| `info()` | Dict with table, dimensions, metric, vector type, and count. |
 
 ### Performance Characteristics
 
-- **Small datasets** (1K-10K vectors): <1ms per query
-- **Medium datasets** (10K-100K vectors): <10ms per query
-- **SIMD acceleration**: Automatic on x86 (AVX) and ARM (NEON)
-- **Brute-force scan**: No ANN indexes yet (sqlite-vec v0.1.6)
+- sqlite-vec 0.1.6 performs brute-force scans with SIMD acceleration (AVX on x86, NEON on Apple Silicon). Expect <1 ms for 1K rows, <10 ms for 100K rows on modern hardware.
+- Because scans touch the entire table, keep WALs short (`checkpoint()` regularly) and VACUUM after bulk deletes.
+- Use `vector_type="int8"` plus quantized vectors when you need smaller storage or faster Hamming metrics.
 
-## Auto-Packing Integration
-
-### With KVault
-
-```python
-from kohakuvault import KVault
-
-kv = KVault("data.db")  # Auto-pack enabled by default
-
-# Store vectors directly in KVault
-kv["model_weights"] = np.random.randn(1000, 768).astype(np.float32)
-
-# Retrieve as numpy array
-weights = kv["model_weights"]  # np.ndarray, not bytes!
-```
-
-### With ColumnVault
-
-```python
-cv = ColumnVault("data.db")
-
-# Vector columns
-embeddings = cv.create_column("embeddings", "vec:f32:768")
-
-# Mixed columns in same database
-ids = cv.create_column("ids", "i64")
-metadata = cv.create_column("metadata", "msgpack")
-
-# All stored efficiently
-for i in range(1000):
-    ids.append(i)
-    embeddings.append(np.random.randn(768).astype(np.float32))
-    metadata.append({"timestamp": i, "source": "model_v1"})
-```
-
-## Combined: Semantic Search System
+## Putting It Together
 
 ```python
 from kohakuvault import KVault, ColumnVault, VectorKVault
+import numpy as np
 
-# All components share one database file!
-db = "semantic_search.db"
-
-# 1. Store full documents in KVault
+db = "semantic.db"
 kv = KVault(db, table="documents")
-for doc_id, doc_text in documents:
-    kv[doc_id] = doc_text.encode()
-
-# 2. Store metadata in ColumnVault
-cv = ColumnVault(db)
+cv = ColumnVault(kv)
+emb = cv.create_column("embeddings", "vec:f32:384")
 titles = cv.create_column("titles", "str:utf8")
-timestamps = cv.create_column("timestamps", "i64")
 
-# 3. Build search index with VectorKVault
-vkv = VectorKVault(db, table="search_index", dimensions=384, metric="cosine")
-for doc_id, embedding in zip(doc_ids, embeddings):
-    vkv.insert(embedding, doc_id.encode())
+for idx, (title, text, embedding) in enumerate(dataset):
+    kv[f"doc:{idx}"] = text.encode()
+    titles.append(title)
+    emb.append(embedding.astype(np.float32))
 
-# 4. End-to-end search
-query_embedding = model.encode("machine learning")
-results = vkv.search(query_embedding, k=5)
+search = VectorKVault(db, table="search_index", dimensions=384, metric="cosine")
+for idx, embedding in enumerate(emb[-len(dataset):]):
+    search.insert(embedding, str(idx).encode())
 
-for id, distance, doc_id_bytes in results:
-    doc_id = doc_id_bytes.decode()
-    full_doc = kv[doc_id]
-    title = titles[int(doc_id.split(':')[1])]
-    print(f"Distance={distance:.4f} | {title} | {full_doc.decode()[:100]}...")
+query = model.encode("machine learning").astype(np.float32)
+for rank, (row_id, dist, doc_idx_bytes) in enumerate(search.search(query, k=5), 1):
+    doc_idx = int(doc_idx_bytes)
+    print(rank, dist, titles[doc_idx], kv[f"doc:{doc_idx}"][:80])
 ```
 
-## Binary Format
+Vector storage, metadata, and similarity search all share `semantic.db`. No extra services required.
 
-### Vector Format
-
-**Fixed-shape**: `|type(1)|data...|`
-- Example: `vec:f32:768` = 1 + 768*4 = 3073 bytes
-- Minimal overhead: 0.19%
-
-**Arbitrary-shape**: `|type(1)|ndim(1)|shape(ndim*4)|data...|`
-- Example: 2D array [10, 20] = 1 + 1 + 8 + 800 = 810 bytes
-- Overhead: 10 bytes for metadata
-
-### Auto-Pack Header
-
-When auto-packing is used with non-raw data:
-
-`|magic_k(2)|version(1)|encoding(1)|flags(1)|reserved(3)|magic_q(2)|data...|`
-
-- **magic_k**: `0x89, 0x4B`
-- **magic_q**: `0x56, 0x4B` (validation)
-- **encoding**: Raw(0x00), Pickle(0x01), DataPacker(0x02), Json(0x03), MessagePack(0x04), Cbor(0x05)
-
-**Smart behavior**: Raw bytes (media files) get NO header, preserving external tool compatibility.
-
-## See Also
-
-- `examples/basic_usage.py` - Auto-packing examples
-- `examples/all_usage.py` - Comprehensive feature demos
-- `examples/vector_search_numpy.py` - Vector search walkthrough
-- `docs/datapacker.md` - DataPacker details
-- `docs/kv.md` - KVault details
-- `docs/col.md` - ColumnVault details
+For more on dtype grammar and caching, see [ColumnVault Guide](columnvault.md). For auto-pack details (storing vectors directly in `KVault`), see [KVault Guide](kvault.md).

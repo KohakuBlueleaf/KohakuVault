@@ -1,156 +1,96 @@
 # DataPacker Reference
 
-`DataPacker` is the Rust serializer/deserializer bundled with KohakuVault. It powers columnar dtype parsing and is available as a standalone utility for custom pipelines.
+`DataPacker` is the Rust serializer/deserializer shared by `ColumnVault`, `KVault`’s auto-pack pipeline, and standalone workflows. It validates dtype strings, packs values without Python loops, and exposes batch APIs for bulk transfers.
 
-## Features
+## Supported Dtype Strings
 
-- Zero-copy interface in Rust; exposed to Python via PyO3.
-- Primitive support (`i64`, `f64`), flexible byte encodings (`bytes`, `bytes:N`).
-- Rich string handling (`str:utf8`, `str:utf16le`, `str:utf16be`, `str:latin1`, `str:ascii`, fixed-width variants).
-- Structured formats (`msgpack`, `cbor`) with optional JSON Schema validation.
-- Batch APIs (`pack_many`, `unpack_many`) to avoid Python loops.
-- Metadata via `elem_size` and `is_varsize` for downstream chunk planning.
+| Category | Pattern | Notes |
+|----------|---------|-------|
+| Integers | `i8`, `i16`, `i32`, `i64` | Little-endian; booleans map to `i8`. |
+| Floats | `f32`, `f64` | IEEE-754. |
+| Bytes | `bytes`, `bytes:N` | Variable or fixed-width zero-padded buffers. |
+| Strings | `str:utf8`, `str:utf16le`, `str:utf16be`, `str:latin1`, `str:ascii`, `str:N:utf8`, etc. | Fixed-width versions pad/truncate encoded bytes. |
+| Structured | `msgpack`, `msgpack:N`, `cbor`, `cbor:N` | Pick fixed sizes when possible to keep `ColumnVault` in the fixed-size fast path. |
+| Vectors | `vec:<elem>[:dim[:dim...]]` | `<elem>` ∈ `{f32,f64,i8,i16,i32,i64,u8,u16,u32,u64}`. Without dims → arbitrary shape (stores ndim + shape). |
 
-## Creating a Packer
+Creating a packer validates the dtype immediately:
 
 ```python
 from kohakuvault import DataPacker
 
-packer = DataPacker("str:32:utf8")
-assert packer.elem_size == 32
-assert not packer.is_varsize
+fixed = DataPacker("str:32:utf8")
+assert fixed.elem_size == 32 and not fixed.is_varsize
+
+var = DataPacker("vec:f32")
+assert var.elem_size == 0 and var.is_varsize
 ```
-
-If the dtype denotes a variable-size format, `elem_size` returns `0` and `is_varsize` becomes `True`.
-
-### Supported Dtype Strings
-
-| Category | Pattern | Notes |
-|----------|---------|-------|
-| Integer | `i64` | 8-byte signed integer |
-| Float | `f64` | 8-byte double |
-| Bytes (fixed) | `bytes:N` | Zero-padded to `N` bytes |
-| Bytes (variable) | `bytes` | Stored verbatim |
-| Strings (variable) | `str:utf8`, `str:utf16le`, `str:utf16be`, `str:latin1`, `str:ascii` | UTF encodings validated; ASCII throws on non-ASCII characters |
-| Strings (fixed) | `str:N:utf8`, `str:N:utf16le`, etc. | Padded or truncated to `N` encoded bytes |
-| MessagePack | `msgpack` or `msgpack:fixed=N` (optional fixed size) | Serialises dicts/lists |
-| CBOR | `cbor` | CBOR encoding via `ciborium` |
-
-For column-heavy workloads, prefer fixed-size structured dtypes such as `msgpack:256` or `cbor:512`. Keeping every element the same width avoids the slower variable-size code paths driven by prefix-sum indexes.
-
-Invalid dtype strings raise `ValueError`.
 
 ## Packing & Unpacking
 
 ```python
 packer = DataPacker("msgpack")
-payload = {"user": 1, "tags": ["vip", "beta"]}
-
-blob = packer.pack(payload)
-assert isinstance(blob, bytes)
-
-decoded = packer.unpack(blob, 0)
-assert decoded["tags"][0] == "vip"
+blob = packer.pack({"user": 1, "tags": ["vip", "beta"]})
+restored = packer.unpack(blob, offset=0)
 ```
 
-Offset semantics:
+Offsets only matter for buffer views—you can store multiple values in one blob and read them by passing different offsets.
 
-- `pack()` returns a `bytes`.
-- `unpack(data, offset=0)` reads a single value from `data` starting at byte offset.
-
-## Batch Operations
-
-### Fixed-size Types
+## Batch APIs
 
 ```python
-packer = DataPacker("i64")
-values = [1, 2, 3, 4]
+from kohakuvault import DataPacker
+import numpy as np
 
-blob = packer.pack_many(values)
-assert len(blob) == len(values) * packer.elem_size
-assert packer.unpack_many(blob, count=len(values)) == values
+pack_i64 = DataPacker("i64")
+values = list(range(1_000))
+buffer = pack_i64.pack_many(values)
+assert pack_i64.unpack_many(buffer, count=len(values)) == values
+
+pack_vec = DataPacker("vec:f32:768")
+vectors = [np.random.randn(768).astype(np.float32) for _ in range(1_000)]
+buffer = pack_vec.pack_many(vectors)
+restored = pack_vec.unpack_many(buffer, count=len(vectors))
 ```
 
-### Variable-size Types
-
-```python
-packer = DataPacker("str:utf8")
-names = ["Rin", "Nozomi", "Hanayo"]
-
-blob = packer.pack_many(names)      # concatenated bytes
-offsets = []
-cursor = 0
-for name in names:
-    encoded = name.encode("utf-8")
-    offsets.append(cursor)
-    cursor += len(encoded)
-
-restored = packer.unpack_many(blob, offsets=offsets)
-```
-
-When calling `unpack_many`:
-
-- Pass `count=...` for fixed-size types.
-- Pass `offsets=[...]` for variable-size types.
-- Do not mix both parameters.
+- Fixed-size types use `count=...`.
+- Variable-size types use `offsets=[...]` (accumulate byte positions yourself).
+- Mixing `count` and `offsets` raises `ValueError`.
 
 ## JSON Schema Validation
-
-MessagePack packers can enforce JSON Schema rules:
 
 ```python
 schema = {
     "type": "object",
-    "properties": {"id": {"type": "integer"}, "name": {"type": "string"}},
+    "properties": {
+        "id": {"type": "integer"},
+        "name": {"type": "string"},
+    },
     "required": ["id", "name"],
 }
 
 packer = DataPacker.with_json_schema(schema)
-valid = {"id": 1, "name": "Rin"}
-packer.pack(valid)             # OK
-packer.pack({"id": "oops"})    # Raises ValueError
+packer.pack({"id": 1, "name": "Rin"})
+packer.pack({"id": "oops"})  # raises ValueError
 ```
 
-Compiled schemas are cached by content hash (MD5) to avoid recompilation overhead.
+Schemas are cached by MD5 hash, so reusing the same schema in multiple packers is cheap.
 
-## Integration with ColumnVault
+## Auto-Pack Integration
 
-`column_proxy.Column` and `VarSizeColumn` attempt to create a `DataPacker` using the column dtype. Effects:
+`KVault.enable_auto_pack()` instantiates `DataPacker` internally to serialize numpy arrays (`vec:*`), ints (`i64`), floats (`f64`), strings, and structured data. Wrappers (`MsgPack`, `Json`, `Cbor`, `Pickle`) are optional—they set `encoding_name` to override the automatic choice when you need a specific format.
 
-- Automatic detection of `elem_size`/`is_varsize` guides chunk alignment.
-- `Column` operations use `pack`, `pack_many`, `unpack`, `unpack_many` when available.
-- `VarSizeColumn` leverages `pack_many` and `batch_read_varsize_unpacked` for structured types, falling back to raw bytes if the packer is unavailable.
-- If the compiled extension is missing, Python lambdas from `DTYPE_INFO` provide legacy behaviour.
+If the Rust extension isn’t available, python fallbacks in `column_proxy.py` handle legacy dtypes (`i64`, `f64`, `bytes:N`). Prefer installing the extension for performance and full dtype coverage.
 
-## Error Semantics
+## Threading & Performance
 
-| Exception | Trigger |
-|-----------|---------|
-| `ValueError` | Invalid dtype string, schema violation, insufficient data during unpack. |
-| `TypeError` | Passing incompatible value types (e.g., non-bytes to `bytes:N`). |
-
-Rust errors are converted to Python `ValueError`/`TypeError` before crossing the FFI boundary.
-
-## Performance Notes
-
-- Creating a `DataPacker` is cheap; caching instances per dtype avoids repeated validation.
-- For structured data, avoid re-serializing offsets in Python - store offsets alongside data (e.g., save to a separate column).
-- JSON Schema validation introduces overhead proportional to schema complexity; keep schemas minimal in hot paths.
-
-## Threading
-
-Packer instances are not thread-safe. In multi-threaded Python code, instantiate one packer per thread:
-
-```python
-def worker():
-    packer = DataPacker("i64")
-    ...
-```
+- Packer instances are **not** thread-safe—create one per thread if you plan to reuse them in worker pools.
+- Construction is cheap; cache packers per dtype to avoid repeated validation.
+- JSON Schema validation and arbitrary-shape vectors allocate temporary buffers proportional to the payload; fixed-size packers can stream directly into preallocated buffers.
 
 ## Testing & Examples
 
-- `tests/test_packer.py` covers primitives, strings, structured types, and column integration.
-- `examples/benchmark_packer.py` compares DataPacker with pure Python packing and demonstrates combined workflows.
-- `examples/datapacker_demo.py` showcases schema validation, structured columns, and bulk operations.
+- `tests/test_packer.py` covers primitives, strings, structured payloads, and vector types.
+- `examples/datapacker_demo.py` shows schema validation + `ColumnVault` integration.
+- `examples/benchmark_packer.py` compares `pack_many`/`unpack_many` against pure Python loops.
 
-Use these resources to evaluate performance and validate dtype choices in your workload.
+Keep this page in sync with new dtype strings—`ColumnVault`, auto-pack, and future APIs all rely on DataPacker to stay consistent.
