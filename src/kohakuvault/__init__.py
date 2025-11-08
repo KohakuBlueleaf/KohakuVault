@@ -1,15 +1,16 @@
 """
-KohakuVault: SQLite-backed key-value store for large media blobs.
+KohakuVault: SQLite-backed storage with vector search and auto-packing.
 
 Features:
-- Dict-like interface for key-value storage
-- List-like interface for columnar storage
+- Auto-packing: Store any Python object (numpy, dict, list, primitives)
+- Vector search: Fast similarity search with sqlite-vec
+- Vector storage: Efficient array/tensor storage in columns
 - Streaming support for large files
 - Write-back caching
 - Thread-safe with retry logic
 """
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 from .column_proxy import Column, ColumnVault, VarSizeColumn
 from .errors import DatabaseBusy, InvalidArgument, IoError, KohakuVaultError, NotFound

@@ -50,6 +50,9 @@ pub enum EncodingType {
     /// CBOR encoding
     Cbor = 0x05,
 
+    /// UTF-8 string (simple encode/decode)
+    Utf8String = 0x06,
+
     /// Reserved for future use
     Reserved = 0xFF,
 }
@@ -63,12 +66,13 @@ impl EncodingType {
             0x03 => Some(EncodingType::Json),
             0x04 => Some(EncodingType::MessagePack),
             0x05 => Some(EncodingType::Cbor),
+            0x06 => Some(EncodingType::Utf8String),
             0xFF => Some(EncodingType::Reserved),
             _ => None,
         }
     }
 
-    #[allow(dead_code)] // Used in Phase 3 for logging/debugging
+    #[allow(dead_code)] // Used for logging/debugging
     pub fn to_str(self) -> &'static str {
         match self {
             EncodingType::Raw => "raw",
@@ -77,6 +81,7 @@ impl EncodingType {
             EncodingType::Json => "json",
             EncodingType::MessagePack => "messagepack",
             EncodingType::Cbor => "cbor",
+            EncodingType::Utf8String => "utf8string",
             EncodingType::Reserved => "reserved",
         }
     }

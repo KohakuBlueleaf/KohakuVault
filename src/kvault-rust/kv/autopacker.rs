@@ -1,23 +1,24 @@
 //! Auto-packing for arbitrary Python objects
 //!
 //! Automatically detects type and chooses best serialization:
-//! Priority order (maximizing DataPacker usage):
-//! 1. bytes → Raw (no header)
-//! 2. Wrapped types (MsgPack, Json, Pickle) → Specified encoding
-//! 3. numpy array → DataPacker vec:type:shape
-//! 4. int → DataPacker i64
-//! 5. float → DataPacker f64
-//! 6. dict/list → DataPacker msgpack (KEY: use MessagePack, not Pickle!)
-//! 7. str → DataPacker str:utf8
-//! 8. Custom objects → Pickle (last resort)
+//!
+//! Priority order:
+//! 1. bytes → Raw (no encoding/header)
+//! 2. Wrapped types (MsgPack, Json, Cbor, Pickle) → Specified encoding
+//! 3. **DataPacker-supported types**:
+//!    - numpy array → vec:* (f32, i64, etc.)
+//!    - int → i64
+//!    - float → f64
+//! 4. str → UTF-8 encode (simple, automatic decode)
+//! 5. dict/list → Try MessagePack, fallback to Pickle if fails
+//! 6. Custom objects → Pickle (last resort)
 
 use super::header::EncodingType;
-use crate::packer::{DataPacker, ElementType, PackerDType, StringEncoding};
+use crate::packer::{DataPacker, ElementType, PackerDType};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 /// Auto-packer that detects type and serializes accordingly
-#[allow(dead_code)] // Used when auto_pack is enabled
 pub struct AutoPacker {
     pub use_pickle_fallback: bool,
 }
@@ -99,20 +100,31 @@ impl AutoPacker {
             return Ok((bytes, EncodingType::DataPacker));
         }
 
-        // 6. Try dict/list → DataPacker msgpack (IMPORTANT: Use MessagePack, not Pickle!)
-        if obj.is_instance_of::<PyDict>() || obj.is_instance_of::<PyList>() {
-            let packer = DataPacker { dtype: PackerDType::MessagePack { fixed_size: None } };
-            let bytes = packer.pack_impl(py, obj)?;
-            return Ok((bytes, EncodingType::MessagePack));
+        // 6. Try str → UTF-8 encode (simple, always decodable)
+        if let Ok(s) = obj.extract::<String>() {
+            let bytes = s.into_bytes();
+            return Ok((bytes, EncodingType::Utf8String));
         }
 
-        // 7. Try str → DataPacker str:utf8
-        if let Ok(_val) = obj.extract::<String>() {
-            let packer = DataPacker {
-                dtype: PackerDType::String { encoding: StringEncoding::Utf8, fixed_size: None },
-            };
-            let bytes = packer.pack_impl(py, obj)?;
-            return Ok((bytes, EncodingType::DataPacker));
+        // 7. Try dict/list → MessagePack first, fallback to Pickle if fails
+        if obj.is_instance_of::<PyDict>() || obj.is_instance_of::<PyList>() {
+            // Try MessagePack first (more efficient)
+            let packer = DataPacker { dtype: PackerDType::MessagePack { fixed_size: None } };
+            if let Ok(bytes) = packer.pack_impl(py, obj) {
+                return Ok((bytes, EncodingType::MessagePack));
+            }
+
+            // MessagePack failed (unsupported type in dict/list) - fallback to Pickle
+            if self.use_pickle_fallback {
+                let pickle = py.import_bound("pickle")?;
+                let pickled = pickle.call_method1("dumps", (obj,))?;
+                let bytes: Vec<u8> = pickled.extract()?;
+                return Ok((bytes, EncodingType::Pickle));
+            }
+
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Cannot serialize dict/list: MessagePack failed and pickle disabled",
+            ));
         }
 
         // 8. Last resort: Pickle (for custom objects)
@@ -240,6 +252,12 @@ impl AutoPacker {
 
                 // Fallback to raw bytes
                 Ok(PyBytes::new_bound(py, data).into())
+            }
+            EncodingType::Utf8String => {
+                // Decode UTF-8 bytes to string
+                let s = std::str::from_utf8(data)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                Ok(s.into_py(py))
             }
             EncodingType::MessagePack => {
                 let packer = DataPacker { dtype: PackerDType::MessagePack { fixed_size: None } };
