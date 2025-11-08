@@ -15,7 +15,6 @@ impl _KVault {
     /// - If headers disabled: return raw bytes
     /// - If headers enabled AND encoding is Raw: return raw bytes (for media file compat)
     /// - If headers enabled AND encoding is not Raw: prepend header
-    #[allow(dead_code)] // Used in Phase 3 (auto-packing)
     pub(crate) fn encode_value(&self, data: &[u8], encoding: EncodingType) -> Vec<u8> {
         let use_headers = self.use_headers.load(Ordering::Relaxed);
 
@@ -38,7 +37,6 @@ impl _KVault {
     /// Returns: (data, Option<Header>)
     /// - If no header: returns (original_bytes, None)
     /// - If header: returns (data_without_header, Some(header))
-    #[allow(dead_code)] // Used in Phase 3 (auto-unpacking)
     pub(crate) fn decode_value(&self, bytes: &[u8]) -> Result<(Vec<u8>, Option<Header>), String> {
         match Header::decode(bytes)? {
             Some(header) => {

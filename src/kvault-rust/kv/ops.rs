@@ -46,10 +46,29 @@ impl _KVault {
         value: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let k = to_key_bytes(py, key)?;
-        let v = if let Ok(b) = value.downcast::<PyBytes>() {
-            b.as_bytes().to_vec()
-        } else {
-            return Err(VaultError::Py("value must be bytes-like".into()).into());
+
+        // Check if auto-packing is enabled and serialize
+        let v = {
+            let auto_pack_guard = self.auto_packer.lock().unwrap();
+            if let Some(ref packer) = *auto_pack_guard {
+                // Auto-pack mode: serialize automatically
+                let (serialized_bytes, encoding) = packer.serialize(py, value)?;
+                drop(auto_pack_guard);
+
+                // Add header if encoding is not Raw
+                self.encode_value(&serialized_bytes, encoding)
+            } else {
+                // Legacy mode: must be bytes
+                drop(auto_pack_guard);
+                if let Ok(b) = value.downcast::<PyBytes>() {
+                    b.as_bytes().to_vec()
+                } else {
+                    return Err(VaultError::Py(
+                        "value must be bytes-like (or enable auto-pack)".into(),
+                    )
+                    .into());
+                }
+            }
         };
 
         // Try to use cache if enabled
@@ -104,26 +123,29 @@ impl _KVault {
     ///
     /// # Errors
     /// Returns KeyError if key not found
-    pub(crate) fn get_impl(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyBytes>> {
+    pub(crate) fn get_impl(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
         let k = to_key_bytes(py, key)?;
 
         // Check write-back cache first
-        if let Some(cache) = self.cache.lock().unwrap().as_ref() {
-            if let Some(v) = cache.map.get(&k) {
-                return Ok(PyBytes::new_bound(py, v).unbind());
-            }
-        }
+        let cached_value = {
+            let cache_guard = self.cache.lock().unwrap();
+            cache_guard
+                .as_ref()
+                .and_then(|cache| cache.map.get(&k).cloned())
+        };
 
-        let sql = format!(
-            "
-            SELECT value
-            FROM {}
-            WHERE key = ?1
-            ",
-            self.table
-        );
-        let conn = self.conn.lock().unwrap();
-        let data: Vec<u8> =
+        let data: Vec<u8> = if let Some(v) = cached_value {
+            v
+        } else {
+            let sql = format!(
+                "
+                SELECT value
+                FROM {}
+                WHERE key = ?1
+                ",
+                self.table
+            );
+            let conn = self.conn.lock().unwrap();
             conn.query_row(&sql, params![k], |r| r.get(0))
                 .map_err(|e| -> PyErr {
                     match e {
@@ -132,8 +154,32 @@ impl _KVault {
                         }
                         other => VaultError::from(other).into(),
                     }
-                })?;
-        Ok(PyBytes::new_bound(py, &data).unbind())
+                })?
+        };
+
+        // Check if auto-pack is enabled for auto-decoding
+        let has_auto_pack = self.auto_packer.lock().unwrap().is_some();
+
+        if has_auto_pack {
+            // Auto-decode based on header
+            let (decoded_data, header) = self
+                .decode_value(&data)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+            if let Some(h) = header {
+                // Has header - auto-decode based on encoding type
+                let auto_pack_guard = self.auto_packer.lock().unwrap();
+                if let Some(ref packer) = *auto_pack_guard {
+                    return packer.deserialize(py, &decoded_data, h.encoding);
+                }
+            }
+
+            // No header - return raw bytes
+            Ok(PyBytes::new_bound(py, &data).into())
+        } else {
+            // Auto-pack disabled - always return raw bytes
+            Ok(PyBytes::new_bound(py, &data).into())
+        }
     }
 
     /// Delete a key-value pair.

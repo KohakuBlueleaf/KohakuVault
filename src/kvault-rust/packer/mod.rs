@@ -250,7 +250,7 @@ impl PackerDType {
 /// Main data packer class exposed to Python
 #[pyclass]
 pub struct DataPacker {
-    dtype: PackerDType,
+    pub(crate) dtype: PackerDType,
 }
 
 #[pymethods]
@@ -427,7 +427,7 @@ impl DataPacker {
 
 // Implementation methods (not exposed to Python)
 impl DataPacker {
-    fn pack_impl(&self, _py: Python, value: &Bound<PyAny>) -> Result<Vec<u8>, PyErr> {
+    pub(crate) fn pack_impl(&self, _py: Python, value: &Bound<PyAny>) -> Result<Vec<u8>, PyErr> {
         match &self.dtype {
             PackerDType::I64 => {
                 let val: i64 = value.extract()?;
@@ -478,7 +478,12 @@ impl DataPacker {
         }
     }
 
-    fn unpack_impl(&self, py: Python, data: &[u8], offset: usize) -> Result<PyObject, PyErr> {
+    pub(crate) fn unpack_impl(
+        &self,
+        py: Python,
+        data: &[u8],
+        offset: usize,
+    ) -> Result<PyObject, PyErr> {
         match &self.dtype {
             PackerDType::I64 => {
                 if offset + 8 > data.len() {

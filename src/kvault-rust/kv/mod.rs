@@ -8,11 +8,15 @@
 //! - Streaming support for large values via BLOB API
 //! - Flexible key types (bytes or strings)
 //! - Optional header system for encoding type detection
+//! - Auto-packing for arbitrary Python objects
 
+mod autopacker;
 mod encoding;
 mod header;
 mod ops;
 mod stream;
+
+use autopacker::AutoPacker;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,6 +37,7 @@ pub struct _KVault {
     pub(crate) chunk_size: usize,
     pub(crate) cache_locked: Arc<AtomicBool>, // For lock_cache()
     pub(crate) use_headers: AtomicBool,       // Enable header format for new writes
+    pub(crate) auto_packer: Mutex<Option<AutoPacker>>, // Auto-packing for arbitrary objects
 }
 
 // Python-exposed methods (single #[pymethods] block required by PyO3)
@@ -97,7 +102,8 @@ impl _KVault {
             cache: Mutex::new(None),
             chunk_size,
             cache_locked: Arc::new(AtomicBool::new(false)),
-            use_headers: AtomicBool::new(false), // Always start disabled for backward compat
+            use_headers: AtomicBool::new(true), // DEFAULT: headers enabled for auto-packing
+            auto_packer: Mutex::new(Some(AutoPacker::new(true))), // DEFAULT: auto-pack enabled
         })
     }
 
@@ -133,6 +139,45 @@ impl _KVault {
     /// Check if headers are enabled
     fn headers_enabled(&self) -> bool {
         self.use_headers.load(Ordering::Relaxed)
+    }
+
+    /// Enable auto-packing (allows arbitrary Python objects)
+    ///
+    /// When enabled, KVault automatically serializes Python objects:
+    /// - numpy arrays → DataPacker vec:*
+    /// - dicts/lists → MessagePack
+    /// - int/float → DataPacker i64/f64
+    /// - bytes → Raw (no header)
+    /// - Custom objects → Pickle (if use_pickle=True)
+    #[pyo3(signature = (use_pickle=true))]
+    fn enable_auto_pack(&self, use_pickle: bool) -> PyResult<()> {
+        let mut guard = self.auto_packer.lock().unwrap();
+        *guard = Some(AutoPacker::new(use_pickle));
+
+        // Also enable headers (required for auto-pack)
+        self.use_headers.store(true, Ordering::Relaxed);
+
+        // Register features in meta table
+        let conn = self.conn.lock().unwrap();
+        MetaTable::register_feature(
+            &conn,
+            crate::common::meta::KV_FEATURES_KEY,
+            crate::common::meta::KV_FEATURE_AUTO_PACK,
+        )
+        .map_err(VaultError::from)?;
+
+        Ok(())
+    }
+
+    /// Disable auto-packing (return to bytes-only mode)
+    fn disable_auto_pack(&self) {
+        let mut guard = self.auto_packer.lock().unwrap();
+        *guard = None;
+    }
+
+    /// Check if auto-packing is enabled
+    fn auto_pack_enabled(&self) -> bool {
+        self.auto_packer.lock().unwrap().is_some()
     }
 
     /// Enable write-back cache (bytes-bounded). Flush when threshold reached.
@@ -256,7 +301,7 @@ impl _KVault {
         self.put_impl(py, key, value)
     }
 
-    fn get(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyBytes>> {
+    fn get(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
         self.get_impl(py, key)
     }
 

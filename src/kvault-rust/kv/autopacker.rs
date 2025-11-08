@@ -1,26 +1,30 @@
 //! Auto-packing for arbitrary Python objects
 //!
 //! Automatically detects type and chooses best serialization:
-//! 1. Try DataPacker (for numpy arrays and supported types)
-//! 2. Fall back to Pickle (for arbitrary Python objects)
+//! Priority order (maximizing DataPacker usage):
+//! 1. bytes → Raw (no header)
+//! 2. Wrapped types (MsgPack, Json, Pickle) → Specified encoding
+//! 3. numpy array → DataPacker vec:type:shape
+//! 4. int → DataPacker i64
+//! 5. float → DataPacker f64
+//! 6. dict/list → DataPacker msgpack (KEY: use MessagePack, not Pickle!)
+//! 7. str → DataPacker str:utf8
+//! 8. Custom objects → Pickle (last resort)
 
 use super::header::EncodingType;
-use crate::packer::{DataPacker, ElementType, PackerDType};
+use crate::packer::{DataPacker, ElementType, PackerDType, StringEncoding};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 /// Auto-packer that detects type and serializes accordingly
+#[allow(dead_code)] // Used when auto_pack is enabled
 pub struct AutoPacker {
-    pub try_datapacker: bool,
-    pub try_pickle: bool,
+    pub use_pickle_fallback: bool,
 }
 
 impl AutoPacker {
-    pub fn new(try_pickle: bool) -> Self {
-        Self {
-            try_datapacker: true,
-            try_pickle,
-        }
+    pub fn new(use_pickle_fallback: bool) -> Self {
+        Self { use_pickle_fallback }
     }
 
     /// Serialize a Python object automatically
@@ -31,28 +35,88 @@ impl AutoPacker {
         py: Python,
         obj: &Bound<'_, PyAny>,
     ) -> PyResult<(Vec<u8>, EncodingType)> {
-        // 1. Check if it's already bytes - keep raw
+        // 1. Check if it's bytes - keep raw (no header!)
         if obj.is_instance_of::<PyBytes>() {
             let bytes: Vec<u8> = obj.extract()?;
             return Ok((bytes, EncodingType::Raw));
         }
 
-        // 2. Try DataPacker for numpy arrays
-        if self.try_datapacker {
-            if let Ok(result) = self.try_serialize_numpy(py, obj) {
+        // 2. Check if it's a wrapped type (MsgPack, Json, Cbor, Pickle)
+        if obj.hasattr("encoding_name")? && obj.hasattr("data")? {
+            let encoding_name: String = obj.getattr("encoding_name")?.extract()?;
+            let data = obj.getattr("data")?;
+
+            return match encoding_name.as_str() {
+                "msgpack" => {
+                    let packer =
+                        DataPacker { dtype: PackerDType::MessagePack { fixed_size: None } };
+                    let bytes = packer.pack_impl(py, &data)?;
+                    Ok((bytes, EncodingType::MessagePack))
+                }
+                "json" => {
+                    let json_mod = py.import_bound("json")?;
+                    let json_str = json_mod.call_method1("dumps", (&data,))?;
+                    let bytes: Vec<u8> = json_str.extract::<String>()?.into_bytes();
+                    Ok((bytes, EncodingType::Json))
+                }
+                "cbor" => {
+                    let packer =
+                        DataPacker { dtype: PackerDType::Cbor { schema: None, fixed_size: None } };
+                    let bytes = packer.pack_impl(py, &data)?;
+                    Ok((bytes, EncodingType::Cbor))
+                }
+                "pickle" => {
+                    let pickle = py.import_bound("pickle")?;
+                    let pickled = pickle.call_method1("dumps", (&data,))?;
+                    let bytes: Vec<u8> = pickled.extract()?;
+                    Ok((bytes, EncodingType::Pickle))
+                }
+                _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown encoding wrapper: {}",
+                    encoding_name
+                ))),
+            };
+        }
+
+        // 3. Try numpy array → DataPacker vec:*
+        if obj.hasattr("__array__")? {
+            if let Ok(result) = self.serialize_numpy(py, obj) {
                 return Ok(result);
             }
         }
 
-        // 3. Try DataPacker for primitives (i64, f64)
-        if self.try_datapacker {
-            if let Ok(result) = self.try_serialize_primitive(py, obj) {
-                return Ok(result);
-            }
+        // 4. Try int → DataPacker i64
+        if let Ok(_val) = obj.extract::<i64>() {
+            let packer = DataPacker { dtype: PackerDType::I64 };
+            let bytes = packer.pack_impl(py, obj)?;
+            return Ok((bytes, EncodingType::DataPacker));
         }
 
-        // 4. Fall back to pickle for arbitrary objects
-        if self.try_pickle {
+        // 5. Try float → DataPacker f64
+        if let Ok(_val) = obj.extract::<f64>() {
+            let packer = DataPacker { dtype: PackerDType::F64 };
+            let bytes = packer.pack_impl(py, obj)?;
+            return Ok((bytes, EncodingType::DataPacker));
+        }
+
+        // 6. Try dict/list → DataPacker msgpack (IMPORTANT: Use MessagePack, not Pickle!)
+        if obj.is_instance_of::<PyDict>() || obj.is_instance_of::<PyList>() {
+            let packer = DataPacker { dtype: PackerDType::MessagePack { fixed_size: None } };
+            let bytes = packer.pack_impl(py, obj)?;
+            return Ok((bytes, EncodingType::MessagePack));
+        }
+
+        // 7. Try str → DataPacker str:utf8
+        if let Ok(_val) = obj.extract::<String>() {
+            let packer = DataPacker {
+                dtype: PackerDType::String { encoding: StringEncoding::Utf8, fixed_size: None },
+            };
+            let bytes = packer.pack_impl(py, obj)?;
+            return Ok((bytes, EncodingType::DataPacker));
+        }
+
+        // 8. Last resort: Pickle (for custom objects)
+        if self.use_pickle_fallback {
             let pickle = py.import_bound("pickle")?;
             let pickled = pickle.call_method1("dumps", (obj,))?;
             let bytes: Vec<u8> = pickled.extract()?;
@@ -60,29 +124,25 @@ impl AutoPacker {
         }
 
         Err(pyo3::exceptions::PyTypeError::new_err(
-            "Cannot auto-pack object: not bytes, numpy array, or picklable",
+            "Cannot auto-pack object: unsupported type and pickle fallback disabled",
         ))
     }
 
-    /// Try to serialize as numpy array
-    fn try_serialize_numpy(
+    /// Serialize numpy array to DataPacker vec:* format
+    fn serialize_numpy(
         &self,
         py: Python,
         obj: &Bound<'_, PyAny>,
     ) -> PyResult<(Vec<u8>, EncodingType)> {
-        // Check if it has __array__ attribute (numpy array-like)
-        if !obj.hasattr("__array__")? {
-            return Err(pyo3::exceptions::PyTypeError::new_err("Not a numpy array"));
-        }
-
-        // Get shape and dtype
+        // Get shape (not used since we use arbitrary shape format, but needed to validate)
         let shape_obj = obj.getattr("shape")?;
         let shape_tuple = shape_obj.downcast::<pyo3::types::PyTuple>()?;
-        let shape: Vec<usize> = shape_tuple
+        let _shape: Vec<usize> = shape_tuple
             .iter()
             .map(|x| x.extract::<usize>())
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Get dtype
         let dtype_obj = obj.getattr("dtype")?;
         let dtype_name_obj = dtype_obj.getattr("name")?;
         let dtype_name: String = dtype_name_obj.extract()?;
@@ -107,45 +167,23 @@ impl AutoPacker {
             }
         };
 
-        // Create a DataPacker with fixed shape (for efficiency)
+        // Use arbitrary shape format (includes shape in data)
+        // This allows deserializer to reconstruct shape without metadata
         let dtype = PackerDType::Vector {
             element_type,
-            fixed_shape: Some(shape),
+            fixed_shape: None, // Arbitrary shape
         };
         let packer = DataPacker { dtype };
 
         // Pack the array
-        let packed_bytes = packer.pack_impl(py, obj)?;
+        let bytes = packer.pack_impl(py, obj)?;
 
-        Ok((packed_bytes, EncodingType::DataPacker))
-    }
-
-    /// Try to serialize as primitive type (int, float)
-    fn try_serialize_primitive(
-        &self,
-        py: Python,
-        obj: &Bound<'_, PyAny>,
-    ) -> PyResult<(Vec<u8>, EncodingType)> {
-        // Try i64
-        if let Ok(val) = obj.extract::<i64>() {
-            let dtype = PackerDType::I64;
-            let packer = DataPacker { dtype };
-            let packed_bytes = packer.pack_impl(py, obj)?;
-            return Ok((packed_bytes, EncodingType::DataPacker));
-        }
-
-        // Try f64
-        if let Ok(val) = obj.extract::<f64>() {
-            let dtype = PackerDType::F64;
-            let packer = DataPacker { dtype };
-            let packed_bytes = packer.pack_impl(py, obj)?;
-            return Ok((packed_bytes, EncodingType::DataPacker));
-        }
-
-        Err(pyo3::exceptions::PyTypeError::new_err("Not a primitive type"))
+        Ok((bytes, EncodingType::DataPacker))
     }
 
     /// Deserialize based on encoding type
+    ///
+    /// Returns actual Python object (not bytes!)
     pub fn deserialize(
         &self,
         py: Python,
@@ -157,42 +195,76 @@ impl AutoPacker {
                 // Return as bytes
                 Ok(PyBytes::new_bound(py, data).into())
             }
+            EncodingType::DataPacker => {
+                // Determine what type of DataPacker data this is based on length and content
+                if data.is_empty() {
+                    return Ok(PyBytes::new_bound(py, data).into());
+                }
+
+                // Primitives are exactly 8 bytes (i64, f64)
+                // Try both and use heuristic to choose
+                if data.len() == 8 {
+                    let bytes_array: [u8; 8] = data.try_into().unwrap();
+
+                    // Try as f64
+                    let as_f64 = f64::from_le_bytes(bytes_array);
+                    // Try as i64
+                    let as_i64 = i64::from_le_bytes(bytes_array);
+
+                    // Heuristic: if f64 interpretation is finite and has decimal part, prefer f64
+                    // Otherwise prefer i64
+                    if as_f64.is_finite() && as_f64.fract().abs() > 1e-9 {
+                        return Ok(as_f64.into_py(py));
+                    } else if as_i64.abs() < 1_000_000_000_000 {
+                        // Reasonable int range
+                        return Ok(as_i64.into_py(py));
+                    } else {
+                        // Large number - could be float stored as int bits
+                        return Ok(as_f64.into_py(py));
+                    }
+                }
+
+                // Vectors have type byte (0x01-0x0A) and are always longer than 8 bytes
+                // Minimum vector size: type(1) + data(>8 bytes) OR type(1) + ndim(1) + shape(4+) + data
+                if data.len() > 8 && ElementType::from_u8(data[0]).is_some() {
+                    let elem_type = ElementType::from_u8(data[0]).unwrap();
+                    if let Ok(obj) = crate::packer::unpack_vector(py, data, 0, None, elem_type) {
+                        return Ok(obj);
+                    }
+                }
+
+                // Try string (no specific marker, just valid UTF-8)
+                if let Ok(s) = std::str::from_utf8(data) {
+                    return Ok(s.into_py(py));
+                }
+
+                // Fallback to raw bytes
+                Ok(PyBytes::new_bound(py, data).into())
+            }
+            EncodingType::MessagePack => {
+                let packer = DataPacker { dtype: PackerDType::MessagePack { fixed_size: None } };
+                packer.unpack_impl(py, data, 0)
+            }
+            EncodingType::Json => {
+                let json_mod = py.import_bound("json")?;
+                let text = std::str::from_utf8(data)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                let decoded = json_mod.call_method1("loads", (text,))?;
+                Ok(decoded.into())
+            }
+            EncodingType::Cbor => {
+                let packer =
+                    DataPacker { dtype: PackerDType::Cbor { schema: None, fixed_size: None } };
+                packer.unpack_impl(py, data, 0)
+            }
             EncodingType::Pickle => {
-                // Unpickle
                 let pickle = py.import_bound("pickle")?;
                 let unpickled = pickle.call_method1("loads", (PyBytes::new_bound(py, data),))?;
                 Ok(unpickled.into())
             }
-            EncodingType::DataPacker => {
-                // Need to parse the packed data to determine dtype
-                // For now, just return bytes (Phase 3 will improve this)
-                Ok(PyBytes::new_bound(py, data).into())
+            EncodingType::Reserved => {
+                Err(pyo3::exceptions::PyValueError::new_err("Reserved encoding type"))
             }
-            EncodingType::Json => {
-                let json = py.import_bound("json")?;
-                let text = std::str::from_utf8(data)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-                let decoded = json.call_method1("loads", (text,))?;
-                Ok(decoded.into())
-            }
-            EncodingType::MessagePack => {
-                // Use DataPacker's MessagePack implementation
-                let dtype = PackerDType::MessagePack { fixed_size: None };
-                let packer = DataPacker { dtype };
-                packer.unpack_impl(py, data, 0)
-            }
-            EncodingType::Cbor => {
-                // Use DataPacker's CBOR implementation
-                let dtype = PackerDType::Cbor {
-                    schema: None,
-                    fixed_size: None,
-                };
-                let packer = DataPacker { dtype };
-                packer.unpack_impl(py, data, 0)
-            }
-            EncodingType::Reserved => Err(pyo3::exceptions::PyValueError::new_err(
-                "Reserved encoding type",
-            )),
         }
     }
 }

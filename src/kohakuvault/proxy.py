@@ -409,22 +409,33 @@ class KVault(Mapping):
         """
         Store a value for a key.
 
+        When auto-pack is enabled (default), accepts any Python object.
+        When auto-pack is disabled, only accepts bytes-like objects.
+
         Parameters
         ----------
         key : bytes | str
             Key to store under.
-        value : bytes | bytearray | memoryview
-            Value to store (must be bytes-like).
+        value : Any (if auto-pack enabled) | bytes (if auto-pack disabled)
+            Value to store.
         """
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
 
         k = _to_bytes_key(key)
-        if not _is_bytes_like(value):
-            raise E.InvalidArgument("value must be bytes-like")
+
+        # Check if auto-pack is enabled
+        if not self.auto_pack_enabled():
+            # Auto-pack disabled: must be bytes-like
+            if not _is_bytes_like(value):
+                raise E.InvalidArgument("value must be bytes-like (or enable auto-pack)")
+            value_to_pass = bytes(value)
+        else:
+            # Auto-pack enabled: accept any object
+            value_to_pass = value
 
         def call():
-            return self._inner.put(k, bytes(value))
+            return self._inner.put(k, value_to_pass)
 
         _with_retries(call, attempts=self._retries, backoff_base=self._backoff, key_for_error=k)
 
@@ -877,6 +888,69 @@ class KVault(Mapping):
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
         return self._inner.headers_enabled()
+
+    # ----------------------------
+    # Auto-Packing Management
+    # ----------------------------
+
+    def enable_auto_pack(self, use_pickle: bool = True) -> None:
+        """
+        Enable auto-packing for arbitrary Python objects (DEFAULT ENABLED).
+
+        When enabled, KVault automatically serializes Python objects:
+        - bytes → Raw (no header, media file compatible)
+        - numpy arrays → DataPacker vec:*
+        - int/float → DataPacker i64/f64
+        - dict/list → MessagePack (efficient binary format)
+        - str → DataPacker str:utf8
+        - Custom objects → Pickle (if use_pickle=True)
+
+        Values are automatically decoded on get() - you get back the original
+        Python object, not bytes!
+
+        Parameters
+        ----------
+        use_pickle : bool, default=True
+            Allow pickle for custom objects as last resort
+
+        Example
+        -------
+        >>> kv.enable_auto_pack()
+        >>> kv["embedding"] = np.random.randn(768).astype(np.float32)
+        >>> kv["config"] = {"timeout": 30, "retries": 3}
+        >>> embedding = kv["embedding"]  # Returns np.ndarray, not bytes!
+        >>> config = kv["config"]        # Returns dict, not bytes!
+        """
+        if self._closed:
+            raise ValueError("Cannot operate on closed KVault")
+        try:
+            self._inner.enable_auto_pack(use_pickle)
+        except Exception as ex:
+            raise E.map_exception(ex)
+
+    def disable_auto_pack(self) -> None:
+        """
+        Disable auto-packing (return to bytes-only mode).
+
+        After disabling, put() will only accept bytes and get() will
+        return bytes.
+        """
+        if self._closed:
+            raise ValueError("Cannot operate on closed KVault")
+        self._inner.disable_auto_pack()
+
+    def auto_pack_enabled(self) -> bool:
+        """
+        Check if auto-packing is currently enabled.
+
+        Returns
+        -------
+        bool
+            True if auto-packing is enabled
+        """
+        if self._closed:
+            raise ValueError("Cannot operate on closed KVault")
+        return self._inner.auto_pack_enabled()
 
     # ----------------------------
     # Maintenance
