@@ -80,7 +80,7 @@ Benchmarks on an M1 Max (WAL on, cache enabled):
 
 ## Documentation
 
-- [Documentation index](docs/index.md)
+- [Documentation index](docs/README.md)
 - [KVault Guide](docs/kvault.md)
 - [ColumnVault Guide](docs/columnvault.md)
 - [Vector Storage & Search](docs/vectors.md)
