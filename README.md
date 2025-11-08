@@ -1,6 +1,6 @@
 # KohakuVault
 
-SQLite-backed storage with vector search, auto-packing, and high-performance Rust engine.
+SQLite-backed storage with Rust engine for high-performance key-value and columnar data.
 
 ## Quick Start
 
@@ -8,136 +8,223 @@ SQLite-backed storage with vector search, auto-packing, and high-performance Rus
 pip install kohakuvault
 ```
 
-### Auto-Packing (New in 0.7.0!)
-
 ```python
-from kohakuvault import KVault
-import numpy as np
+from kohakuvault import KVault, ColumnVault, DataPacker
 
-kv = KVault("data.db")  # Auto-pack enabled by default!
+# Key-Value Storage
+kv = KVault("data.db")
+kv["user:123"] = b"user data"
+kv["image:001"] = large_image_bytes
 
-# Store any Python object - automatic serialization!
-kv["embedding"] = np.random.randn(768).astype(np.float32)
-kv["config"] = {"timeout": 30, "enabled": True}
-kv["scores"] = [95.5, 87.3, 92.1]
-kv["count"] = 42
+# Columnar Storage (shared DB)
+cv = ColumnVault("data.db")
+temps = cv.create_column("temperatures", "f64")
+temps.extend([23.6, 23.8, 24.1])
 
-# Get returns actual objects, not bytes!
-config = kv["config"]  # dict
-embedding = kv["embedding"]  # numpy array
+profiles = cv.create_column("profiles", "msgpack")
+profiles.append({"id": 1, "name": "Alice", "active": True})
+
+# Bulk operations
+scores = cv.create_column("scores", "i64")
+scores.extend(list(range(100000)))  # 12.5M ops/s with cache
+
+# Serialization
+packer = DataPacker("msgpack")
+packed = packer.pack({"key": "value"})
+data = packer.unpack(packed, 0)
 ```
 
-### Vector Similarity Search (New in 0.7.0!)
+## Core Features
+
+### KVault - Key-Value Storage
+
+Dict-like interface for binary blobs:
+
+```python
+kv = KVault("vault.db")
+
+# Basic operations
+kv["key"] = b"value"
+value = kv["key"]
+del kv["key"]
+"key" in kv
+
+# Performance with caching
+with kv.cache():
+    for i in range(10000):
+        kv[f"item:{i}"] = data
+
+# Streaming for large files
+with open("large_file.mp4", "rb") as f:
+    kv.put_file("video:001", f)
+
+with open("output.mp4", "wb") as f:
+    kv.get_to_file("video:001", f)
+```
+
+### ColumnVault - Columnar Storage
+
+List-like interface for typed columns:
+
+```python
+cv = ColumnVault("columns.db")
+
+# Create columns with types
+ids = cv.create_column("ids", "i64")
+scores = cv.create_column("scores", "f64")
+names = cv.create_column("names", "str:utf8")
+metadata = cv.create_column("metadata", "msgpack")
+
+# Append/extend
+ids.append(1)
+ids.extend([2, 3, 4, 5])
+
+# Indexing and slicing
+value = ids[0]
+batch = ids[10:20]  # 200x faster than loop
+
+# Update
+ids[5] = 999
+ids[10:15] = [100, 101, 102, 103, 104]
+```
+
+### DataPacker - Type-Safe Serialization
+
+Efficient Rust-based serialization:
+
+```python
+packer = DataPacker("i64")
+packed = packer.pack(42)           # 8 bytes
+value = packer.unpack(packed, 0)   # 42
+
+# Bulk operations (faster)
+values = list(range(10000))
+packed_all = packer.pack_many(values)
+unpacked_all = packer.unpack_many(packed_all, count=10000)
+
+# Supported types
+"i64", "f64"                       # Primitives
+"str:utf8", "str:32:utf8"         # Strings (variable/fixed)
+"bytes", "bytes:128"               # Raw bytes
+"msgpack", "cbor"                  # Structured data
+```
+
+## Performance
+
+**M1 Max, 50K entries**:
+- KVault write (64MB cache): ~24K ops/s @ 16KB (~377 MB/s)
+- KVault read (hot cache): ~63K ops/s @ 16KB (~987 MB/s)
+- Column extend (i64): ~12.5M ops/s with cache
+- Column slice read (f64, 100 items): ~2.3M slices/s
+- MessagePack: >1M ops/s
+
+See `examples/benchmark.py` for reproducible benchmarks.
+
+## Storage Interfaces
+
+| Interface       | Model                   | Access        | Best For                      |
+|-----------------|-------------------------|---------------|-------------------------------|
+| `KVault`        | Key → value             | Dict-like     | Blobs, media, large files     |
+| `Column`        | Fixed-size elements     | List-like     | Metrics, dense arrays         |
+| `VarSizeColumn` | Variable-size elements  | List-like     | Logs, JSON, text              |
+| `DataPacker`    | Type serializer         | Pack/unpack   | Custom pipelines              |
+| `CSBTree`       | Ordered map             | Sorted access | Secondary indexes             |
+| `SkipList`      | Ordered map             | Concurrent    | Lock-free access              |
+
+## What's New in 0.7.0
+
+### Auto-Packing (Enabled by Default)
+
+Store any Python object without manual serialization:
+
+```python
+kv = KVault("data.db")
+
+# Automatic!
+kv["array"] = np.random.randn(768).astype(np.float32)  # numpy
+kv["config"] = {"timeout": 30}                          # dict → MessagePack
+kv["items"] = [1, 2, 3]                                 # list → MessagePack
+kv["count"] = 42                                        # int
+kv["image.jpg"] = jpeg_bytes                            # bytes (raw)
+
+# Get returns actual objects!
+config = kv["config"]  # dict, not bytes!
+```
+
+**Priority**: DataPacker types (i64, f64, vec:*) → str → MessagePack → Pickle fallback
+
+### Vector Storage
+
+Efficient array storage in columns:
+
+```python
+cv = ColumnVault("vectors.db")
+embeddings = cv.create_column("text", "vec:f32:768")
+images = cv.create_column("mnist", "vec:u8:28:28")
+
+embeddings.extend([np.random.randn(768).astype(np.float32) for _ in range(1000)])
+```
+
+**Overhead**: 1 byte per vector
+
+### Vector Similarity Search
+
+k-NN search with sqlite-vec:
 
 ```python
 from kohakuvault import VectorKVault
 
 vkv = VectorKVault("search.db", dimensions=384, metric="cosine")
-
-# Index documents
-for doc, embedding in zip(documents, embeddings):
-    vkv.insert(embedding, doc.encode())
-
-# Search
+vkv.insert(embedding, doc.encode())
 results = vkv.search(query_embedding, k=10)
 ```
 
-### Vector Columns (New in 0.7.0!)
-
-```python
-from kohakuvault import ColumnVault
-
-cv = ColumnVault("vectors.db")
-embeddings = cv.create_column("text_embeddings", "vec:f32:768")
-embeddings.extend([np.random.randn(768).astype(np.float32) for _ in range(1000)])
-```
-
-## Storage Interfaces at a Glance
-
-| Interface            | Data model              | Access pattern        | Backing tables / structures            | Highlights                                         | Best for                               |
-|----------------------|-------------------------|-----------------------|----------------------------------------|----------------------------------------------------|----------------------------------------|
-| `KVault`             | Key -> any Python object | Dict-style            | `kvault` (blob)                        | **Auto-packing**, streaming, retry logic, caching  | Any data type, media files, ML models  |
-| `VectorKVault`       | Vector -> value          | k-NN similarity search| `vec0` virtual table (sqlite-vec)      | **Fast vector search**, multiple metrics (cosine/L2) | Semantic search, recommendations     |
-| `Column`             | Fixed-size elements     | Mutable sequence      | `col_meta` + `col_chunks`              | **Vector storage**, batch slice ops, Rust packing  | Embeddings, images, dense arrays       |
-| `VarSizeColumn`      | Prefixed variable bytes | Mutable sequence      | `{name}_data` + `{name}_idx`           | Size-aware updates, adaptive chunk growth          | Logs, JSON payloads, text              |
-| `DataPacker`         | Typed serializer        | Pack/unpack helpers   | Pure Rust (no extra tables)            | **Vector types**, MessagePack/CBOR, 35x faster bulk | Custom pipelines, preprocessing        |
-| `CSBTree`            | Ordered map             | B+Tree style API      | Arena-backed cache-sensitive tree      | Contiguous nodes, iterator & range queries         | Sorted secondary indexes, metadata     |
-| `SkipList`           | Ordered map             | Lock-free (CAS)       | Lock-free skip list                    | Concurrent inserts/reads without GIL contention    | Shared read/write heaps, hot paths     |
-
-## Capabilities
-
-- **Auto-packing (v0.7.0)**: Store numpy arrays, dicts, lists, primitives without manual serialization. Automatic encoding/decoding.
-- **Vector search (v0.7.0)**: Fast k-NN similarity search with sqlite-vec. Cosine, L2, L1, hamming metrics.
-- **Vector storage (v0.7.0)**: Efficient array/tensor storage in columns. Minimal 1-byte overhead for fixed-shape vectors.
-- **Optimized bulk ops (v0.7.0)**: 35x faster pack_many/unpack_many for vectors using numpy.stack/frombuffer.
-- Rust-powered I/O with Python-first ergonomics (PyO3 bridge).
-- Write-back cache for both key-value and columnar workloads (context manager, daemon auto-flush, capacity guards).
-- Fast range access: `Column.__getitem__` batches reads; slice assignment funnels to Rust.
-- Variable-size column maintenance: prefix-sum index, chunk rebuilds, and fragment tracking.
-- Concurrency aware retry logic that turns SQLite busy states into typed exceptions.
-- Optional CSB+Tree and SkipList implementations for ordered access patterns.
+**Metrics**: cosine, L2, L1, hamming
 
 ## Architecture
 
 ```
-Python layer (proxy.py / column_proxy.py)
-    -> PyO3 bindings
-Rust core (lib.rs)
-    -> rusqlite + custom allocators
-SQLite storage (single .db + WAL)
+Python Layer
+    ↓ PyO3 bindings
+Rust Core (lib.rs)
+    ↓ rusqlite + sqlite-vec
+SQLite (single .db + WAL)
 ```
 
-- **KVault**: mutex-protected connection, optional write-back cache, streaming via BLOB API.
-- **ColumnVault**: element-aligned chunking, cache buckets per column, adaptive variable-size slices.
-- **DataPacker**: Rust serializers report `elem_size` / `is_varsize` to Python, enabling automatic dtype strategy.
-- **SkipList / CSBTree**: share Python key wrappers to support arbitrary `PyObject` ordering.
+- **KVault**: Mutex-protected connection, write-back cache, BLOB API streaming
+- **ColumnVault**: Chunked storage, adaptive sizing, batch operations
+- **DataPacker**: Rust serializers (primitives, vectors, MessagePack, CBOR)
+- **VectorKVault**: sqlite-vec integration, SIMD-accelerated search
 
-## Performance Snapshot
+All components share a single SQLite file.
 
-### New in 0.7.0
-- **Vector bulk unpack**: 35x faster than loop (10K 768-dim embeddings)
-- **Primitives bulk**: 2.66x faster pack, 5.92x faster unpack (1M values)
-- **MessagePack**: 42% smaller than JSON, >800K ops/s
-- **Vector overhead**: 1 byte for fixed-shape (0.19% for 768-dim f32)
+## Advanced Features
 
-### Existing (M1 Max, 50K entries)
-- KVault write with 64 MiB cache: ~24k ops/s at 16 KiB payloads (~377 MB/s).
-- KVault read hot cache: ~63k ops/s at 16 KiB payloads (~987 MB/s).
-- Column `extend` (`i64`): ~12.5M ops/s with cache, >450x faster than uncached.
-- Column slice read (`f64`, 100 items): ~2.3M slices/s, 200x faster than per-element.
+- **Caching**: Write-back cache with configurable thresholds and auto-flush
+- **Streaming**: BLOB API for large files without memory buffering
+- **Batch operations**: Slice read/write, pack_many/unpack_many (3-35x faster)
+- **Type wrappers**: `MsgPack(data)`, `Json(data)` for explicit encoding
+- **Ordered containers**: CSBTree (B+Tree) and SkipList (lock-free)
+- **Error handling**: Typed exceptions with automatic retry for busy states
 
-See `examples/benchmark.py` and `examples/benchmark_datapacker_new.py` for benchmarks.
-
-## Tooling & Extras
-
-- **Auto-packing (v0.7.0)**: Automatic serialization/deserialization for numpy arrays, dicts, lists, primitives. MessagePack for dicts/lists (efficient!), DataPacker for arrays. Disabled with `kv.disable_auto_pack()`.
-- **Vector types (v0.7.0)**: `vec:f32:768` (fixed), `vec:i64:10:20` (2D), `vec:u8:3:224:224` (RGB), `vec:f32` (arbitrary). 10 element types: f32, f64, i32, i64, u8, u16, u32, u64, i8, i16.
-- **VectorKVault (v0.7.0)**: Vector similarity search with k-NN queries. Supports cosine, L2, L1, hamming metrics. Built on sqlite-vec.
-- **Type wrappers (v0.7.0)**: `MsgPack(data)`, `Json(data)`, `Cbor(data)`, `Pickle(data)` for explicit encoding control.
-- **DataPacker**: primitives, strings, vectors, `msgpack`, `cbor`, JSON Schema validation. `pack_many`/`unpack_many` with numpy optimization.
-- **Write-back cache**: `vault.cache(...)` and `column.cache(...)` with auto-flush, daemon threads, capacity guards.
-- **Mixed workloads**: KVault, ColumnVault, and VectorKVault share single SQLite file.
-- **Ordered indexes**: `CSBTree` (cache-sensitive B+Tree) and `SkipList` (lock-free).
-- **Error mapping**: `RuntimeError` → `KohakuVaultError`, `DatabaseBusy`, `NotFound`, `InvalidArgument`, `IoError`.
-
-## Development & Testing
+## Development
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
 pip install -e .[dev]
-
-# Format and lint
-ruff check --fix .
-black src tests examples
-cargo fmt
-
-# Run Python + Rust tests
-pytest
-cargo test
+pytest                    # Run tests
+cargo test                # Rust tests
+cargo clippy             # Linting
 ```
 
-The repository uses maturin for building the extension; see `pyproject.toml` for configuration.
+## Documentation
+
+- `examples/basic_usage.py` - Basic examples
+- `examples/all_usage.py` - Comprehensive demos
+- `docs/kv.md` - KVault details
+- `docs/col.md` - ColumnVault details
+- `docs/datapacker.md` - DataPacker types
+- `docs/vectors.md` - Vector storage and search (v0.7.0)
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) for details.
+Apache License 2.0
