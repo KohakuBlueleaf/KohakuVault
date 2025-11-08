@@ -12,6 +12,8 @@ path = "src/kvault-rust/lib.rs"
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
 rusqlite = { version = "0.31", features = ["bundled", "blob", "unlock_notify"] }
+sqlite-vec = "0.1.6"       # SQLite vector search extension
+zerocopy = "0.7"           # Zero-copy vector operations
 parking_lot = "0.12"
 thiserror = "1.0"
 crossbeam-epoch = "0.9"  # Epoch-based GC for lock-free deletion

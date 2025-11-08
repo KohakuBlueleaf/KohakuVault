@@ -12,7 +12,9 @@ authors = [
 license = { text = "Apache-2.0" }
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "numpy>=1.20.0",
+]
 
 classifiers = [
     "Programming Language :: Python :: 3",
