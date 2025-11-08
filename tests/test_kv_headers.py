@@ -106,21 +106,24 @@ def test_meta_table_created():
     try:
         kv = KVault(db_path)
         kv.close()
+        del kv  # Explicitly delete to release file handles
 
         # Check that meta table exists
         import sqlite3
 
         conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+        try:
+            cursor = conn.cursor()
 
-        # Check table exists
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='kohakuvault_meta'"
-        )
-        result = cursor.fetchone()
-        assert result is not None
-
-        conn.close()
+            # Check table exists
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='kohakuvault_meta'"
+            )
+            result = cursor.fetchone()
+            assert result is not None
+        finally:
+            cursor.close()
+            conn.close()
 
     finally:
         Path(db_path).unlink(missing_ok=True)
@@ -139,21 +142,24 @@ def test_feature_registration():
         # Enable headers
         kv.enable_headers()
         kv.close()
+        del kv  # Explicitly delete to release file handles
 
         # Check meta table has the feature registered
         import sqlite3
 
         conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+        try:
+            cursor = conn.cursor()
 
-        cursor.execute("SELECT value FROM kohakuvault_meta WHERE key='kv_features'")
-        result = cursor.fetchone()
+            cursor.execute("SELECT value FROM kohakuvault_meta WHERE key='kv_features'")
+            result = cursor.fetchone()
 
-        assert result is not None
-        features = result[0]
-        assert "headers_v1" in features
-
-        conn.close()
+            assert result is not None
+            features = result[0]
+            assert "headers_v1" in features
+        finally:
+            cursor.close()
+            conn.close()
 
     finally:
         Path(db_path).unlink(missing_ok=True)
@@ -171,10 +177,12 @@ def test_backward_compatibility_with_old_db():
         import sqlite3
 
         conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE kv (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL)")
-        conn.execute("INSERT INTO kv (key, value) VALUES (?, ?)", (b"key1", b"value1"))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("CREATE TABLE kv (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL)")
+            conn.execute("INSERT INTO kv (key, value) VALUES (?, ?)", (b"key1", b"value1"))
+            conn.commit()
+        finally:
+            conn.close()
 
         # Open with new KVault (should create meta table automatically)
         kv = KVault(db_path)
@@ -187,15 +195,19 @@ def test_backward_compatibility_with_old_db():
         assert kv["key2"] == b"value2"
 
         kv.close()
+        del kv  # Explicitly delete to release file handles
 
         # Verify meta table was created
         conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='kohakuvault_meta'"
-        )
-        assert cursor.fetchone() is not None
-        conn.close()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='kohakuvault_meta'"
+            )
+            assert cursor.fetchone() is not None
+        finally:
+            cursor.close()
+            conn.close()
 
     finally:
         Path(db_path).unlink(missing_ok=True)
@@ -214,6 +226,7 @@ def test_header_preserved_across_sessions():
         assert kv1.headers_enabled() is True
         kv1["key1"] = b"data1"
         kv1.close()
+        del kv1  # Explicitly delete to release file handles
 
         # Session 2: Reopen (headers enabled by default)
         kv2 = KVault(db_path)
@@ -226,6 +239,7 @@ def test_header_preserved_across_sessions():
         assert kv2["key1"] == b"data1"
 
         kv2.close()
+        del kv2  # Explicitly delete to release file handles
 
     finally:
         Path(db_path).unlink(missing_ok=True)
