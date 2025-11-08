@@ -8,11 +8,11 @@ import pytest
 from kohakuvault import KVault
 
 
-def test_headers_disabled_by_default():
-    """Test that headers are disabled by default for backward compatibility."""
+def test_headers_enabled_by_default():
+    """Test that headers are enabled by default for auto-packing."""
     kv = KVault(":memory:")
 
-    assert kv.headers_enabled() is False
+    assert kv.headers_enabled() is True
 
     # Raw bytes should be stored as-is (no header)
     kv["key1"] = b"raw data"
@@ -209,15 +209,15 @@ def test_header_preserved_across_sessions():
         db_path = f.name
 
     try:
-        # Session 1: Enable headers and write data
+        # Session 1: Headers enabled by default, write data
         kv1 = KVault(db_path)
-        kv1.enable_headers()
+        assert kv1.headers_enabled() is True
         kv1["key1"] = b"data1"
         kv1.close()
 
-        # Session 2: Reopen (headers should be disabled by default for safety)
+        # Session 2: Reopen (headers enabled by default)
         kv2 = KVault(db_path)
-        assert kv2.headers_enabled() is False
+        assert kv2.headers_enabled() is True
 
         # But feature should be registered in meta table
         # User can check and re-enable if needed
