@@ -11,15 +11,15 @@ One-file SQLite datastore with:
 from kohakuvault import KVault, ColumnVault, VectorKVault, CSBTree
 import numpy as np
 
-DB = "app.db"
+DB = "test.db"
 
 # Store media + metadata in one file
 kv = KVault(DB, table="media")
-kv["video:42"] = open("clip.mp4", "rb").read()                 # raw bytes stay raw
+kv["video:42"] = b"abcdefg" # raw bytes stay raw
 kv["video:42:meta"] = {"fps": 60, "tags": ["tutorial", "gpu"]}  # auto MessagePack
 
 # Incremental columnar logging (no file rewrites)
-cols = ColumnVault(kv)
+cols = ColumnVault(kv) # or ColumnVault(DB)
 ids = cols.ensure("ids", "i64")
 latency = cols.ensure("latency_ms", "f64")
 embeddings = cols.ensure("embeddings", "vec:f32:384")
@@ -34,9 +34,10 @@ index.insert(latency[-1], ids[-1])  # log-latency -> run-id
 
 # Vector similarity search (sqlite-vec inside the same DB)
 search = VectorKVault(DB, table="runs", dimensions=384, metric="cosine")
-row_id = search.insert(embeddings[-1], str(ids[-1]).encode())
-for rank, (rid, distance, run_id_bytes) in enumerate(search.search(embeddings[-1], k=3), 1):
-    print(rank, distance, run_id_bytes.decode())
+for idx, emb in enumerate(embeddings[:10]):
+    search.insert(emb, str(idx).encode())
+for rank, (rid, distance, run_id) in enumerate(search.search(embeddings[-1], k=3), 1):
+    print(rank, distance, run_id.decode())
 ```
 
 
