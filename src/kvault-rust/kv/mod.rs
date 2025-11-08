@@ -7,9 +7,13 @@
 //! - Write-back caching for improved write performance
 //! - Streaming support for large values via BLOB API
 //! - Flexible key types (bytes or strings)
+//! - Optional header system for encoding type detection
 
+mod encoding;
+mod header;
 mod ops;
 mod stream;
+
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,7 +22,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use rusqlite::{params, Connection};
 
-use crate::common::{checkpoint_wal, open_connection, VaultError, WriteBackCache};
+use crate::common::{checkpoint_wal, open_connection, meta::MetaTable, VaultError, WriteBackCache};
 
 /// Main KVault struct exposed to Python.
 /// Provides a dict-like interface for key-value storage.
@@ -29,6 +33,7 @@ pub struct _KVault {
     pub(crate) cache: Mutex<Option<WriteBackCache<Vec<u8>, Vec<u8>>>>,
     pub(crate) chunk_size: usize,
     pub(crate) cache_locked: Arc<AtomicBool>, // For lock_cache()
+    pub(crate) use_headers: AtomicBool,       // Enable header format for new writes
 }
 
 // Python-exposed methods (single #[pymethods] block required by PyO3)
@@ -60,6 +65,9 @@ impl _KVault {
         let conn = open_connection(path, enable_wal, page_size, mmap_size, cache_kb)
             .map_err(VaultError::from)?;
 
+        // Create metadata table (shared with ColumnVault)
+        MetaTable::ensure_table(&conn).map_err(VaultError::from)?;
+
         // Create schema - minimal design with key as primary key
         conn.execute_batch(&format!(
             "
@@ -74,13 +82,58 @@ impl _KVault {
         ))
         .map_err(VaultError::from)?;
 
+        // Check if header feature is registered (indicates this DB has been used with headers)
+        let _headers_supported = MetaTable::has_feature(
+            &conn,
+            crate::common::meta::KV_FEATURES_KEY,
+            crate::common::meta::KV_FEATURE_HEADERS,
+        )
+        .unwrap_or(false);
+        // Note: Always start with headers disabled for backward compat
+        // User must explicitly enable if needed
+
         Ok(Self {
             conn: Mutex::new(conn),
             table: table.to_string(),
             cache: Mutex::new(None),
             chunk_size,
             cache_locked: Arc::new(AtomicBool::new(false)),
+            use_headers: AtomicBool::new(false), // Always start disabled for backward compat
         })
+    }
+
+    /// Enable header format for new writes
+    ///
+    /// When enabled, all new values will be written with a 10-byte header
+    /// that indicates the encoding type. This allows for:
+    /// - Auto-packing of Python objects (future)
+    /// - Mixed encoding types in same vault
+    /// - Compression/encryption flags (future)
+    ///
+    /// Note: Existing values without headers are still readable (backward compatible)
+    fn enable_headers(&self) -> PyResult<()> {
+        self.use_headers.store(true, Ordering::Relaxed);
+
+        // Register feature in meta table
+        let conn = self.conn.lock().unwrap();
+        MetaTable::register_feature(
+            &conn,
+            crate::common::meta::KV_FEATURES_KEY,
+            crate::common::meta::KV_FEATURE_HEADERS,
+        )
+        .map_err(VaultError::from)?;
+
+        Ok(())
+    }
+
+    /// Disable header format (return to raw bytes mode)
+    fn disable_headers(&self) {
+        self.use_headers.store(false, Ordering::Relaxed);
+    }
+
+    /// Check if headers are enabled
+    fn headers_enabled(&self) -> bool {
+        self.use_headers.load(Ordering::Relaxed)
     }
 
     /// Enable write-back cache (bytes-bounded). Flush when threshold reached.

@@ -829,6 +829,56 @@ class KVault(Mapping):
             self._daemon_thread = None
 
     # ----------------------------
+    # Header Format Management
+    # ----------------------------
+
+    def enable_headers(self) -> None:
+        """
+        Enable header format for new writes.
+
+        When enabled, values written with specific encodings will have a 10-byte
+        header prepended that indicates the encoding type. This allows:
+        - Auto-packing of Python objects (Phase 3)
+        - Mixed encoding types in same vault
+        - Future: compression/encryption flags
+
+        IMPORTANT: Raw bytes (default put behavior) are still stored without
+        headers to maintain compatibility with external tools for media files.
+
+        Note: Existing values without headers remain readable (backward compatible).
+        """
+        if self._closed:
+            raise ValueError("Cannot operate on closed KVault")
+        try:
+            self._inner.enable_headers()
+        except Exception as ex:
+            raise E.map_exception(ex)
+
+    def disable_headers(self) -> None:
+        """
+        Disable header format (return to raw bytes mode).
+
+        New writes will not include headers. Existing values with headers
+        can still be read.
+        """
+        if self._closed:
+            raise ValueError("Cannot operate on closed KVault")
+        self._inner.disable_headers()
+
+    def headers_enabled(self) -> bool:
+        """
+        Check if header format is currently enabled.
+
+        Returns
+        -------
+        bool
+            True if headers are enabled for new writes
+        """
+        if self._closed:
+            raise ValueError("Cannot operate on closed KVault")
+        return self._inner.headers_enabled()
+
+    # ----------------------------
     # Maintenance
     # ----------------------------
 

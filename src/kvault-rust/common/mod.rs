@@ -8,6 +8,9 @@
 //! - Generic write-back cache
 //! - SQLite connection helpers (WAL, pragmas, checkpointing)
 //! - BLOB API helpers
+//! - Metadata table management
+
+pub mod meta;
 
 use std::collections::HashMap;
 use std::fs;
