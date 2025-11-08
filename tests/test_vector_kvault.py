@@ -183,15 +183,262 @@ def test_vector_kvault_repr(temp_db):
     assert "metric='cosine'" in repr_str
 
 
-def test_vector_kvault_string_values(temp_db):
-    """Test storing string values (auto-converted to bytes)"""
+def test_vector_kvault_auto_pack_enabled_by_default(temp_db):
+    """Test that auto-pack is enabled by default (same as KVault)"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+    assert vkv.auto_pack_enabled() is True
+    assert vkv.headers_enabled() is True
+
+
+def test_vector_kvault_auto_pack_dict(temp_db):
+    """Test auto-packing dicts (same as KVault)"""
     vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
 
-    vec = [1.0, 0.0, 0.0, 0.0]
-    id = vkv.insert(vec, "test string")
+    vec = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    test_dict = {"name": "test", "value": 123, "nested": {"key": "value"}}
 
-    _, value = vkv.get_by_id(id)
-    assert value == b"test string"
+    id = vkv.insert(vec, test_dict)
+
+    # Should return dict, not bytes!
+    _, retrieved = vkv.get_by_id(id)
+    assert isinstance(retrieved, dict)
+    assert retrieved == test_dict
+
+
+def test_vector_kvault_auto_pack_list(temp_db):
+    """Test auto-packing lists (same as KVault)"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    vec = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    test_list = [1, 2, 3, "four", 5.0]
+
+    id = vkv.insert(vec, test_list)
+
+    # Should return list, not bytes!
+    _, retrieved = vkv.get_by_id(id)
+    assert isinstance(retrieved, list)
+    assert retrieved == test_list
+
+
+def test_vector_kvault_auto_pack_numpy(temp_db):
+    """Test auto-packing numpy arrays (same as KVault)"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    vec = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    test_array = np.array([10, 20, 30], dtype=np.int64)
+
+    id = vkv.insert(vec, test_array)
+
+    # Should return numpy array, not bytes!
+    _, retrieved = vkv.get_by_id(id)
+    assert isinstance(retrieved, np.ndarray)
+    np.testing.assert_array_equal(retrieved, test_array)
+
+
+def test_vector_kvault_auto_pack_primitives(temp_db):
+    """Test auto-packing int/float/str (same as KVault)"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    vec1 = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    vec2 = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    vec3 = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+
+    id1 = vkv.insert(vec1, 42)
+    id2 = vkv.insert(vec2, 3.14159)
+    id3 = vkv.insert(vec3, "hello world")
+
+    # Should return original types, not bytes!
+    _, val1 = vkv.get_by_id(id1)
+    assert isinstance(val1, int)
+    assert val1 == 42
+
+    _, val2 = vkv.get_by_id(id2)
+    assert isinstance(val2, float)
+    assert abs(val2 - 3.14159) < 1e-10
+
+    _, val3 = vkv.get_by_id(id3)
+    assert isinstance(val3, str)
+    assert val3 == "hello world"
+
+
+def test_vector_kvault_auto_pack_bytes_stays_raw(temp_db):
+    """Test that bytes stay raw (same as KVault)"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    vec = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    test_bytes = b"\xff\xd8\xff\xe0jpeg data"
+
+    id = vkv.insert(vec, test_bytes)
+
+    # Should return bytes
+    _, retrieved = vkv.get_by_id(id)
+    assert isinstance(retrieved, bytes)
+    assert retrieved == test_bytes
+
+
+def test_vector_kvault_search_returns_decoded_values(temp_db):
+    """Test that search() returns auto-decoded values"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    vec1 = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    vec2 = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    vec3 = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+
+    vkv.insert(vec1, {"type": "dict"})
+    vkv.insert(vec2, [1, 2, 3])
+    vkv.insert(vec3, "string value")
+
+    query = np.array([0.9, 0.1, 0.0, 0.0], dtype=np.float32)
+    results = vkv.search(query, k=3)
+
+    # All results should be auto-decoded, not bytes
+    for id, distance, value in results:
+        assert not isinstance(value, bytes)
+        assert isinstance(value, (dict, list, str))
+
+
+def test_vector_kvault_get_returns_decoded_value(temp_db):
+    """Test that get() returns auto-decoded value"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    vec = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    test_dict = {"key": "value", "number": 42}
+
+    vkv.insert(vec, test_dict)
+
+    query = np.array([1.1, 2.1, 3.1, 4.1], dtype=np.float32)
+    result = vkv.get(query)
+
+    # Should return dict, not bytes
+    assert isinstance(result, dict)
+    assert result == test_dict
+
+
+def test_vector_kvault_setitem_operator(temp_db):
+    """Test __setitem__ operator (vkv[vector] = value)"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    vec1 = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    vec2 = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+
+    # Use __setitem__ operator
+    vkv[vec1] = {"operator": "test", "works": True}
+    vkv[vec2] = [1, 2, 3, 4, 5]
+
+    assert len(vkv) == 2
+
+    # Verify values were stored and auto-decoded
+    result1 = vkv.get(vec1)
+    assert isinstance(result1, dict)
+    assert result1 == {"operator": "test", "works": True}
+
+    result2 = vkv.get(vec2)
+    assert isinstance(result2, list)
+    assert result2 == [1, 2, 3, 4, 5]
+
+
+def test_vector_kvault_getitem_operator(temp_db):
+    """Test __getitem__ operator (value = vkv[vector])"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    vec = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    test_value = {"test": "getitem"}
+
+    vkv.insert(vec, test_value)
+
+    # Use __getitem__ operator (searches for most similar)
+    query = np.array([1.1, 2.1, 3.1, 4.1], dtype=np.float32)
+    result = vkv[query]
+
+    assert isinstance(result, dict)
+    assert result == test_value
+
+
+def test_vector_kvault_getitem_raises_keyerror(temp_db):
+    """Test __getitem__ raises KeyError when no vectors found"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    query = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+
+    # Should raise KeyError, not other exceptions
+    with pytest.raises(KeyError):
+        _ = vkv[query]
+
+
+def test_vector_kvault_dict_like_operators_combined(temp_db):
+    """Test using __setitem__ and __getitem__ together"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    vec = np.array([5.0, 6.0, 7.0, 8.0], dtype=np.float32)
+
+    # Set using operator
+    vkv[vec] = "operator test value"
+
+    # Get using operator (with same vector, should find exact match)
+    result = vkv[vec]
+
+    assert isinstance(result, str)
+    assert result == "operator test value"
+
+
+def test_vector_kvault_enable_disable_auto_pack(temp_db):
+    """Test enable_auto_pack() and disable_auto_pack() (same as KVault)"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    # Should be enabled by default
+    assert vkv.auto_pack_enabled() is True
+
+    # Disable auto-pack
+    vkv.disable_auto_pack()
+    assert vkv.auto_pack_enabled() is False
+
+    # Re-enable
+    vkv.enable_auto_pack()
+    assert vkv.auto_pack_enabled() is True
+
+
+def test_vector_kvault_headers_enabled(temp_db):
+    """Test headers_enabled() (same as KVault)"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    # Should be enabled by default (for auto-packing)
+    assert vkv.headers_enabled() is True
+
+    # Test enable/disable
+    vkv.disable_headers()
+    assert vkv.headers_enabled() is False
+
+    vkv.enable_headers()
+    assert vkv.headers_enabled() is True
+
+
+def test_vector_kvault_mixed_types_same_vault(temp_db):
+    """Test storing different types in same vault (same as KVault)"""
+    vkv = VectorKVault(temp_db, dimensions=4, metric="cosine")
+
+    vec_base = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    # Store different types
+    test_data = [
+        ({"type": "dict"}, dict),
+        ([1, 2, 3], list),
+        (np.array([10, 20, 30], dtype=np.int64), np.ndarray),
+        (42, int),
+        (3.14, float),
+        ("string", str),
+        (b"bytes", bytes),
+    ]
+
+    ids = []
+    for i, (value, expected_type) in enumerate(test_data):
+        vec = vec_base + i
+        id = vkv.insert(vec, value)
+        ids.append((id, expected_type))
+
+    # Retrieve and verify all types
+    for id, expected_type in ids:
+        _, retrieved = vkv.get_by_id(id)
+        assert isinstance(retrieved, expected_type)
 
 
 def test_vector_kvault_dimension_validation(temp_db):

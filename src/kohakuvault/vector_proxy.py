@@ -92,17 +92,6 @@ class VectorKVault:
         else:
             raise TypeError(f"Vector must be numpy array, list, or bytes, got {type(vector)}")
 
-    def _prepare_value(self, value: Any) -> bytes:
-        """Convert value to bytes."""
-        if isinstance(value, bytes):
-            return value
-        elif isinstance(value, bytearray):
-            return bytes(value)
-        elif isinstance(value, str):
-            return value.encode("utf-8")
-        else:
-            raise TypeError(f"Value must be bytes, bytearray, or str, got {type(value)}")
-
     def insert(
         self,
         vector: VectorInput,
@@ -113,7 +102,7 @@ class VectorKVault:
 
         Args:
             vector: Vector as numpy array (preferred), list of floats, or bytes
-            value: Value to store (bytes, str, or bytes-like)
+            value: Value to store (any Python object when auto-pack enabled, bytes otherwise)
             metadata: Optional dict of metadata (not yet supported)
 
         Returns:
@@ -121,8 +110,8 @@ class VectorKVault:
         """
         try:
             vec = self._prepare_vector(vector)
-            val = self._prepare_value(value)
-            return self._vault.insert(vec, val, metadata)
+            # Value is now auto-packed by Rust side
+            return self._vault.insert(vec, value, metadata)
         except Exception as ex:
             raise E.map_exception(ex)
 
@@ -131,7 +120,7 @@ class VectorKVault:
         query_vector: VectorInput,
         k: int = 10,
         metric: Optional[str] = None,
-    ) -> List[Tuple[int, float, bytes]]:
+    ) -> List[Tuple[int, float, Any]]:
         """Search for k-nearest neighbors.
 
         Args:
@@ -141,6 +130,7 @@ class VectorKVault:
 
         Returns:
             List of (id, distance, value) tuples sorted by distance
+            Values are auto-decoded to original Python types
         """
         try:
             vec = self._prepare_vector(query_vector)
@@ -148,7 +138,7 @@ class VectorKVault:
         except Exception as ex:
             raise E.map_exception(ex)
 
-    def get(self, query_vector: VectorInput, metric: Optional[str] = None) -> bytes:
+    def get(self, query_vector: VectorInput, metric: Optional[str] = None) -> Any:
         """Get value for the most similar vector (KVault-like interface).
 
         Args:
@@ -156,7 +146,7 @@ class VectorKVault:
             metric: Override distance metric (optional)
 
         Returns:
-            Value of the most similar vector
+            Value of the most similar vector (auto-decoded to original Python type)
 
         Raises:
             NotFound: If no vectors found in database
@@ -167,7 +157,7 @@ class VectorKVault:
         except Exception as ex:
             raise E.map_exception(ex)
 
-    def get_by_id(self, id: int) -> Tuple[np.ndarray, bytes]:
+    def get_by_id(self, id: int) -> Tuple[np.ndarray, Any]:
         """Get vector and value by ID.
 
         Args:
@@ -175,6 +165,7 @@ class VectorKVault:
 
         Returns:
             (vector, value) tuple where vector is a numpy array
+            Value is auto-decoded to original Python type
 
         Raises:
             NotFound: If ID doesn't exist
@@ -209,15 +200,15 @@ class VectorKVault:
         Args:
             id: Row ID
             vector: New vector as numpy array (preferred), list, or bytes (optional)
-            value: New value (optional)
+            value: New value (any Python object when auto-pack enabled) (optional)
 
         Raises:
             ValueError: If neither vector nor value provided
         """
         try:
             vec = self._prepare_vector(vector) if vector is not None else None
-            val = self._prepare_value(value) if value is not None else None
-            self._vault.update(id, vec, val)
+            # Value is now auto-packed by Rust side
+            self._vault.update(id, vec, value)
         except Exception as ex:
             raise E.map_exception(ex)
 
@@ -256,6 +247,125 @@ class VectorKVault:
             return self._vault.info()
         except Exception as ex:
             raise E.map_exception(ex)
+
+    # ----------------------------
+    # Auto-packing Management (EXACTLY SAME AS KVault)
+    # ----------------------------
+
+    def enable_auto_pack(self, use_pickle: bool = True) -> None:
+        """
+        Enable auto-packing for arbitrary Python objects (DEFAULT ENABLED).
+
+        When enabled, VectorKVault automatically serializes Python objects:
+        - bytes → Raw (no header, media file compatible)
+        - numpy arrays → DataPacker vec:*
+        - int/float → DataPacker i64/f64
+        - dict/list → MessagePack (efficient binary format)
+        - str → DataPacker str:utf8
+        - Custom objects → Pickle (if use_pickle=True)
+
+        Values are automatically decoded on get() - you get back the original
+        Python object, not bytes!
+
+        Parameters
+        ----------
+        use_pickle : bool, default=True
+            Allow pickle for custom objects as last resort
+        """
+        try:
+            self._vault.enable_auto_pack(use_pickle)
+        except Exception as ex:
+            raise E.map_exception(ex)
+
+    def disable_auto_pack(self) -> None:
+        """
+        Disable auto-packing (return to bytes-only mode).
+
+        After disabling, insert() will only accept bytes and get() will
+        return bytes.
+        """
+        try:
+            self._vault.disable_auto_pack()
+        except Exception as ex:
+            raise E.map_exception(ex)
+
+    def auto_pack_enabled(self) -> bool:
+        """
+        Check if auto-packing is currently enabled.
+
+        Returns
+        -------
+        bool
+            True if auto-packing is enabled
+        """
+        try:
+            return self._vault.auto_pack_enabled()
+        except Exception as ex:
+            raise E.map_exception(ex)
+
+    def enable_headers(self) -> None:
+        """Enable header format for new writes."""
+        try:
+            self._vault.enable_headers()
+        except Exception as ex:
+            raise E.map_exception(ex)
+
+    def disable_headers(self) -> None:
+        """Disable header format (return to raw bytes mode)."""
+        try:
+            self._vault.disable_headers()
+        except Exception as ex:
+            raise E.map_exception(ex)
+
+    def headers_enabled(self) -> bool:
+        """Check if headers are enabled."""
+        try:
+            return self._vault.headers_enabled()
+        except Exception as ex:
+            raise E.map_exception(ex)
+
+    # ----------------------------
+    # Dict-like Interface (EXACTLY SAME AS KVault)
+    # ----------------------------
+
+    def __setitem__(self, vector: VectorInput, value: Any) -> None:
+        """
+        Insert vector-value pair using dict-like syntax.
+
+        vkv[embedding] = value
+
+        This is a convenience method that inserts and returns the ID.
+        Note: The ID is not returned, so this is mainly for write-heavy workloads.
+
+        Args:
+            vector: Vector as numpy array (preferred), list, or bytes
+            value: Value to store (any Python object when auto-pack enabled)
+        """
+        self.insert(vector, value)
+
+    def __getitem__(self, query_vector: VectorInput) -> Any:
+        """
+        Get value for most similar vector using dict-like syntax.
+
+        value = vkv[embedding]
+
+        This is equivalent to get(query_vector) - returns the value of the
+        most similar vector (k=1 search).
+
+        Args:
+            query_vector: Query vector as numpy array (preferred), list, or bytes
+
+        Returns:
+            Value of the most similar vector (auto-decoded to original type)
+
+        Raises:
+            KeyError: If no vectors found in database
+        """
+        try:
+            return self.get(query_vector)
+        except (E.NotFound, E.KohakuVaultError) as ex:
+            # Handle both NotFound and RuntimeError from empty database
+            raise KeyError("No vectors found in database") from ex
 
     def __len__(self) -> int:
         """Return count of vectors."""

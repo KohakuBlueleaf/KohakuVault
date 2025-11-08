@@ -10,7 +10,7 @@ impl VectorKVault {
     /// Insert a vector-value pair
     pub fn insert(
         &self,
-        _py: Python<'_>,
+        py: Python<'_>,
         vector: &Bound<'_, PyAny>,
         value: &Bound<'_, PyAny>,
         _metadata: Option<&Bound<'_, pyo3::types::PyDict>>,
@@ -18,8 +18,22 @@ impl VectorKVault {
         // Convert vector to blob
         let vector_blob = self.prepare_vector_blob(vector)?;
 
-        // Convert value to bytes
-        let value_bytes = self.extract_bytes(value)?;
+        // Convert value to bytes using auto-packing (EXACTLY SAME AS KVault)
+        let value_bytes = {
+            let auto_pack_guard = self.auto_packer.lock();
+            if let Some(ref packer) = *auto_pack_guard {
+                // Auto-pack mode: serialize automatically
+                let (serialized_bytes, encoding) = packer.serialize(py, value)?;
+                drop(auto_pack_guard);
+
+                // Add header if encoding is not Raw
+                self.encode_value(&serialized_bytes, encoding)
+            } else {
+                // Legacy mode: must be bytes
+                drop(auto_pack_guard);
+                self.extract_bytes(value)?
+            }
+        };
 
         let conn = self.conn.lock();
 
@@ -46,7 +60,7 @@ impl VectorKVault {
     }
 
     /// Get vector and value by ID
-    pub fn get_by_id(&self, py: Python<'_>, id: i64) -> PyResult<(Py<PyBytes>, Py<PyBytes>)> {
+    pub fn get_by_id(&self, py: Python<'_>, id: i64) -> PyResult<(Py<PyBytes>, PyObject)> {
         let conn = self.conn.lock();
 
         let sql = format!(
@@ -63,9 +77,12 @@ impl VectorKVault {
             .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
 
         match result {
-            Some((vector, value)) => {
+            Some((vector, value_bytes)) => {
                 let vector_py = PyBytes::new_bound(py, &vector).unbind();
-                let value_py = PyBytes::new_bound(py, &value).unbind();
+
+                // Auto-decode value (EXACTLY SAME AS KVault)
+                let value_py = self.decode_and_deserialize(py, &value_bytes)?;
+
                 Ok((vector_py, value_py))
             }
             None => Err(PyRuntimeError::new_err(format!("ID {} not found", id))),
@@ -105,6 +122,7 @@ impl VectorKVault {
     /// Update vector or value by ID
     pub fn update(
         &self,
+        py: Python<'_>,
         id: i64,
         vector: Option<&Bound<'_, PyAny>>,
         value: Option<&Bound<'_, PyAny>>,
@@ -127,7 +145,22 @@ impl VectorKVault {
 
         // Update value if provided
         if let Some(val) = value {
-            let value_bytes = self.extract_bytes(val)?;
+            // Convert value to bytes using auto-packing (EXACTLY SAME AS KVault)
+            let value_bytes = {
+                let auto_pack_guard = self.auto_packer.lock();
+                if let Some(ref packer) = *auto_pack_guard {
+                    // Auto-pack mode: serialize automatically
+                    let (serialized_bytes, encoding) = packer.serialize(py, val)?;
+                    drop(auto_pack_guard);
+
+                    // Add header if encoding is not Raw
+                    self.encode_value(&serialized_bytes, encoding)
+                } else {
+                    // Legacy mode: must be bytes
+                    drop(auto_pack_guard);
+                    self.extract_bytes(val)?
+                }
+            };
 
             // Get value_ref
             let value_ref: i64 = conn

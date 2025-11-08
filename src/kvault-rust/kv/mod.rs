@@ -10,13 +10,13 @@
 //! - Optional header system for encoding type detection
 //! - Auto-packing for arbitrary Python objects
 
-mod autopacker;
+pub(crate) mod autopacker;
 mod encoding;
-mod header;
+pub(crate) mod header;
 mod ops;
 mod stream;
 
-use autopacker::AutoPacker;
+pub(crate) use autopacker::AutoPacker;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

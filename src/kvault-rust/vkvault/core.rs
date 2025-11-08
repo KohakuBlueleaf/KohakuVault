@@ -1,5 +1,7 @@
 //! Core VectorKVault struct and initialization
 
+use crate::kv::autopacker::AutoPacker;
+use crate::kv::header::EncodingType;
 use crate::vector_utils::{normalize_l2, py_to_vec_f32, vec_f32_to_blob, VectorType};
 use crate::vkvault::metrics::SimilarityMetric;
 use parking_lot::Mutex;
@@ -7,6 +9,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use rusqlite::Connection;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// VectorKVault - Vector similarity search with arbitrary values
 ///
@@ -17,6 +20,8 @@ pub struct VectorKVault {
     pub(crate) dimensions: usize,
     pub(crate) metric: SimilarityMetric,
     pub(crate) vector_type: VectorType,
+    pub(crate) use_headers: AtomicBool, // Enable header format for new writes
+    pub(crate) auto_packer: Mutex<Option<AutoPacker>>, // Auto-packing for arbitrary objects
 }
 
 impl VectorKVault {
@@ -68,6 +73,8 @@ impl VectorKVault {
             dimensions,
             metric,
             vector_type: vec_type,
+            use_headers: AtomicBool::new(true), // DEFAULT: headers enabled for auto-packing
+            auto_packer: Mutex::new(Some(AutoPacker::new(true))), // DEFAULT: auto-pack enabled
         };
 
         vkv.create_tables()?;
@@ -194,5 +201,119 @@ impl VectorKVault {
             .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
 
         Ok(count > 0)
+    }
+
+    /// Encode value with header if headers are enabled and encoding is not Raw
+    ///
+    /// Exactly same behavior as KVault:
+    /// - If headers disabled: return raw bytes
+    /// - If headers enabled AND encoding is Raw: return raw bytes
+    /// - If headers enabled AND encoding is not Raw: prepend header
+    pub(crate) fn encode_value(&self, data: &[u8], encoding: EncodingType) -> Vec<u8> {
+        let use_headers = self.use_headers.load(Ordering::Relaxed);
+
+        if !use_headers || encoding == EncodingType::Raw {
+            // Keep raw bytes as-is (no header)
+            data.to_vec()
+        } else {
+            // Add header for encoded data
+            use crate::kv::header::{Header, HEADER_SIZE};
+            let header = Header::new(encoding);
+            let mut result = Vec::with_capacity(HEADER_SIZE + data.len());
+            result.extend_from_slice(&header.encode());
+            result.extend_from_slice(data);
+            result
+        }
+    }
+
+    /// Decode value, stripping header if present
+    ///
+    /// Returns: (data, Option<Header>)
+    /// - If no header: returns (original_bytes, None)
+    /// - If header: returns (data_without_header, Some(header))
+    pub(crate) fn decode_value(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(Vec<u8>, Option<crate::kv::header::Header>), String> {
+        use crate::kv::header::{Header, HEADER_SIZE};
+
+        match Header::decode(bytes)? {
+            Some(header) => {
+                if bytes.len() < HEADER_SIZE {
+                    return Err("Value too short for header".to_string());
+                }
+                Ok((bytes[HEADER_SIZE..].to_vec(), Some(header)))
+            }
+            None => {
+                // No header, return original bytes
+                Ok((bytes.to_vec(), None))
+            }
+        }
+    }
+
+    /// Enable auto-packing (allows arbitrary Python objects as values)
+    pub fn enable_auto_pack(&self, use_pickle: bool) -> PyResult<()> {
+        let mut guard = self.auto_packer.lock();
+        *guard = Some(AutoPacker::new(use_pickle));
+
+        // Also enable headers (required for auto-pack)
+        self.use_headers.store(true, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Disable auto-packing (return to bytes-only mode)
+    pub fn disable_auto_pack(&self) {
+        let mut guard = self.auto_packer.lock();
+        *guard = None;
+    }
+
+    /// Check if auto-packing is enabled
+    pub fn auto_pack_enabled(&self) -> bool {
+        self.auto_packer.lock().is_some()
+    }
+
+    /// Enable header format for new writes
+    pub fn enable_headers(&self) {
+        self.use_headers.store(true, Ordering::Relaxed);
+    }
+
+    /// Disable header format (return to raw bytes mode)
+    pub fn disable_headers(&self) {
+        self.use_headers.store(false, Ordering::Relaxed);
+    }
+
+    /// Check if headers are enabled
+    pub fn headers_enabled(&self) -> bool {
+        self.use_headers.load(Ordering::Relaxed)
+    }
+
+    /// Decode and deserialize value (EXACTLY SAME AS KVault)
+    ///
+    /// This method auto-decodes based on header if auto-pack is enabled
+    pub(crate) fn decode_and_deserialize(&self, py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
+        // Check if auto-pack is enabled for auto-decoding
+        let has_auto_pack = self.auto_packer.lock().is_some();
+
+        if has_auto_pack {
+            // Auto-decode based on header
+            let (decoded_data, header) = self
+                .decode_value(data)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+            if let Some(h) = header {
+                // Has header - auto-decode based on encoding type
+                let auto_pack_guard = self.auto_packer.lock();
+                if let Some(ref packer) = *auto_pack_guard {
+                    return packer.deserialize(py, &decoded_data, h.encoding);
+                }
+            }
+
+            // No header - return raw bytes
+            Ok(PyBytes::new_bound(py, data).into())
+        } else {
+            // Auto-pack disabled - always return raw bytes
+            Ok(PyBytes::new_bound(py, data).into())
+        }
     }
 }

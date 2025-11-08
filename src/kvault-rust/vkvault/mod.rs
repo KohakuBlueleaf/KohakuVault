@@ -79,7 +79,7 @@ impl _VectorKVault {
     ///     metric: Override distance metric (optional)
     ///
     /// Returns:
-    ///     List of (id, distance, value) tuples
+    ///     List of (id, distance, value) tuples (values are auto-decoded)
     #[pyo3(signature = (query_vector, k=10, metric=None))]
     fn search(
         &self,
@@ -87,7 +87,7 @@ impl _VectorKVault {
         query_vector: &Bound<'_, PyAny>,
         k: usize,
         metric: Option<&str>,
-    ) -> PyResult<Vec<(i64, f32, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<(i64, f32, PyObject)>> {
         self.inner.search(py, query_vector, k, metric)
     }
 
@@ -98,7 +98,7 @@ impl _VectorKVault {
     ///     metric: Override distance metric (optional)
     ///
     /// Returns:
-    ///     bytes: Value of the most similar vector
+    ///     Value of the most similar vector (auto-decoded)
     ///
     /// Raises:
     ///     RuntimeError: If no vectors found
@@ -108,7 +108,7 @@ impl _VectorKVault {
         py: Python<'_>,
         query_vector: &Bound<'_, PyAny>,
         metric: Option<&str>,
-    ) -> PyResult<Py<PyBytes>> {
+    ) -> PyResult<PyObject> {
         self.inner.get(py, query_vector, metric)
     }
 
@@ -118,9 +118,9 @@ impl _VectorKVault {
     ///     id: Row ID
     ///
     /// Returns:
-    ///     (vector, value) tuple
+    ///     (vector, value) tuple (value is auto-decoded)
     #[pyo3(signature = (id))]
-    fn get_by_id(&self, py: Python<'_>, id: i64) -> PyResult<(Py<PyBytes>, Py<PyBytes>)> {
+    fn get_by_id(&self, py: Python<'_>, id: i64) -> PyResult<(Py<PyBytes>, PyObject)> {
         self.inner.get_by_id(py, id)
     }
 
@@ -142,11 +142,12 @@ impl _VectorKVault {
     #[pyo3(signature = (id, vector=None, value=None))]
     fn update(
         &self,
+        py: Python<'_>,
         id: i64,
         vector: Option<&Bound<'_, PyAny>>,
         value: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        self.inner.update(id, vector, value)
+        self.inner.update(py, id, vector, value)
     }
 
     /// Check if ID exists
@@ -175,6 +176,53 @@ impl _VectorKVault {
     ///     dict: Table info (dimensions, metric, vector_type, count)
     fn info(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         self.inner.info(py)
+    }
+
+    /// Enable auto-packing (allows arbitrary Python objects as values)
+    ///
+    /// When enabled, VectorKVault automatically serializes Python objects:
+    /// - numpy arrays → DataPacker vec:*
+    /// - dicts/lists → MessagePack
+    /// - int/float → DataPacker i64/f64
+    /// - bytes → Raw (no header)
+    /// - Custom objects → Pickle (if use_pickle=True)
+    ///
+    /// Args:
+    ///     use_pickle: Allow pickle for custom objects as last resort (default: True)
+    #[pyo3(signature = (use_pickle=true))]
+    fn enable_auto_pack(&self, use_pickle: bool) -> PyResult<()> {
+        self.inner.enable_auto_pack(use_pickle)
+    }
+
+    /// Disable auto-packing (return to bytes-only mode)
+    fn disable_auto_pack(&self) {
+        self.inner.disable_auto_pack()
+    }
+
+    /// Check if auto-packing is enabled
+    ///
+    /// Returns:
+    ///     bool: True if auto-packing is enabled
+    fn auto_pack_enabled(&self) -> bool {
+        self.inner.auto_pack_enabled()
+    }
+
+    /// Enable header format for new writes
+    fn enable_headers(&self) {
+        self.inner.enable_headers()
+    }
+
+    /// Disable header format (return to raw bytes mode)
+    fn disable_headers(&self) {
+        self.inner.disable_headers()
+    }
+
+    /// Check if headers are enabled
+    ///
+    /// Returns:
+    ///     bool: True if headers are enabled
+    fn headers_enabled(&self) -> bool {
+        self.inner.headers_enabled()
     }
 }
 

@@ -4,7 +4,6 @@ use crate::vkvault::core::VectorKVault;
 use crate::vkvault::metrics::SimilarityMetric;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 use rusqlite::params;
 
 impl VectorKVault {
@@ -15,7 +14,7 @@ impl VectorKVault {
         query_vector: &Bound<'_, PyAny>,
         k: usize,
         metric: Option<&str>,
-    ) -> PyResult<Vec<(i64, f32, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<(i64, f32, PyObject)>> {
         let query_blob = self.prepare_vector_blob(query_vector)?;
 
         let metric = if let Some(m) = metric {
@@ -60,10 +59,12 @@ impl VectorKVault {
 
         let mut output = Vec::new();
         for result in results {
-            let (id, distance, value) = result
+            let (id, distance, value_bytes) = result
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to read row: {}", e)))?;
-            let py_bytes = PyBytes::new_bound(py, &value).unbind();
-            output.push((id, distance, py_bytes));
+
+            // Auto-decode value (EXACTLY SAME AS KVault)
+            let decoded_value = self.decode_and_deserialize(py, &value_bytes)?;
+            output.push((id, distance, decoded_value));
         }
 
         Ok(output)
@@ -75,7 +76,7 @@ impl VectorKVault {
         py: Python<'_>,
         query_vector: &Bound<'_, PyAny>,
         metric: Option<&str>,
-    ) -> PyResult<Py<PyBytes>> {
+    ) -> PyResult<PyObject> {
         let results = self.search(py, query_vector, 1, metric)?;
 
         if results.is_empty() {
