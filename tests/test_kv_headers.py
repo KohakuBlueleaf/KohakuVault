@@ -58,10 +58,10 @@ def test_raw_bytes_no_header_even_when_enabled():
 
     # Put raw bytes - should still be stored without header
     # This ensures media files can be previewed by external tools
-    kv["image.jpg"] = b"\xFF\xD8\xFF\xE0"  # JPEG magic bytes
+    kv["image.jpg"] = b"\xff\xd8\xff\xe0"  # JPEG magic bytes
 
     value = kv["image.jpg"]
-    assert value == b"\xFF\xD8\xFF\xE0"
+    assert value == b"\xff\xd8\xff\xe0"
     # Should NOT have KohakuVault header
     assert not value.startswith(b"\x89K")
 
@@ -109,6 +109,7 @@ def test_meta_table_created():
 
         # Check that meta table exists
         import sqlite3
+
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
@@ -141,12 +142,11 @@ def test_feature_registration():
 
         # Check meta table has the feature registered
         import sqlite3
+
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
-        cursor.execute(
-            "SELECT value FROM kohakuvault_meta WHERE key='kv_features'"
-        )
+        cursor.execute("SELECT value FROM kohakuvault_meta WHERE key='kv_features'")
         result = cursor.fetchone()
 
         assert result is not None
@@ -169,10 +169,9 @@ def test_backward_compatibility_with_old_db():
     try:
         # Create old-style database (just the kv table, no meta)
         import sqlite3
+
         conn = sqlite3.connect(db_path)
-        conn.execute(
-            "CREATE TABLE kv (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL)"
-        )
+        conn.execute("CREATE TABLE kv (key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL)")
         conn.execute("INSERT INTO kv (key, value) VALUES (?, ?)", (b"key1", b"value1"))
         conn.commit()
         conn.close()

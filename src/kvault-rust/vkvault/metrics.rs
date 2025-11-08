@@ -18,10 +18,7 @@ impl SimilarityMetric {
             "l2" | "euclidean" => Ok(SimilarityMetric::L2),
             "l1" | "manhattan" => Ok(SimilarityMetric::L1),
             "hamming" => Ok(SimilarityMetric::Hamming),
-            _ => Err(format!(
-                "Unknown metric '{}'. Expected: cosine, l2, l1, or hamming",
-                s
-            )),
+            _ => Err(format!("Unknown metric '{}'. Expected: cosine, l2, l1, or hamming", s)),
         }
     }
 

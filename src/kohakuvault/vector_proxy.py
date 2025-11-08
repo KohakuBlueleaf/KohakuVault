@@ -90,9 +90,7 @@ class VectorKVault:
             arr = np.frombuffer(vector, dtype=np.float32, count=num_floats)
             return arr.tolist()
         else:
-            raise TypeError(
-                f"Vector must be numpy array, list, or bytes, got {type(vector)}"
-            )
+            raise TypeError(f"Vector must be numpy array, list, or bytes, got {type(vector)}")
 
     def _prepare_value(self, value: Any) -> bytes:
         """Convert value to bytes."""
@@ -103,9 +101,7 @@ class VectorKVault:
         elif isinstance(value, str):
             return value.encode("utf-8")
         else:
-            raise TypeError(
-                f"Value must be bytes, bytearray, or str, got {type(value)}"
-            )
+            raise TypeError(f"Value must be bytes, bytearray, or str, got {type(value)}")
 
     def insert(
         self,

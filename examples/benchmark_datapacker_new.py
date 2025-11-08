@@ -81,15 +81,17 @@ def benchmark_primitives(n_ops=10000):
     _ = packer_i64.unpack_many(packed_all, count=n_ops)
     i64_unpack_bulk_time = time.perf_counter() - start
 
-    results.append({
-        "type": "i64",
-        "pack_loop": i64_loop_time,
-        "pack_bulk": i64_bulk_time,
-        "pack_speedup": i64_loop_time / i64_bulk_time,
-        "unpack_loop": i64_unpack_loop_time,
-        "unpack_bulk": i64_unpack_bulk_time,
-        "unpack_speedup": i64_unpack_loop_time / i64_unpack_bulk_time,
-    })
+    results.append(
+        {
+            "type": "i64",
+            "pack_loop": i64_loop_time,
+            "pack_bulk": i64_bulk_time,
+            "pack_speedup": i64_loop_time / i64_bulk_time,
+            "unpack_loop": i64_unpack_loop_time,
+            "unpack_bulk": i64_unpack_bulk_time,
+            "unpack_speedup": i64_unpack_loop_time / i64_unpack_bulk_time,
+        }
+    )
 
     # Test f64
     print(f"Benchmarking f64 ({n_ops:,} operations)...")
@@ -119,18 +121,22 @@ def benchmark_primitives(n_ops=10000):
     _ = packer_f64.unpack_many(packed_all, count=n_ops)
     f64_unpack_bulk_time = time.perf_counter() - start
 
-    results.append({
-        "type": "f64",
-        "pack_loop": f64_loop_time,
-        "pack_bulk": f64_bulk_time,
-        "pack_speedup": f64_loop_time / f64_bulk_time,
-        "unpack_loop": f64_unpack_loop_time,
-        "unpack_bulk": f64_unpack_bulk_time,
-        "unpack_speedup": f64_unpack_loop_time / f64_unpack_bulk_time,
-    })
+    results.append(
+        {
+            "type": "f64",
+            "pack_loop": f64_loop_time,
+            "pack_bulk": f64_bulk_time,
+            "pack_speedup": f64_loop_time / f64_bulk_time,
+            "unpack_loop": f64_unpack_loop_time,
+            "unpack_bulk": f64_unpack_bulk_time,
+            "unpack_speedup": f64_unpack_loop_time / f64_unpack_bulk_time,
+        }
+    )
 
     # Print results
-    print(f"\n{'Type':<10s} {'Pack Loop':<15s} {'Pack Bulk':<15s} {'Speedup':<12s} {'Unpack Loop':<15s} {'Unpack Bulk':<15s} {'Speedup':<12s}")
+    print(
+        f"\n{'Type':<10s} {'Pack Loop':<15s} {'Pack Bulk':<15s} {'Speedup':<12s} {'Unpack Loop':<15s} {'Unpack Bulk':<15s} {'Speedup':<12s}"
+    )
     print("-" * 110)
     for r in results:
         print(
@@ -179,7 +185,10 @@ def benchmark_vectors(n_ops=10000):
                 shape = tuple(int(d) for d in dims_str.split(":"))
                 data = [np.random.randint(0, 256, size=shape, dtype=np.uint8) for _ in range(n_ops)]
             else:
-                data = [np.random.randint(0, 256, size=dim_or_total, dtype=np.uint8) for _ in range(n_ops)]
+                data = [
+                    np.random.randint(0, 256, size=dim_or_total, dtype=np.uint8)
+                    for _ in range(n_ops)
+                ]
         elif "i64" in dtype:
             data = [np.arange(dim_or_total, dtype=np.int64) for _ in range(n_ops)]
         elif "f32" in dtype:
@@ -203,19 +212,23 @@ def benchmark_vectors(n_ops=10000):
         sample_packed = packed_items[0]
         packed_size = len(sample_packed)
 
-        results.append({
-            "label": label,
-            "dtype": dtype,
-            "pack_time": pack_time,
-            "unpack_time": unpack_time,
-            "pack_ops": n_ops / pack_time,
-            "unpack_ops": n_ops / unpack_time,
-            "packed_size": packed_size,
-            "is_varsize": packer.is_varsize,
-        })
+        results.append(
+            {
+                "label": label,
+                "dtype": dtype,
+                "pack_time": pack_time,
+                "unpack_time": unpack_time,
+                "pack_ops": n_ops / pack_time,
+                "unpack_ops": n_ops / unpack_time,
+                "packed_size": packed_size,
+                "is_varsize": packer.is_varsize,
+            }
+        )
 
     # Print results
-    print(f"\n{'Type':<30s} {'Size':<15s} {'Pack':<15s} {'Unpack':<15s} {'Pack/s':<15s} {'Unpack/s':<15s}")
+    print(
+        f"\n{'Type':<30s} {'Size':<15s} {'Pack':<15s} {'Unpack':<15s} {'Pack/s':<15s} {'Unpack/s':<15s}"
+    )
     print("-" * 105)
     for r in results:
         varsize_marker = " (varsize)" if r["is_varsize"] else ""
@@ -282,18 +295,22 @@ def benchmark_vector_bulk(n_ops=10000):
         _ = packer.unpack_many(packed_bulk, count=n_ops)
         unpack_bulk_time = time.perf_counter() - start
 
-        results.append({
-            "label": label,
-            "pack_loop_time": pack_loop_time,
-            "pack_bulk_time": pack_bulk_time,
-            "unpack_loop_time": unpack_loop_time,
-            "unpack_bulk_time": unpack_bulk_time,
-            "pack_speedup": pack_loop_time / pack_bulk_time,
-            "unpack_speedup": unpack_loop_time / unpack_bulk_time,
-        })
+        results.append(
+            {
+                "label": label,
+                "pack_loop_time": pack_loop_time,
+                "pack_bulk_time": pack_bulk_time,
+                "unpack_loop_time": unpack_loop_time,
+                "unpack_bulk_time": unpack_bulk_time,
+                "pack_speedup": pack_loop_time / pack_bulk_time,
+                "unpack_speedup": unpack_loop_time / unpack_bulk_time,
+            }
+        )
 
     # Print results
-    print(f"\n{'Type':<20s} {'Pack Loop':<15s} {'Pack Bulk':<15s} {'Speedup':<12s} {'Unpack Loop':<15s} {'Unpack Bulk':<15s} {'Speedup':<12s}")
+    print(
+        f"\n{'Type':<20s} {'Pack Loop':<15s} {'Pack Bulk':<15s} {'Speedup':<12s} {'Unpack Loop':<15s} {'Unpack Bulk':<15s} {'Speedup':<12s}"
+    )
     print("-" * 110)
     for r in results:
         print(
@@ -347,14 +364,16 @@ def benchmark_structured(n_ops=10000):
 
     json_size = len(json_bytes)
 
-    results.append({
-        "type": "JSON (Python)",
-        "pack_time": json_pack_time,
-        "unpack_time": json_unpack_time,
-        "pack_ops": n_ops / json_pack_time,
-        "unpack_ops": n_ops / json_unpack_time,
-        "size": json_size,
-    })
+    results.append(
+        {
+            "type": "JSON (Python)",
+            "pack_time": json_pack_time,
+            "unpack_time": json_unpack_time,
+            "pack_ops": n_ops / json_pack_time,
+            "unpack_ops": n_ops / json_unpack_time,
+            "size": json_size,
+        }
+    )
 
     # MessagePack
     print(f"Benchmarking MessagePack ({n_ops:,} operations)...")
@@ -373,14 +392,16 @@ def benchmark_structured(n_ops=10000):
 
     msgpack_size = len(packed_msgpack)
 
-    results.append({
-        "type": "MessagePack (Rust)",
-        "pack_time": msgpack_pack_time,
-        "unpack_time": msgpack_unpack_time,
-        "pack_ops": n_ops / msgpack_pack_time,
-        "unpack_ops": n_ops / msgpack_unpack_time,
-        "size": msgpack_size,
-    })
+    results.append(
+        {
+            "type": "MessagePack (Rust)",
+            "pack_time": msgpack_pack_time,
+            "unpack_time": msgpack_unpack_time,
+            "pack_ops": n_ops / msgpack_pack_time,
+            "unpack_ops": n_ops / msgpack_unpack_time,
+            "size": msgpack_size,
+        }
+    )
 
     # CBOR
     print(f"Benchmarking CBOR ({n_ops:,} operations)...")
@@ -399,17 +420,21 @@ def benchmark_structured(n_ops=10000):
 
     cbor_size = len(packed_cbor)
 
-    results.append({
-        "type": "CBOR (Rust)",
-        "pack_time": cbor_pack_time,
-        "unpack_time": cbor_unpack_time,
-        "pack_ops": n_ops / cbor_pack_time,
-        "unpack_ops": n_ops / cbor_unpack_time,
-        "size": cbor_size,
-    })
+    results.append(
+        {
+            "type": "CBOR (Rust)",
+            "pack_time": cbor_pack_time,
+            "unpack_time": cbor_unpack_time,
+            "pack_ops": n_ops / cbor_pack_time,
+            "unpack_ops": n_ops / cbor_unpack_time,
+            "size": cbor_size,
+        }
+    )
 
     # Print results
-    print(f"\n{'Type':<25s} {'Size':<10s} {'Pack':<15s} {'Unpack':<15s} {'Pack/s':<15s} {'Unpack/s':<15s}")
+    print(
+        f"\n{'Type':<25s} {'Size':<10s} {'Pack':<15s} {'Unpack':<15s} {'Pack/s':<15s} {'Unpack/s':<15s}"
+    )
     print("-" * 95)
     for r in results:
         print(
@@ -428,7 +453,11 @@ def benchmark_structured(n_ops=10000):
 
     print(f"\nMessagePack vs JSON:")
     print(f"  Size reduction: {100 * msgpack_size / json_size:.1f}% of JSON size")
-    print(f"  Pack speedup: {msgpack_speedup:.2f}x faster" if msgpack_speedup > 1 else f"  Pack: {1/msgpack_speedup:.2f}x slower")
+    print(
+        f"  Pack speedup: {msgpack_speedup:.2f}x faster"
+        if msgpack_speedup > 1
+        else f"  Pack: {1/msgpack_speedup:.2f}x slower"
+    )
 
 
 # =============================================================================
@@ -470,17 +499,21 @@ def benchmark_strings(n_ops=10000):
             _ = packer.unpack(packed, 0)
         unpack_time = time.perf_counter() - start
 
-        results.append({
-            "label": label,
-            "pack_time": pack_time,
-            "unpack_time": unpack_time,
-            "size": len(packed),
-            "pack_ops": n_ops / pack_time,
-            "unpack_ops": n_ops / unpack_time,
-        })
+        results.append(
+            {
+                "label": label,
+                "pack_time": pack_time,
+                "unpack_time": unpack_time,
+                "size": len(packed),
+                "pack_ops": n_ops / pack_time,
+                "unpack_ops": n_ops / unpack_time,
+            }
+        )
 
     # Print results
-    print(f"\n{'Encoding':<25s} {'Size':<10s} {'Pack':<15s} {'Unpack':<15s} {'Pack/s':<15s} {'Unpack/s':<15s}")
+    print(
+        f"\n{'Encoding':<25s} {'Size':<10s} {'Pack':<15s} {'Unpack':<15s} {'Pack/s':<15s} {'Unpack/s':<15s}"
+    )
     print("-" * 95)
     for r in results:
         print(
@@ -532,18 +565,22 @@ def benchmark_vector_scaling(dimensions_list: List[int] = None):
         pack_mb_per_sec = (total_bytes / (1024 * 1024)) / pack_time
         unpack_mb_per_sec = (total_bytes / (1024 * 1024)) / unpack_time
 
-        results.append({
-            "dims": dims,
-            "pack_time": pack_time,
-            "unpack_time": unpack_time,
-            "pack_ops": n_ops / pack_time,
-            "unpack_ops": n_ops / unpack_time,
-            "pack_mb_s": pack_mb_per_sec,
-            "unpack_mb_s": unpack_mb_per_sec,
-        })
+        results.append(
+            {
+                "dims": dims,
+                "pack_time": pack_time,
+                "unpack_time": unpack_time,
+                "pack_ops": n_ops / pack_time,
+                "unpack_ops": n_ops / unpack_time,
+                "pack_mb_s": pack_mb_per_sec,
+                "unpack_mb_s": unpack_mb_per_sec,
+            }
+        )
 
     # Print results
-    print(f"\n{'Dims':<10s} {'Pack':<15s} {'Unpack':<15s} {'Pack/s':<15s} {'Unpack/s':<15s} {'Pack MB/s':<15s} {'Unpack MB/s':<15s}")
+    print(
+        f"\n{'Dims':<10s} {'Pack':<15s} {'Unpack':<15s} {'Pack/s':<15s} {'Unpack/s':<15s} {'Pack MB/s':<15s} {'Unpack MB/s':<15s}"
+    )
     print("-" * 110)
     for r in results:
         print(
@@ -586,13 +623,15 @@ def benchmark_overhead():
         overhead = len(packed) - data_size
         overhead_pct = 100 * overhead / data_size
 
-        results.append({
-            "label": label,
-            "total_size": len(packed),
-            "data_size": data_size,
-            "overhead": overhead,
-            "overhead_pct": overhead_pct,
-        })
+        results.append(
+            {
+                "label": label,
+                "total_size": len(packed),
+                "data_size": data_size,
+                "overhead": overhead,
+                "overhead_pct": overhead_pct,
+            }
+        )
 
     # Print results
     print(f"\n{'Format':<30s} {'Total':<12s} {'Data':<12s} {'Overhead':<12s} {'Overhead %':<12s}")
@@ -681,6 +720,7 @@ Examples:
     except Exception as e:
         print(f"\nError during benchmark: {e}")
         import traceback
+
         traceback.print_exc()
 
 

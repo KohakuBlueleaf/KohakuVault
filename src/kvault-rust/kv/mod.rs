@@ -14,7 +14,6 @@ mod header;
 mod ops;
 mod stream;
 
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -22,7 +21,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use rusqlite::{params, Connection};
 
-use crate::common::{checkpoint_wal, open_connection, meta::MetaTable, VaultError, WriteBackCache};
+use crate::common::{checkpoint_wal, meta::MetaTable, open_connection, VaultError, WriteBackCache};
 
 /// Main KVault struct exposed to Python.
 /// Provides a dict-like interface for key-value storage.

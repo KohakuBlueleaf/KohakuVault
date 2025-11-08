@@ -2,8 +2,8 @@
 //!
 //! Provides methods to encode/decode values with optional headers.
 
-use super::header::{EncodingType, Header, HEADER_SIZE};
 use super::_KVault;
+use super::header::{EncodingType, Header, HEADER_SIZE};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::atomic::Ordering;
@@ -16,11 +16,7 @@ impl _KVault {
     /// - If headers enabled AND encoding is Raw: return raw bytes (for media file compat)
     /// - If headers enabled AND encoding is not Raw: prepend header
     #[allow(dead_code)] // Used in Phase 3 (auto-packing)
-    pub(crate) fn encode_value(
-        &self,
-        data: &[u8],
-        encoding: EncodingType,
-    ) -> Vec<u8> {
+    pub(crate) fn encode_value(&self, data: &[u8], encoding: EncodingType) -> Vec<u8> {
         let use_headers = self.use_headers.load(Ordering::Relaxed);
 
         if !use_headers || encoding == EncodingType::Raw {
@@ -43,10 +39,7 @@ impl _KVault {
     /// - If no header: returns (original_bytes, None)
     /// - If header: returns (data_without_header, Some(header))
     #[allow(dead_code)] // Used in Phase 3 (auto-unpacking)
-    pub(crate) fn decode_value(
-        &self,
-        bytes: &[u8],
-    ) -> Result<(Vec<u8>, Option<Header>), String> {
+    pub(crate) fn decode_value(&self, bytes: &[u8]) -> Result<(Vec<u8>, Option<Header>), String> {
         match Header::decode(bytes)? {
             Some(header) => {
                 if bytes.len() < HEADER_SIZE {

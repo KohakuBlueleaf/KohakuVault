@@ -32,7 +32,7 @@ pub fn pack_many_vectors_fixed(
     // Calculate sizes
     let elem_count: usize = shape.iter().product();
     let data_bytes_per_vec = elem_count * element_type.byte_size();
-    let total_size = count * (1 + data_bytes_per_vec);  // type(1) + data per vector
+    let total_size = count * (1 + data_bytes_per_vec); // type(1) + data per vector
 
     let mut result = Vec::with_capacity(total_size);
     let type_byte = element_type as u8;
@@ -104,7 +104,7 @@ pub fn unpack_many_vectors_fixed(
     // Calculate sizes
     let elem_count: usize = shape.iter().product();
     let data_bytes_per_vec = elem_count * element_type.byte_size();
-    let bytes_per_vec = 1 + data_bytes_per_vec;  // type(1) + data
+    let bytes_per_vec = 1 + data_bytes_per_vec; // type(1) + data
 
     let expected_size = count * bytes_per_vec;
     if data.len() < expected_size {
@@ -127,9 +127,7 @@ pub fn unpack_many_vectors_fixed(
         if type_byte != element_type as u8 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Type mismatch at vector {}: expected {}, got {}",
-                i,
-                element_type as u8,
-                type_byte
+                i, element_type as u8, type_byte
             )));
         }
 
@@ -139,10 +137,8 @@ pub fn unpack_many_vectors_fixed(
         let vec_data = &data[data_start..data_end];
 
         // Use numpy.frombuffer for efficient conversion
-        let array = numpy.call_method1(
-            "frombuffer",
-            (PyBytes::new_bound(py, vec_data), dtype_str)
-        )?;
+        let array =
+            numpy.call_method1("frombuffer", (PyBytes::new_bound(py, vec_data), dtype_str))?;
 
         // Reshape if multi-dimensional
         let final_array = if shape.len() > 1 {

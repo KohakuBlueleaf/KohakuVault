@@ -26,10 +26,7 @@ impl VectorKVault {
         // Insert value into blob table
         let value_id: i64 = conn
             .query_row(
-                &format!(
-                    "INSERT INTO {}_values (value) VALUES (?) RETURNING id",
-                    &self.table
-                ),
+                &format!("INSERT INTO {}_values (value) VALUES (?) RETURNING id", &self.table),
                 params![value_bytes],
                 |row| row.get(0),
             )
@@ -37,10 +34,7 @@ impl VectorKVault {
 
         // Insert vector into vec0 table
         conn.execute(
-            &format!(
-                "INSERT INTO {} (vector, value_ref) VALUES (?, ?)",
-                &self.table
-            ),
+            &format!("INSERT INTO {} (vector, value_ref) VALUES (?, ?)", &self.table),
             params![vector_blob, value_id],
         )
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to insert vector: {}", e)))?;
@@ -64,9 +58,7 @@ impl VectorKVault {
         );
 
         let result: Option<(Vec<u8>, Vec<u8>)> = conn
-            .query_row(&sql, params![id], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+            .query_row(&sql, params![id], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()
             .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
 
@@ -96,11 +88,8 @@ impl VectorKVault {
 
         if let Some(value_id) = value_ref {
             // Delete from vec0 table
-            conn.execute(
-                &format!("DELETE FROM {} WHERE rowid = ?", &self.table),
-                params![id],
-            )
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete vector: {}", e)))?;
+            conn.execute(&format!("DELETE FROM {} WHERE rowid = ?", &self.table), params![id])
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete vector: {}", e)))?;
 
             // Delete from values table
             conn.execute(
@@ -121,9 +110,7 @@ impl VectorKVault {
         value: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         if vector.is_none() && value.is_none() {
-            return Err(PyValueError::new_err(
-                "Must provide either vector or value to update",
-            ));
+            return Err(PyValueError::new_err("Must provide either vector or value to update"));
         }
 
         let conn = self.conn.lock();

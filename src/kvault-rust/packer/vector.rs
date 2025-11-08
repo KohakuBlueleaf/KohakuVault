@@ -154,8 +154,9 @@ pub fn unpack_vector(
     let mut pos = offset;
 
     // Read type
-    let element_type = ElementType::from_u8(data[pos])
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("Unknown element type: {}", data[pos])))?;
+    let element_type = ElementType::from_u8(data[pos]).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("Unknown element type: {}", data[pos]))
+    })?;
     pos += 1;
 
     // Read shape
@@ -174,7 +175,8 @@ pub fn unpack_vector(
             if pos + 4 > data.len() {
                 return Err(pyo3::exceptions::PyValueError::new_err("Not enough data for shape"));
             }
-            let dim = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+            let dim = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
             shape_vec.push(dim);
             pos += 4;
         }
@@ -234,7 +236,10 @@ fn extract_array_data(
     // Get shape
     let shape_obj = array.getattr("shape")?;
     let shape_tuple = shape_obj.downcast::<pyo3::types::PyTuple>()?;
-    let shape: Vec<usize> = shape_tuple.iter().map(|x| x.extract::<usize>().unwrap()).collect();
+    let shape: Vec<usize> = shape_tuple
+        .iter()
+        .map(|x| x.extract::<usize>().unwrap())
+        .collect();
 
     // Convert to correct dtype and get bytes
     let dtype_str = element_type.to_numpy_dtype();
@@ -258,7 +263,12 @@ fn create_python_list(
         ElementType::F32 => {
             for i in 0..count {
                 let offset = i * 4;
-                let bytes = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+                let bytes = [
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ];
                 let val = f32::from_le_bytes(bytes);
                 list.append(val)?;
             }
@@ -283,7 +293,12 @@ fn create_python_list(
         ElementType::I32 => {
             for i in 0..count {
                 let offset = i * 4;
-                let bytes = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+                let bytes = [
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ];
                 let val = i32::from_le_bytes(bytes);
                 list.append(val)?;
             }
@@ -321,7 +336,12 @@ fn create_python_list(
         ElementType::U32 => {
             for i in 0..count {
                 let offset = i * 4;
-                let bytes = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+                let bytes = [
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ];
                 let val = u32::from_le_bytes(bytes);
                 list.append(val)?;
             }

@@ -33,12 +33,8 @@ impl MetaTable {
 
     /// Get a metadata value
     pub fn get(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
-        conn.query_row(
-            "SELECT value FROM kohakuvault_meta WHERE key = ?",
-            [key],
-            |row| row.get(0),
-        )
-        .optional()
+        conn.query_row("SELECT value FROM kohakuvault_meta WHERE key = ?", [key], |row| row.get(0))
+            .optional()
     }
 
     /// Set a metadata value (upsert)
@@ -61,7 +57,11 @@ impl MetaTable {
     /// Check if a feature is supported
     ///
     /// Features are stored as comma-separated lists in the meta table
-    pub fn has_feature(conn: &Connection, feature_key: &str, feature: &str) -> rusqlite::Result<bool> {
+    pub fn has_feature(
+        conn: &Connection,
+        feature_key: &str,
+        feature: &str,
+    ) -> rusqlite::Result<bool> {
         if let Some(features_str) = Self::get(conn, feature_key)? {
             Ok(features_str.split(',').any(|f| f == feature))
         } else {
@@ -72,7 +72,11 @@ impl MetaTable {
     /// Register a feature as supported
     ///
     /// Adds feature to comma-separated list if not already present
-    pub fn register_feature(conn: &Connection, feature_key: &str, feature: &str) -> rusqlite::Result<()> {
+    pub fn register_feature(
+        conn: &Connection,
+        feature_key: &str,
+        feature: &str,
+    ) -> rusqlite::Result<()> {
         let features_str = if let Some(existing) = Self::get(conn, feature_key)? {
             if existing.split(',').any(|f| f == feature) {
                 // Already registered

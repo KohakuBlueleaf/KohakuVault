@@ -48,9 +48,7 @@ impl _VectorKVault {
         metric: &str,
         vector_type: &str,
     ) -> PyResult<Self> {
-        Ok(Self {
-            inner: VectorKVault::new(path, table, dimensions, metric, vector_type)?,
-        })
+        Ok(Self { inner: VectorKVault::new(path, table, dimensions, metric, vector_type)? })
     }
 
     /// Insert a vector-value pair

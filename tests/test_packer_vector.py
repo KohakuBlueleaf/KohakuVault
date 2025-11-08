@@ -411,8 +411,8 @@ def test_vec_arbitrary_format_details():
     # Format: |type(1)|ndim(1)|dim0(4)|dim1(4)|data(16)|
     assert packed[0] == 0x01  # ElementType::F32
     assert packed[1] == 2  # ndim
-    assert int.from_bytes(packed[2:6], 'little') == 2  # dim0
-    assert int.from_bytes(packed[6:10], 'little') == 2  # dim1
+    assert int.from_bytes(packed[2:6], "little") == 2  # dim0
+    assert int.from_bytes(packed[6:10], "little") == 2  # dim1
     # Data starts at byte 10
 
 

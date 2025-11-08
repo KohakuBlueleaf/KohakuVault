@@ -64,7 +64,6 @@ pub fn blob_to_vec_f32(blob: &[u8]) -> Result<Vec<f32>, String> {
     Ok(result)
 }
 
-
 /// Convert Python list/array to Vec<f32>
 pub fn py_to_vec_f32(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
     // Try to extract as sequence
@@ -88,8 +87,7 @@ pub fn py_to_vec_f32(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
     // Try as bytes (direct BLOB)
     if let Ok(bytes) = obj.downcast::<PyBytes>() {
         let blob = bytes.as_bytes();
-        return blob_to_vec_f32(blob)
-            .map_err(pyo3::exceptions::PyValueError::new_err);
+        return blob_to_vec_f32(blob).map_err(pyo3::exceptions::PyValueError::new_err);
     }
 
     Err(pyo3::exceptions::PyTypeError::new_err(

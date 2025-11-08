@@ -8,6 +8,7 @@ using numpy arrays as the standard interface.
 import numpy as np
 from kohakuvault import VectorKVault
 
+
 def main():
     # Create VectorKVault for 128-dimensional embeddings
     print("Creating VectorKVault with 128 dimensions...")
@@ -87,6 +88,7 @@ def main():
         print(f"  {key}: {value}")
 
     print("\n✅ Example completed successfully!")
+
 
 if __name__ == "__main__":
     main()

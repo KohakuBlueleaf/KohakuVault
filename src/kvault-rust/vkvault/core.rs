@@ -28,11 +28,11 @@ impl VectorKVault {
         metric: &str,
         vector_type: &str,
     ) -> PyResult<Self> {
-        let metric = SimilarityMetric::from_str(metric)
-            .map_err(PyValueError::new_err)?;
+        let metric = SimilarityMetric::from_str(metric).map_err(PyValueError::new_err)?;
 
-        let vec_type = VectorType::from_str(vector_type)
-            .ok_or_else(|| PyValueError::new_err(format!("Unknown vector type: {}", vector_type)))?;
+        let vec_type = VectorType::from_str(vector_type).ok_or_else(|| {
+            PyValueError::new_err(format!("Unknown vector type: {}", vector_type))
+        })?;
 
         // Validate metric compatibility
         if !metric.is_compatible_with(vec_type) {
@@ -108,8 +108,9 @@ impl VectorKVault {
             &self.table
         );
 
-        conn.execute(&create_values_table, [])
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create values table: {}", e)))?;
+        conn.execute(&create_values_table, []).map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to create values table: {}", e))
+        })?;
 
         Ok(())
     }
@@ -135,16 +136,14 @@ impl VectorKVault {
 
                 Ok(vec_f32_to_blob(&vec))
             }
-            VectorType::Int8 => {
-                Err(PyValueError::new_err(
-                    "Int8 vectors not yet supported. Use float32 or implement quantization first.".to_string(),
-                ))
-            }
-            VectorType::Bit => {
-                Err(PyValueError::new_err(
-                    "Bit vectors not yet supported. Use float32 or implement quantization first.".to_string(),
-                ))
-            }
+            VectorType::Int8 => Err(PyValueError::new_err(
+                "Int8 vectors not yet supported. Use float32 or implement quantization first."
+                    .to_string(),
+            )),
+            VectorType::Bit => Err(PyValueError::new_err(
+                "Bit vectors not yet supported. Use float32 or implement quantization first."
+                    .to_string(),
+            )),
         }
     }
 
@@ -158,9 +157,7 @@ impl VectorKVault {
             return Ok(bytearray);
         }
 
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "Expected bytes or bytearray",
-        ))
+        Err(pyo3::exceptions::PyTypeError::new_err("Expected bytes or bytearray"))
     }
 
     /// Get table information
@@ -179,11 +176,7 @@ impl VectorKVault {
     pub fn count(&self) -> PyResult<i64> {
         let conn = self.conn.lock();
         let count: i64 = conn
-            .query_row(
-                &format!("SELECT COUNT(*) FROM {}", &self.table),
-                [],
-                |row| row.get(0),
-            )
+            .query_row(&format!("SELECT COUNT(*) FROM {}", &self.table), [], |row| row.get(0))
             .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
 
         Ok(count)
