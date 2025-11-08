@@ -16,6 +16,9 @@ use std::sync::{Arc, Mutex};
 /// Maximum height
 pub const MAX_HEIGHT: usize = 32;
 
+/// Type alias for node pointer vectors (used in find operation)
+type NodePtrVec<K, V> = Vec<*mut Node<K, V>>;
+
 /// Skip list node
 struct Node<K, V> {
     key: K,
@@ -100,7 +103,7 @@ where
     }
 
     /// Find position for key (lock-free)
-    fn find(&self, key: &K) -> (Vec<*mut Node<K, V>>, Vec<*mut Node<K, V>>) {
+    fn find(&self, key: &K) -> (NodePtrVec<K, V>, NodePtrVec<K, V>) {
         let mut preds = vec![ptr::null_mut(); MAX_HEIGHT];
         let mut succs = vec![ptr::null_mut(); MAX_HEIGHT];
 
@@ -164,6 +167,7 @@ where
             // Set forward pointers
             unsafe {
                 let new_node_ref = &*new_node;
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..=new_level.min(current_max) {
                     new_node_ref.forward[i].store(succs[i], AtomicOrdering::Relaxed);
                 }
@@ -260,6 +264,7 @@ where
 
         // Unlink the node at all levels
         unsafe {
+            #[allow(clippy::needless_range_loop)]
             for i in 0..victim.forward.len().min(preds.len()) {
                 if preds[i].is_null() {
                     continue;
