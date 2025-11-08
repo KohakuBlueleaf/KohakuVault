@@ -11,10 +11,13 @@
 
 mod primitives;
 mod structured;
+mod vector;
+mod vector_bulk;
 
 // Re-export public types
 pub use primitives::{pack_bytes, pack_string, unpack_bytes, unpack_string, StringEncoding};
 pub use structured::{pack_cbor, pack_messagepack, unpack_cbor, unpack_messagepack};
+pub use vector::{pack_vector, unpack_vector, ElementType};
 
 #[cfg(feature = "schema-validation")]
 pub use structured::pack_messagepack_validated;
@@ -81,6 +84,14 @@ pub enum PackerDType {
     Cbor {
         schema: Option<String>,
         fixed_size: Option<usize>,
+    },
+
+    /// Vector/array with element type and optional fixed shape
+    /// - None: arbitrary shape (includes shape in data)
+    /// - Some(shape): fixed shape (validates on pack/unpack)
+    Vector {
+        element_type: ElementType,
+        fixed_shape: Option<Vec<usize>>,
     },
 }
 
@@ -164,6 +175,43 @@ impl PackerDType {
                 Ok(Self::Cbor { schema: None, fixed_size })
             }
 
+            "vec" | "vector" => {
+                // Parse: "vec:f32", "vec:f32:128", "vec:i64:10:20", etc.
+                if parts.len() < 2 {
+                    return Err(PackerError::InvalidDtype(
+                        "Vector type requires element type (e.g., vec:f32)".to_string(),
+                    ));
+                }
+
+                let element_type = ElementType::from_str(parts[1]).ok_or_else(|| {
+                    PackerError::InvalidDtype(format!(
+                        "Unknown element type '{}'. Expected f32, f64, i32, i64, u8, etc.",
+                        parts[1]
+                    ))
+                })?;
+
+                let fixed_shape = if parts.len() > 2 {
+                    // Parse fixed shape dimensions
+                    let mut shape = Vec::new();
+                    for dim_str in &parts[2..] {
+                        let dim = dim_str.parse::<usize>().map_err(|_| {
+                            PackerError::InvalidDtype(format!("Invalid dimension: {}", dim_str))
+                        })?;
+                        if dim == 0 {
+                            return Err(PackerError::InvalidDtype(
+                                "Dimension must be greater than 0".to_string(),
+                            ));
+                        }
+                        shape.push(dim);
+                    }
+                    Some(shape)
+                } else {
+                    None
+                };
+
+                Ok(Self::Vector { element_type, fixed_shape })
+            }
+
             _ => Err(PackerError::InvalidDtype(format!("Unknown dtype: {}", dtype_str))),
         }
     }
@@ -183,6 +231,13 @@ impl PackerDType {
             Self::MessagePackValidated { .. } => 0,
             Self::Cbor { fixed_size: Some(size), .. } => *size,
             Self::Cbor { fixed_size: None, .. } => 0,
+            Self::Vector { element_type, fixed_shape } => {
+                if let Some(shape) = fixed_shape {
+                    vector::calculate_vector_size(*element_type, shape)
+                } else {
+                    0 // Arbitrary shape is variable-size
+                }
+            }
         }
     }
 
@@ -257,6 +312,12 @@ impl DataPacker {
 
     /// Pack multiple values to concatenated bytes
     pub fn pack_many(&self, py: Python, values: &Bound<PyList>) -> PyResult<Py<PyBytes>> {
+        // Use optimized bulk path for fixed-shape vectors
+        if let PackerDType::Vector { element_type, fixed_shape: Some(ref shape) } = &self.dtype {
+            return vector_bulk::pack_many_vectors_fixed(py, values, *element_type, shape);
+        }
+
+        // Generic path for all other types
         let mut result = Vec::new();
 
         for value in values.iter() {
@@ -284,6 +345,13 @@ impl DataPacker {
         count: Option<usize>,
         offsets: Option<Vec<usize>>,
     ) -> PyResult<Py<PyList>> {
+        // Use optimized bulk path for fixed-shape vectors
+        if let PackerDType::Vector { element_type, fixed_shape: Some(ref shape) } = &self.dtype {
+            if let Some(n) = count {
+                return vector_bulk::unpack_many_vectors_fixed(py, data, n, *element_type, shape);
+            }
+        }
+
         let list = PyList::empty_bound(py);
         let elem_size = self.dtype.elem_size();
 
@@ -403,6 +471,10 @@ impl DataPacker {
                     Ok(bytes)
                 }
             }
+
+            PackerDType::Vector { element_type, fixed_shape } => {
+                pack_vector(value, *element_type, fixed_shape.as_deref())
+            }
         }
     }
 
@@ -467,6 +539,10 @@ impl DataPacker {
                     // Variable-size: read from offset to end
                     unpack_cbor(py, &data[offset..])
                 }
+            }
+
+            PackerDType::Vector { element_type, fixed_shape } => {
+                unpack_vector(py, data, offset, fixed_shape.as_deref(), *element_type)
             }
         }
     }
