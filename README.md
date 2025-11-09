@@ -1,5 +1,7 @@
 # KohakuVault
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/KohakuBlueleaf/KohakuVault)
+
 One-file SQLite datastore with:
   * `KVault` key-value storage inspired by [BoringDB](https://github.com/mel-project/boringdb) (streaming blobs + auto-pack for dict/list/numpy)
   * `ColumnVault` columnar layout inspired by Stanchion (typed chunks: `i64`, `msgpack`, `vec:*`) built on SQLite BLOB ranges
