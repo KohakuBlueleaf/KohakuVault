@@ -464,73 +464,83 @@ impl _ColumnVault {
     ///
     /// Returns:
     ///     (col_id, elem_size, length, max_chunk_bytes)
-    fn get_column_info(&self, name: &str) -> PyResult<(i64, i64, i64, i64)> {
-        let conn = self.conn.lock().unwrap();
+    fn get_column_info(&self, py: Python<'_>, name: &str) -> PyResult<(i64, i64, i64, i64)> {
+        let name = name.to_string();
 
-        let result = conn.query_row(
-            "
-            SELECT col_id, elem_size, length, max_chunk_bytes
-            FROM col_meta
-            WHERE name = ?1
-            ",
-            params![name],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        );
+        py.allow_threads(|| {
+            let conn = self.conn.lock().unwrap();
 
-        match result {
-            Ok(info) => Ok(info),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                Err(ColError::NotFound(name.to_string()).into())
+            let result = conn.query_row(
+                "
+                SELECT col_id, elem_size, length, max_chunk_bytes
+                FROM col_meta
+                WHERE name = ?1
+                ",
+                params![name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            );
+
+            match result {
+                Ok(info) => Ok(info),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Err(ColError::NotFound(name).into()),
+                Err(e) => Err(ColError::from(e).into()),
             }
-            Err(e) => Err(ColError::from(e).into()),
-        }
+        })
     }
 
     /// List all columns with their metadata.
     ///
     /// Returns:
     ///     List of (name, dtype, length) tuples
-    fn list_columns(&self, _py: Python<'_>) -> PyResult<Vec<(String, String, i64)>> {
-        let conn = self.conn.lock().unwrap();
+    fn list_columns(&self, py: Python<'_>) -> PyResult<Vec<(String, String, i64)>> {
+        py.allow_threads(|| {
+            let conn = self.conn.lock().unwrap();
 
-        let mut stmt = conn
-            .prepare("SELECT name, dtype, length FROM col_meta ORDER BY col_id")
-            .map_err(ColError::from)?;
+            let mut stmt = conn
+                .prepare("SELECT name, dtype, length FROM col_meta ORDER BY col_id")
+                .map_err(ColError::from)?;
 
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
-            })
-            .map_err(ColError::from)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+                })
+                .map_err(ColError::from)?;
 
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row.map_err(ColError::from)?);
-        }
+            let mut result = Vec::new();
+            for row in rows {
+                result.push(row.map_err(ColError::from)?);
+            }
 
-        Ok(result)
+            Ok(result)
+        })
     }
 
     /// Delete a column and all its data.
-    fn delete_column(&self, name: &str) -> PyResult<bool> {
-        let conn = self.conn.lock().unwrap();
+    fn delete_column(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
+        let name = name.to_string();
 
-        let deleted = conn
-            .execute("DELETE FROM col_meta WHERE name = ?1", params![name])
-            .map_err(ColError::from)?;
+        py.allow_threads(|| {
+            let conn = self.conn.lock().unwrap();
 
-        Ok(deleted > 0)
+            let deleted = conn
+                .execute("DELETE FROM col_meta WHERE name = ?1", params![name])
+                .map_err(ColError::from)?;
+
+            Ok(deleted > 0)
+        })
     }
 
     /// Manually checkpoint WAL file to main database.
     /// This helps prevent WAL from growing too large.
     /// Returns success indicator (0 = success).
-    fn checkpoint_wal(&self) -> PyResult<i64> {
-        let conn = self.conn.lock().unwrap();
-        // PRAGMA wal_checkpoint(PASSIVE) - non-blocking checkpoint
-        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
-            .map_err(ColError::from)?;
-        Ok(0) // Success indicator
+    fn checkpoint_wal(&self, py: Python<'_>) -> PyResult<i64> {
+        py.allow_threads(|| {
+            let conn = self.conn.lock().unwrap();
+            // PRAGMA wal_checkpoint(PASSIVE) - non-blocking checkpoint
+            conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+                .map_err(ColError::from)?;
+            Ok(0) // Success indicator
+        })
     }
 
     // ===== Fixed-Size Column Operations =====
@@ -692,11 +702,12 @@ impl _ColumnVault {
 
     fn append_raw_adaptive(
         &self,
+        py: Python<'_>,
         col_id: i64,
         data: &Bound<'_, PyBytes>,
         max_chunk_bytes: i64,
     ) -> PyResult<(i32, i32, i32)> {
-        self.append_raw_adaptive_impl(col_id, data, max_chunk_bytes)
+        self.append_raw_adaptive_impl(py, col_id, data, max_chunk_bytes)
     }
 
     fn extend_adaptive(
