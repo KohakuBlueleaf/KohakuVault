@@ -98,7 +98,7 @@ def test_text_vault_insert_multi_column(temp_db):
 
     doc_id = tv.insert(
         {"title": "Introduction", "body": "This is the main content", "tags": "intro tutorial"},
-        b"metadata"
+        b"metadata",
     )
 
     assert doc_id >= 1
@@ -374,7 +374,7 @@ def test_text_vault_search_with_snippets(temp_db):
 
     tv.insert(
         "This is a long document about Python programming. Python is great for data science.",
-        b"value"
+        b"value",
     )
 
     results = tv.search_with_snippets("Python", k=10, highlight_start="<b>", highlight_end="</b>")
@@ -629,7 +629,7 @@ def test_text_vault_search_special_characters(temp_db):
     tv.insert("C++ programming guide", b"doc2")
     tv.insert("Contact: test@email.com", b"doc3")
     tv.insert("Price > 100", b"doc4")
-    tv.insert("He said \"hello\" to me", b"doc5")
+    tv.insert('He said "hello" to me', b"doc5")
 
     # All these should work with escape=True (default)
     assert len(tv.search("What is this?")) == 1
@@ -701,7 +701,10 @@ def test_text_vault_rag_document_chunks(temp_db):
     chunks = [
         ("Machine learning is a subset of artificial intelligence", {"source": "doc1", "chunk": 0}),
         ("Deep learning uses neural networks with many layers", {"source": "doc1", "chunk": 1}),
-        ("Natural language processing enables computers to understand text", {"source": "doc2", "chunk": 0}),
+        (
+            "Natural language processing enables computers to understand text",
+            {"source": "doc2", "chunk": 0},
+        ),
         ("Transformers are the foundation of modern NLP models", {"source": "doc2", "chunk": 1}),
     ]
 
@@ -714,8 +717,7 @@ def test_text_vault_rag_document_chunks(temp_db):
     assert len(results) > 0
     # Should find the deep learning chunk
     found_deep_learning = any(
-        r[2].get("source") == "doc1" and r[2].get("chunk") == 1
-        for r in results
+        r[2].get("source") == "doc1" and r[2].get("chunk") == 1 for r in results
     )
     assert found_deep_learning
 

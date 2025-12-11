@@ -72,9 +72,10 @@ impl TextVault {
             .collect();
         param_values.push(rusqlite::types::Value::Integer(value_id));
 
-        stmt.execute(rusqlite::params_from_iter(param_values)).map_err(|e| {
-            PyRuntimeError::new_err(format!("Failed to insert into FTS5 table: {}", e))
-        })?;
+        stmt.execute(rusqlite::params_from_iter(param_values))
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to insert into FTS5 table: {}", e))
+            })?;
 
         // Get the rowid of the inserted document
         let doc_id: i64 = conn.last_insert_rowid();
@@ -201,10 +202,7 @@ impl TextVault {
 
         match result {
             Some(value_bytes) => self.decode_and_deserialize(py, &value_bytes),
-            None => Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                "Key not found: {}",
-                key
-            ))),
+            None => Err(pyo3::exceptions::PyKeyError::new_err(format!("Key not found: {}", key))),
         }
     }
 
@@ -225,7 +223,9 @@ impl TextVault {
         if let Some(value_id) = value_ref {
             // Delete from FTS5 table
             conn.execute(&format!("DELETE FROM {} WHERE rowid = ?", &self.table), params![id])
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete document: {}", e)))?;
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to delete document: {}", e))
+                })?;
 
             // Delete from values table
             conn.execute(
@@ -257,14 +257,14 @@ impl TextVault {
             let text_values = self.parse_text_input(text_input)?;
 
             // Build UPDATE statement
-            let set_clauses: Vec<String> =
-                self.columns.iter().map(|col| format!("{} = ?", col)).collect();
+            let set_clauses: Vec<String> = self
+                .columns
+                .iter()
+                .map(|col| format!("{} = ?", col))
+                .collect();
 
-            let sql = format!(
-                "UPDATE {} SET {} WHERE rowid = ?",
-                &self.table,
-                set_clauses.join(", ")
-            );
+            let sql =
+                format!("UPDATE {} SET {} WHERE rowid = ?", &self.table, set_clauses.join(", "));
 
             let mut param_values: Vec<rusqlite::types::Value> = text_values
                 .iter()
@@ -273,7 +273,9 @@ impl TextVault {
             param_values.push(rusqlite::types::Value::Integer(id));
 
             conn.execute(&sql, rusqlite::params_from_iter(param_values))
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to update document: {}", e)))?;
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to update document: {}", e))
+                })?;
         }
 
         // Update value if provided

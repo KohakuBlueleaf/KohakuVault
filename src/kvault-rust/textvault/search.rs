@@ -108,8 +108,8 @@ impl TextVault {
 
         let mut output = Vec::new();
         for result in results {
-            let (id, score, value_bytes) =
-                result.map_err(|e| PyRuntimeError::new_err(format!("Failed to read row: {}", e)))?;
+            let (id, score, value_bytes) = result
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to read row: {}", e)))?;
 
             // Convert BM25 score to positive (more relevant = higher score)
             let positive_score = -score;
@@ -199,8 +199,8 @@ impl TextVault {
 
         let mut output = Vec::new();
         for result in results {
-            let (id, score, texts, value_bytes) =
-                result.map_err(|e| PyRuntimeError::new_err(format!("Failed to read row: {}", e)))?;
+            let (id, score, texts, value_bytes) = result
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to read row: {}", e)))?;
 
             // Convert BM25 score to positive
             let positive_score = -score;
@@ -266,15 +266,12 @@ impl TextVault {
 
         // Determine which column to use for snippets
         let col_idx = if let Some(col) = snippet_column {
-            self.columns
-                .iter()
-                .position(|c| c == col)
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "Column '{}' not found. Available columns: {:?}",
-                        col, &self.columns
-                    ))
-                })?
+            self.columns.iter().position(|c| c == col).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Column '{}' not found. Available columns: {:?}",
+                    col, &self.columns
+                ))
+            })?
         } else {
             0 // Default to first column
         };
@@ -316,8 +313,8 @@ impl TextVault {
 
         let mut output = Vec::new();
         for result in results {
-            let (id, score, snippet, value_bytes) =
-                result.map_err(|e| PyRuntimeError::new_err(format!("Failed to read row: {}", e)))?;
+            let (id, score, snippet, value_bytes) = result
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to read row: {}", e)))?;
 
             // Convert BM25 score to positive
             let positive_score = -score;
