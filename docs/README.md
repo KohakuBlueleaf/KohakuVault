@@ -8,6 +8,7 @@ Use this index to navigate the guides that ship with the repository. Each page i
 
 ## Core Guides
 - [KVault Guide](kvault.md) – dict-like storage, auto-packing, caching, streaming, and retry semantics.
+- [TextVault Guide](textvault.md) – full-text search with FTS5 BM25 ranking, ideal for RAG pipelines.
 - [ColumnVault Guide](columnvault.md) – typed columns, dtype grammar, structured data, caching, and chunk tuning.
 - [Vector Storage & Search](vectors.md) – vector dtypes inside `ColumnVault` plus similarity search with `VectorKVault`/`sqlite-vec`.
 - [Structured Data Cookbook](structured_columns.md) – practical recipes for MessagePack/CBOR columns, schema validation, and hybrid layouts.

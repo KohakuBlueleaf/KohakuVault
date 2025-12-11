@@ -4,13 +4,14 @@
 
 One-file SQLite datastore with:
   * `KVault` key-value storage inspired by [BoringDB](https://github.com/mel-project/boringdb) (streaming blobs + auto-pack for dict/list/numpy)
+  * `TextVault` full-text search with FTS5 BM25 ranking (ideal for RAG pipelines)
   * `ColumnVault` columnar layout inspired by Stanchion (typed chunks: `i64`, `msgpack`, `vec:*`) built on SQLite BLOB ranges
   * write-back caches plus standalone CSB+Tree / SkipList containers for ordered/temporal metadata
   * `VectorKVault` (sqlite-vec) for k-NN search living in the same `.db`
 
 
 ```python
-from kohakuvault import KVault, ColumnVault, VectorKVault, CSBTree
+from kohakuvault import KVault, TextVault, ColumnVault, VectorKVault, CSBTree
 import numpy as np
 
 DB = "test.db"
@@ -19,6 +20,12 @@ DB = "test.db"
 kv = KVault(DB, table="media")
 kv["video:42"] = b"abcdefg" # raw bytes stay raw
 kv["video:42:meta"] = {"fps": 60, "tags": ["tutorial", "gpu"]}  # auto MessagePack
+
+# Full-text search with BM25 ranking (great for RAG)
+tv = TextVault(DB, table="docs")
+tv.insert("Machine learning is a subset of AI", {"category": "tech"})
+for doc_id, score, meta in tv.search("machine learning", k=5):
+    print(f"Doc {doc_id}: score={score:.4f}")
 
 # Incremental columnar logging (no file rewrites)
 cols = ColumnVault(kv) # or ColumnVault(DB)
@@ -70,6 +77,7 @@ maturin develop
 
 ## Use cases / references
 - **Media vaults** – Random-access blobs + metadata (`tests/test_kv_headers.py`, `examples/basic_usage.py`).
+- **RAG pipelines** – Full-text BM25 search + vector similarity in the same DB (`tests/test_text_vault.py`).
 - **Incremental ML logging** – Fixed/var columns, vector dtypes, caches (`tests/test_columnar.py`, `examples/columnar_demo.py`).
 - **Vector-heavy retrieval** – `VectorKVault`, CSBTree/SkipList, auto-packed metadata (`tests/test_vector_kvault.py`, `examples/vector_search_numpy.py`, `examples/all_usage.py`).
 
@@ -84,6 +92,7 @@ Benchmarks on an M1 Max (WAL on, cache enabled):
 
 - [Documentation index](docs/README.md)
 - [KVault Guide](docs/kvault.md)
+- [TextVault Guide](docs/textvault.md) – Full-text search with BM25 ranking
 - [ColumnVault Guide](docs/columnvault.md)
 - [Vector Storage & Search](docs/vectors.md)
 - [DataPacker Reference](docs/datapacker.md)
