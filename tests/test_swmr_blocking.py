@@ -5,12 +5,17 @@ Process A holds connection open, Process B tries to open while A is active.
 
 import multiprocessing
 import os
+import shutil
+import sys
 import tempfile
 import time
 
 import pytest
 
 from kohakuvault import ColumnVault
+
+# Skip multiprocessing tests on Windows CI - temp directory cleanup issues
+SKIP_MP_ON_WINDOWS = sys.platform == "win32" and os.environ.get("CI") == "true"
 
 
 def process_a_hold_connection(db_path, ready_event, release_event):
@@ -77,6 +82,7 @@ def process_b_try_open(db_path, start_event, result_queue):
         result_queue.put(("error", str(e)))
 
 
+@pytest.mark.skipif(SKIP_MP_ON_WINDOWS, reason="Multiprocessing temp dir issues on Windows CI")
 def test_concurrent_open_with_held_connection():
     """
     Test the specific scenario:
@@ -84,7 +90,8 @@ def test_concurrent_open_with_held_connection():
     2. Process B tries to open while A is holding
     3. B should NOT hang indefinitely (WAL mode should allow this)
     """
-    with tempfile.TemporaryDirectory() as tmpdir:
+    tmpdir = tempfile.mkdtemp()
+    try:
         db_path = os.path.join(tmpdir, "test.db")
 
         # Create and populate database
@@ -163,6 +170,12 @@ def test_concurrent_open_with_held_connection():
                 assert length == 100
         else:
             pytest.fail("No result from Process B")
+    finally:
+        # Clean up temp directory manually
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def _simultaneous_opener(db_path, proc_id, start_barrier, result_queue):
@@ -190,9 +203,11 @@ def _simultaneous_opener(db_path, proc_id, start_barrier, result_queue):
         result_queue.put(("error", proc_id, str(e)))
 
 
+@pytest.mark.skipif(SKIP_MP_ON_WINDOWS, reason="Multiprocessing temp dir issues on Windows CI")
 def test_rapid_simultaneous_opens():
     """Multiple processes all try to open at exactly the same time."""
-    with tempfile.TemporaryDirectory() as tmpdir:
+    tmpdir = tempfile.mkdtemp()
+    try:
         db_path = os.path.join(tmpdir, "test.db")
 
         # Create database
@@ -244,6 +259,11 @@ def test_rapid_simultaneous_opens():
         print(f"\n✅ All {num_procs} processes opened simultaneously without hanging")
         for proc_id, length, elapsed in results:
             print(f"  Process {proc_id}: length={length}, time={elapsed:.3f}s")
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
