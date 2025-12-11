@@ -48,7 +48,7 @@ jobs:
         shell: bash
         run: |
           pip install target/wheels/*.whl
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov pytest-asyncio
 
       - name: Run tests with coverage
         run: pytest -v --cov=kohakuvault --cov-report=term-missing --cov-report=xml
