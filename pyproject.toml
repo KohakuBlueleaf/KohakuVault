@@ -33,12 +33,12 @@ classifiers = [
 dev = [
     "maturin>=1.0,<2.0",
     "black>=25.0.0",
-    "pytest>=8.2.0",
+    "pytest>=9.0",
     "pytest-cov>=7.0.0",
     "pytest-asyncio>=1.0.0",
 ]
 test = [
-    "pytest>=8.2.0",
+    "pytest>=9.0",
     "pytest-cov>=7.0.0",
     "pytest-asyncio>=1.0.0",
 ]
