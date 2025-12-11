@@ -19,6 +19,7 @@ mod common;
 mod kv;
 mod packer;
 mod skiplist;
+mod textvault;
 mod tree;
 mod vector_utils;
 mod vkvault;
@@ -61,6 +62,9 @@ fn _kvault(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register VectorKVault
     vkvault::register_vkvault_types(m)?;
+
+    // Register TextVault
+    textvault::register_textvault_types(m)?;
 
     Ok(())
 }

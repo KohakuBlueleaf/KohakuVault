@@ -15,6 +15,7 @@ __version__ = "0.7.1"
 from .column_proxy import Column, ColumnVault, VarSizeColumn
 from .errors import DatabaseBusy, InvalidArgument, IoError, KohakuVaultError, NotFound
 from .proxy import KVault
+from .text_proxy import TextVault
 from .vector_proxy import VectorKVault
 from .wrappers import Cbor, Json, MsgPack, Pickle
 
@@ -39,6 +40,7 @@ except ImportError:
 __all__ = [
     "KVault",
     "VectorKVault",
+    "TextVault",
     "Column",
     "ColumnVault",
     "VarSizeColumn",
