@@ -78,7 +78,7 @@ impl VectorKVault {
 
         match result {
             Some((vector, value_bytes)) => {
-                let vector_py = PyBytes::new_bound(py, &vector).unbind();
+                let vector_py = PyBytes::new(py, &vector).unbind();
 
                 // Auto-decode value (EXACTLY SAME AS KVault)
                 let value_py = self.decode_and_deserialize(py, &value_bytes)?;

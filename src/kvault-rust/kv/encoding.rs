@@ -68,7 +68,7 @@ impl _KVault {
             .decode_value(&bytes_vec)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
-        Ok((PyBytes::new_bound(py, &data).unbind(), header))
+        Ok((PyBytes::new(py, &data).unbind(), header))
     }
 
     /// Put value with specific encoding type

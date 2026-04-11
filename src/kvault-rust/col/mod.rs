@@ -368,7 +368,7 @@ impl _ColumnVault {
         if !fixed_buffer.is_empty() {
             // Fixed-size column: use append_raw
             Python::with_gil(|py| {
-                let py_bytes = PyBytes::new_bound(py, &fixed_buffer);
+                let py_bytes = PyBytes::new(py, &fixed_buffer);
                 self.append_raw_impl(col_id, &py_bytes, elem_size, 0, current_length)
             })?;
         } else if !var_buffer.is_empty() {
@@ -386,13 +386,13 @@ impl _ColumnVault {
 
             // Call extend_adaptive and get index data back
             let index_bytes = Python::with_gil(|py| {
-                let py_list = PyList::new_bound(
+                let py_list = PyList::new(
                     py,
                     var_buffer
                         .iter()
-                        .map(|v| PyBytes::new_bound(py, v))
+                        .map(|v| PyBytes::new(py, v))
                         .collect::<Vec<_>>(),
-                );
+                )?;
 
                 self.extend_adaptive_impl(py, col_id, &py_list, max_chunk_bytes)
             })?;

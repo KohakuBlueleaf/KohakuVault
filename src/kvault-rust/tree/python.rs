@@ -208,7 +208,7 @@ impl PyCSBTree {
                 Py::<PyAny>::from_owned_ptr_or_opt(py, k.obj.as_ptr()).expect("INCREF failed")
             })
             .collect();
-        Ok(PyList::new_bound(py, keys).into())
+        Ok(PyList::new(py, keys)?.into())
     }
 
     /// Get all values in key order
@@ -225,7 +225,7 @@ impl PyCSBTree {
                 Py::<PyAny>::from_owned_ptr_or_opt(py, v.obj.as_ptr()).expect("INCREF failed")
             })
             .collect();
-        Ok(PyList::new_bound(py, values).into())
+        Ok(PyList::new(py, values)?.into())
     }
 
     /// Get all (key, value) pairs
@@ -246,7 +246,7 @@ impl PyCSBTree {
                 )
             })
             .collect();
-        Ok(PyList::new_bound(py, items).into())
+        Ok(PyList::new(py, items)?.into())
     }
 
     /// Range query: get all (key, value) pairs where start <= key < end
@@ -275,7 +275,7 @@ impl PyCSBTree {
             })
             .collect();
 
-        Ok(PyList::new_bound(py, results).into())
+        Ok(PyList::new(py, results)?.into())
     }
 
     /// Clear all entries
@@ -334,7 +334,7 @@ impl PyCSBTree {
     fn update(&mut self, py: Python<'_>, items: Py<PyAny>) -> PyResult<()> {
         let items_bound = items.bind(py);
 
-        for item in items_bound.iter()? {
+        for item in items_bound.try_iter()? {
             let tuple = item?;
             let key = tuple.get_item(0)?;
             let value = tuple.get_item(1)?;

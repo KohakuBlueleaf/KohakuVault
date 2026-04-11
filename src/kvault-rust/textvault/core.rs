@@ -114,7 +114,7 @@ impl TextVault {
 
     /// Get table information
     pub fn info(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let dict = PyDict::new_bound(py);
+        let dict = PyDict::new(py);
         dict.set_item("table", &self.table)?;
         dict.set_item("columns", &self.columns)?;
         dict.set_item("count", self.count()?)?;
@@ -253,10 +253,10 @@ impl TextVault {
             }
 
             // No header - return raw bytes
-            Ok(PyBytes::new_bound(py, data).into())
+            Ok(PyBytes::new(py, data).into())
         } else {
             // Auto-pack disabled - always return raw bytes
-            Ok(PyBytes::new_bound(py, data).into())
+            Ok(PyBytes::new(py, data).into())
         }
     }
 

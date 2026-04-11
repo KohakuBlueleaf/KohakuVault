@@ -62,7 +62,7 @@ impl super::_ColumnVault {
             Ok::<Vec<u8>, PyErr>(result_vec)
         })?;
 
-        Ok(PyBytes::new_bound(py, &result).unbind())
+        Ok(PyBytes::new(py, &result).unbind())
     }
 
     /// Batch read variable-size elements with single FFI call.
@@ -110,7 +110,7 @@ impl super::_ColumnVault {
         }
 
         if count == 0 {
-            return Ok(PyList::empty_bound(py).unbind());
+            return Ok(PyList::empty(py).unbind());
         }
 
         if count > 10_000_000 {
@@ -217,11 +217,11 @@ impl super::_ColumnVault {
         })?;
 
         // STEP 5: Convert to Python list
-        let py_list = PyList::empty_bound(py);
+        let py_list = PyList::empty(py);
         for result in results {
             match result {
                 Some(data) => {
-                    py_list.append(PyBytes::new_bound(py, &data))?;
+                    py_list.append(PyBytes::new(py, &data))?;
                 }
                 None => {
                     return Err(ColError::Col("Missing element in batch read".to_string()).into());
@@ -267,7 +267,7 @@ impl super::_ColumnVault {
 
         // Unpack each element using DataPacker (all in Rust!)
         let raw_list_bound = raw_list.bind(py);
-        let result_list = PyList::empty_bound(py);
+        let result_list = PyList::empty(py);
 
         for item in raw_list_bound.iter() {
             let bytes = item.downcast::<PyBytes>()?;
@@ -645,7 +645,7 @@ impl super::_ColumnVault {
             Ok::<Vec<u8>, PyErr>(index_data)
         })?;
 
-        Ok(PyBytes::new_bound(py, &index_data).unbind())
+        Ok(PyBytes::new(py, &index_data).unbind())
     }
 
     /// Append raw data to cache for variable-size column (cached adaptive interface).

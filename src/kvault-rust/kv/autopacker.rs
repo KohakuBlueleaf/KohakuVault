@@ -55,7 +55,7 @@ impl AutoPacker {
                     Ok((bytes, EncodingType::MessagePack))
                 }
                 "json" => {
-                    let json_mod = py.import_bound("json")?;
+                    let json_mod = py.import("json")?;
                     let json_str = json_mod.call_method1("dumps", (&data,))?;
                     let bytes: Vec<u8> = json_str.extract::<String>()?.into_bytes();
                     Ok((bytes, EncodingType::Json))
@@ -67,7 +67,7 @@ impl AutoPacker {
                     Ok((bytes, EncodingType::Cbor))
                 }
                 "pickle" => {
-                    let pickle = py.import_bound("pickle")?;
+                    let pickle = py.import("pickle")?;
                     let pickled = pickle.call_method1("dumps", (&data,))?;
                     let bytes: Vec<u8> = pickled.extract()?;
                     Ok((bytes, EncodingType::Pickle))
@@ -116,7 +116,7 @@ impl AutoPacker {
 
             // MessagePack failed (unsupported type in dict/list) - fallback to Pickle
             if self.use_pickle_fallback {
-                let pickle = py.import_bound("pickle")?;
+                let pickle = py.import("pickle")?;
                 let pickled = pickle.call_method1("dumps", (obj,))?;
                 let bytes: Vec<u8> = pickled.extract()?;
                 return Ok((bytes, EncodingType::Pickle));
@@ -129,7 +129,7 @@ impl AutoPacker {
 
         // 8. Last resort: Pickle (for custom objects)
         if self.use_pickle_fallback {
-            let pickle = py.import_bound("pickle")?;
+            let pickle = py.import("pickle")?;
             let pickled = pickle.call_method1("dumps", (obj,))?;
             let bytes: Vec<u8> = pickled.extract()?;
             return Ok((bytes, EncodingType::Pickle));
@@ -205,12 +205,12 @@ impl AutoPacker {
         match encoding {
             EncodingType::Raw => {
                 // Return as bytes
-                Ok(PyBytes::new_bound(py, data).into())
+                Ok(PyBytes::new(py, data).into())
             }
             EncodingType::DataPacker => {
                 // Determine what type of DataPacker data this is based on length and content
                 if data.is_empty() {
-                    return Ok(PyBytes::new_bound(py, data).into());
+                    return Ok(PyBytes::new(py, data).into());
                 }
 
                 // Primitives are exactly 8 bytes (i64, f64)
@@ -226,13 +226,13 @@ impl AutoPacker {
                     // Heuristic: if f64 interpretation is finite and has decimal part, prefer f64
                     // Otherwise prefer i64
                     if as_f64.is_finite() && as_f64.fract().abs() > 1e-9 {
-                        return Ok(as_f64.into_py(py));
+                        return Ok(as_f64.into_pyobject(py).unwrap().into_any().unbind());
                     } else if as_i64.abs() < 1_000_000_000_000 {
                         // Reasonable int range
-                        return Ok(as_i64.into_py(py));
+                        return Ok(as_i64.into_pyobject(py).unwrap().into_any().unbind());
                     } else {
                         // Large number - could be float stored as int bits
-                        return Ok(as_f64.into_py(py));
+                        return Ok(as_f64.into_pyobject(py).unwrap().into_any().unbind());
                     }
                 }
 
@@ -247,24 +247,24 @@ impl AutoPacker {
 
                 // Try string (no specific marker, just valid UTF-8)
                 if let Ok(s) = std::str::from_utf8(data) {
-                    return Ok(s.into_py(py));
+                    return Ok(s.into_pyobject(py).unwrap().into_any().unbind());
                 }
 
                 // Fallback to raw bytes
-                Ok(PyBytes::new_bound(py, data).into())
+                Ok(PyBytes::new(py, data).into())
             }
             EncodingType::Utf8String => {
                 // Decode UTF-8 bytes to string
                 let s = std::str::from_utf8(data)
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-                Ok(s.into_py(py))
+                Ok(s.into_pyobject(py).unwrap().into_any().unbind())
             }
             EncodingType::MessagePack => {
                 let packer = DataPacker { dtype: PackerDType::MessagePack { fixed_size: None } };
                 packer.unpack_impl(py, data, 0)
             }
             EncodingType::Json => {
-                let json_mod = py.import_bound("json")?;
+                let json_mod = py.import("json")?;
                 let text = std::str::from_utf8(data)
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
                 let decoded = json_mod.call_method1("loads", (text,))?;
@@ -276,8 +276,8 @@ impl AutoPacker {
                 packer.unpack_impl(py, data, 0)
             }
             EncodingType::Pickle => {
-                let pickle = py.import_bound("pickle")?;
-                let unpickled = pickle.call_method1("loads", (PyBytes::new_bound(py, data),))?;
+                let pickle = py.import("pickle")?;
+                let unpickled = pickle.call_method1("loads", (PyBytes::new(py, data),))?;
                 Ok(unpickled.into())
             }
             EncodingType::Reserved => {

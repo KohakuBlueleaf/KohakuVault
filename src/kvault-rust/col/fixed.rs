@@ -77,7 +77,7 @@ impl super::_ColumnVault {
             result_offset += bytes_to_read;
         }
 
-        Ok(PyBytes::new_bound(py, &result).unbind())
+        Ok(PyBytes::new(py, &result).unbind())
     }
 
     /// Write a range of elements to a column (from raw bytes).
@@ -246,7 +246,7 @@ impl super::_ColumnVault {
         packer: Option<&crate::packer::DataPacker>,
     ) -> PyResult<Py<PyList>> {
         if count == 0 {
-            return Ok(PyList::empty_bound(py).unbind());
+            return Ok(PyList::empty(py).unbind());
         }
 
         // Use existing read_range_impl
@@ -255,11 +255,11 @@ impl super::_ColumnVault {
         // If no packer, manually split and return bytes
         if packer.is_none() {
             let data_bytes = data.bind(py).as_bytes();
-            let result = PyList::empty_bound(py);
+            let result = PyList::empty(py);
             for i in 0..count as usize {
                 let offset = i * elem_size as usize;
                 let elem_bytes = &data_bytes[offset..offset + elem_size as usize];
-                result.append(PyBytes::new_bound(py, elem_bytes))?;
+                result.append(PyBytes::new(py, elem_bytes))?;
             }
             return Ok(result.unbind());
         }
@@ -463,13 +463,13 @@ impl super::_ColumnVault {
         }
 
         // Create PyList of PyBytes for extend_cached
-        let py_list = PyList::new_bound(
+        let py_list = PyList::new(
             values.py(),
             elements
                 .iter()
-                .map(|e| PyBytes::new_bound(values.py(), e))
+                .map(|e| PyBytes::new(values.py(), e))
                 .collect::<Vec<_>>(),
-        );
+        )?;
 
         // Extend cache (not variable-size since these are fixed-size packed elements)
         self.extend_cached(col_id, &py_list, false)

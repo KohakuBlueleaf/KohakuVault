@@ -154,13 +154,13 @@ impl TextVault {
             Some((texts, value_bytes)) => {
                 // Return texts as dict if multiple columns, string if single column
                 let texts_py = if self.columns.len() == 1 {
-                    texts[0].clone().into_py(py)
+                    texts[0].clone().into_pyobject(py).unwrap().into_any().unbind()
                 } else {
-                    let dict = PyDict::new_bound(py);
+                    let dict = PyDict::new(py);
                     for (col, text) in self.columns.iter().zip(texts.iter()) {
                         dict.set_item(col, text)?;
                     }
-                    dict.into_py(py)
+                    dict.into_any().unbind()
                 };
 
                 // Auto-decode value (EXACTLY SAME AS KVault/VectorKVault)

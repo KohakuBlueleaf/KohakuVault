@@ -169,7 +169,7 @@ impl VectorKVault {
 
     /// Get table information
     pub fn info(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
-        let dict = pyo3::types::PyDict::new_bound(py);
+        let dict = pyo3::types::PyDict::new(py);
         dict.set_item("table", &self.table)?;
         dict.set_item("dimensions", self.dimensions)?;
         dict.set_item("metric", self.metric.to_str())?;
@@ -310,10 +310,10 @@ impl VectorKVault {
             }
 
             // No header - return raw bytes
-            Ok(PyBytes::new_bound(py, data).into())
+            Ok(PyBytes::new(py, data).into())
         } else {
             // Auto-pack disabled - always return raw bytes
-            Ok(PyBytes::new_bound(py, data).into())
+            Ok(PyBytes::new(py, data).into())
         }
     }
 }

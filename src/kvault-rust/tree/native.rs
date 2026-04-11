@@ -25,15 +25,15 @@ impl CSBTreeI64 {
 
     fn insert(&mut self, py: Python<'_>, key: i64, value: &Bound<'_, PyBytes>) -> Option<Py<PyBytes>> {
         let v = value.as_bytes().to_vec();
-        self.inner.insert(key, v).map(|old| PyBytes::new_bound(py, &old).into())
+        self.inner.insert(key, v).map(|old| PyBytes::new(py, &old).into())
     }
 
     fn get(&self, py: Python<'_>, key: i64) -> Option<Py<PyBytes>> {
-        self.inner.get(&key).map(|v| PyBytes::new_bound(py, v).into())
+        self.inner.get(&key).map(|v| PyBytes::new(py, v).into())
     }
 
     fn remove(&mut self, py: Python<'_>, key: i64) -> Option<Py<PyBytes>> {
-        self.inner.remove(&key).map(|v| PyBytes::new_bound(py, &v).into())
+        self.inner.remove(&key).map(|v| PyBytes::new(py, &v).into())
     }
 
     fn __contains__(&self, key: i64) -> bool {
@@ -51,7 +51,7 @@ impl CSBTreeI64 {
     fn __getitem__(&self, py: Python<'_>, key: i64) -> PyResult<Py<PyBytes>> {
         self.inner
             .get(&key)
-            .map(|v| PyBytes::new_bound(py, v).into())
+            .map(|v| PyBytes::new(py, v).into())
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Key not found"))
     }
 
@@ -70,30 +70,30 @@ impl CSBTreeI64 {
 
     fn keys(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let keys: Vec<i64> = self.inner.iter().map(|(k, _)| *k).collect();
-        Ok(PyList::new_bound(py, keys).into())
+        Ok(PyList::new(py, keys)?.into())
     }
 
     fn values(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let values: Vec<_> = self.inner.iter().map(|(_, v)| PyBytes::new_bound(py, v)).collect();
-        Ok(PyList::new_bound(py, values).into())
+        let values: Vec<_> = self.inner.iter().map(|(_, v)| PyBytes::new(py, v)).collect();
+        Ok(PyList::new(py, values)?.into())
     }
 
     fn items(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let items: Vec<_> = self
             .inner
             .iter()
-            .map(|(k, v)| (*k, PyBytes::new_bound(py, v)))
+            .map(|(k, v)| (*k, PyBytes::new(py, v)))
             .collect();
-        Ok(PyList::new_bound(py, items).into())
+        Ok(PyList::new(py, items)?.into())
     }
 
     fn range(&self, py: Python<'_>, start: i64, end: i64) -> PyResult<Py<PyList>> {
         let results: Vec<_> = self
             .inner
             .range(start..end)
-            .map(|(k, v)| (*k, PyBytes::new_bound(py, v)))
+            .map(|(k, v)| (*k, PyBytes::new(py, v)))
             .collect();
-        Ok(PyList::new_bound(py, results).into())
+        Ok(PyList::new(py, results)?.into())
     }
 
     fn clear(&mut self) {
@@ -109,7 +109,7 @@ impl CSBTreeI64 {
         let items: Vec<(i64, Py<PyBytes>)> = slf
             .inner
             .iter()
-            .map(|(k, v)| (*k, PyBytes::new_bound(py, v).into()))
+            .map(|(k, v)| (*k, PyBytes::new(py, v).into()))
             .collect();
         Ok(items.into_py(py))
     }
@@ -133,15 +133,15 @@ impl CSBTreeString {
 
     fn insert(&mut self, py: Python<'_>, key: String, value: &Bound<'_, PyBytes>) -> Option<Py<PyBytes>> {
         let v = value.as_bytes().to_vec();
-        self.inner.insert(key, v).map(|old| PyBytes::new_bound(py, &old).into())
+        self.inner.insert(key, v).map(|old| PyBytes::new(py, &old).into())
     }
 
     fn get(&self, py: Python<'_>, key: String) -> Option<Py<PyBytes>> {
-        self.inner.get(&key).map(|v| PyBytes::new_bound(py, v).into())
+        self.inner.get(&key).map(|v| PyBytes::new(py, v).into())
     }
 
     fn remove(&mut self, py: Python<'_>, key: String) -> Option<Py<PyBytes>> {
-        self.inner.remove(&key).map(|v| PyBytes::new_bound(py, &v).into())
+        self.inner.remove(&key).map(|v| PyBytes::new(py, &v).into())
     }
 
     fn __contains__(&self, key: String) -> bool {
@@ -159,7 +159,7 @@ impl CSBTreeString {
     fn __getitem__(&self, py: Python<'_>, key: String) -> PyResult<Py<PyBytes>> {
         self.inner
             .get(&key)
-            .map(|v| PyBytes::new_bound(py, v).into())
+            .map(|v| PyBytes::new(py, v).into())
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Key not found"))
     }
 
@@ -178,30 +178,30 @@ impl CSBTreeString {
 
     fn keys(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let keys: Vec<String> = self.inner.iter().map(|(k, _)| k.clone()).collect();
-        Ok(PyList::new_bound(py, keys).into())
+        Ok(PyList::new(py, keys)?.into())
     }
 
     fn values(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let values: Vec<_> = self.inner.iter().map(|(_, v)| PyBytes::new_bound(py, v)).collect();
-        Ok(PyList::new_bound(py, values).into())
+        let values: Vec<_> = self.inner.iter().map(|(_, v)| PyBytes::new(py, v)).collect();
+        Ok(PyList::new(py, values)?.into())
     }
 
     fn items(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let items: Vec<_> = self
             .inner
             .iter()
-            .map(|(k, v)| (k.clone(), PyBytes::new_bound(py, v)))
+            .map(|(k, v)| (k.clone(), PyBytes::new(py, v)))
             .collect();
-        Ok(PyList::new_bound(py, items).into())
+        Ok(PyList::new(py, items)?.into())
     }
 
     fn range(&self, py: Python<'_>, start: String, end: String) -> PyResult<Py<PyList>> {
         let results: Vec<_> = self
             .inner
             .range(start..end)
-            .map(|(k, v)| (k.clone(), PyBytes::new_bound(py, v)))
+            .map(|(k, v)| (k.clone(), PyBytes::new(py, v)))
             .collect();
-        Ok(PyList::new_bound(py, results).into())
+        Ok(PyList::new(py, results)?.into())
     }
 
     fn clear(&mut self) {
@@ -217,7 +217,7 @@ impl CSBTreeString {
         let items: Vec<(String, Py<PyBytes>)> = slf
             .inner
             .iter()
-            .map(|(k, v)| (k.clone(), PyBytes::new_bound(py, v).into()))
+            .map(|(k, v)| (k.clone(), PyBytes::new(py, v).into()))
             .collect();
         Ok(items.into_py(py))
     }

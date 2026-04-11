@@ -24,10 +24,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -42,7 +47,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           # Build for multiple Python versions
-          maturin build --release --interpreter python3.10 python3.11 python3.12 python3.13
+          maturin build --release --interpreter python3.10 python3.11 python3.12 python3.13 python3.14
         env:
           # Enable full CPU optimizations
           RUSTFLAGS: "-C target-cpu=native"
@@ -50,14 +55,14 @@ jobs:
       - name: Build wheels (Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          maturin build --release --interpreter python3.10 python3.11 python3.12 python3.13
+          maturin build --release --interpreter python3.10 python3.11 python3.12 python3.13 python3.14
 
       - name: Build wheels (macOS)
         if: matrix.os == 'macos-latest'
         run: |
           # Build for Apple Silicon only (M1/M2/M3)
           rustup target add aarch64-apple-darwin
-          maturin build --release --interpreter python3.10 python3.11 python3.12 python3.13 --target aarch64-apple-darwin
+          maturin build --release --interpreter python3.10 python3.11 python3.12 python3.13 python3.14 --target aarch64-apple-darwin
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4

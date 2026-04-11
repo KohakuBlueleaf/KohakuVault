@@ -196,7 +196,7 @@ pub fn unpack_vector(
     }
 
     // Import numpy
-    let numpy = py.import_bound("numpy")?;
+    let numpy = py.import("numpy")?;
 
     // Convert data to Python list based on element type
     let flat_list = create_python_list(py, &data[pos..pos + data_bytes], element_type, elem_count)?;
@@ -210,7 +210,7 @@ pub fn unpack_vector(
 
     // Reshape if needed
     if shape.len() > 1 {
-        let shape_tuple = pyo3::types::PyTuple::new_bound(py, &shape);
+        let shape_tuple = pyo3::types::PyTuple::new(py, &shape)?;
         let reshaped = array.call_method1("reshape", (shape_tuple,))?;
         Ok(reshaped.into())
     } else {
@@ -224,7 +224,7 @@ fn extract_array_data(
     element_type: ElementType,
 ) -> Result<(Vec<usize>, Vec<u8>), PyErr> {
     // Try to get numpy array
-    let numpy = value.py().import_bound("numpy")?;
+    let numpy = value.py().import("numpy")?;
 
     // Convert to numpy array if not already
     let array = if value.hasattr("__array__")? {
@@ -257,7 +257,7 @@ fn create_python_list(
     element_type: ElementType,
     count: usize,
 ) -> Result<Py<PyList>, PyErr> {
-    let list = PyList::empty_bound(py);
+    let list = PyList::empty(py);
 
     match element_type {
         ElementType::F32 => {

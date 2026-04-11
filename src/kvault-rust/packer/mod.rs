@@ -307,7 +307,7 @@ impl DataPacker {
     /// Pack single value to bytes
     pub fn pack(&self, py: Python, value: &Bound<PyAny>) -> PyResult<Py<PyBytes>> {
         let bytes = self.pack_impl(py, value)?;
-        Ok(PyBytes::new_bound(py, &bytes).unbind())
+        Ok(PyBytes::new(py, &bytes).unbind())
     }
 
     /// Pack multiple values to concatenated bytes
@@ -325,7 +325,7 @@ impl DataPacker {
             result.extend_from_slice(&bytes);
         }
 
-        Ok(PyBytes::new_bound(py, &result).unbind())
+        Ok(PyBytes::new(py, &result).unbind())
     }
 
     /// Unpack single value from bytes at offset
@@ -352,7 +352,7 @@ impl DataPacker {
             }
         }
 
-        let list = PyList::empty_bound(py);
+        let list = PyList::empty(py);
         let elem_size = self.dtype.elem_size();
 
         if elem_size == 0 {
@@ -491,7 +491,7 @@ impl DataPacker {
                 }
                 let bytes: [u8; 8] = data[offset..offset + 8].try_into().unwrap();
                 let val = i64::from_le_bytes(bytes);
-                Ok(val.into_py(py))
+                Ok(val.into_pyobject(py).unwrap().into_any().unbind())
             }
 
             PackerDType::F64 => {
@@ -500,7 +500,7 @@ impl DataPacker {
                 }
                 let bytes: [u8; 8] = data[offset..offset + 8].try_into().unwrap();
                 let val = f64::from_le_bytes(bytes);
-                Ok(val.into_py(py))
+                Ok(val.into_pyobject(py).unwrap().into_any().unbind())
             }
 
             PackerDType::String { encoding, fixed_size } => {

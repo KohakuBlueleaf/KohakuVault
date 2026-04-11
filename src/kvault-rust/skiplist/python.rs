@@ -119,7 +119,7 @@ impl PySkipList {
                 Py::<PyAny>::from_owned_ptr_or_opt(py, k.obj.as_ptr()).expect("INCREF failed")
             })
             .collect();
-        Ok(PyList::new_bound(py, keys).into())
+        Ok(PyList::new(py, keys)?.into())
     }
 
     /// Get all values in key order (snapshot view)
@@ -132,7 +132,7 @@ impl PySkipList {
                 Py::<PyAny>::from_owned_ptr_or_opt(py, arc_v.obj.as_ptr()).expect("INCREF failed")
             })
             .collect();
-        Ok(PyList::new_bound(py, values).into())
+        Ok(PyList::new(py, values)?.into())
     }
 
     /// Get all (key, value) pairs (snapshot view)
@@ -150,7 +150,7 @@ impl PySkipList {
                 )
             })
             .collect();
-        Ok(PyList::new_bound(py, items).into())
+        Ok(PyList::new(py, items)?.into())
     }
 
     /// Clear all entries
@@ -183,7 +183,7 @@ impl PySkipList {
             })
             .collect();
 
-        Ok(PyList::new_bound(py, results).into())
+        Ok(PyList::new(py, results)?.into())
     }
 }
 

@@ -152,7 +152,7 @@ pub fn unpack_string(
         string
     };
 
-    Ok(trimmed.into_py(py))
+    Ok(trimmed.into_pyobject(py).unwrap().into_any().unbind())
 }
 
 /// Unpack bytes from data with optional fixed size.
@@ -168,7 +168,7 @@ pub fn unpack_bytes(
     }
 
     let bytes = &data[offset..offset + size];
-    Ok(PyBytes::new_bound(py, bytes).into())
+    Ok(PyBytes::new(py, bytes).into())
 }
 
 #[cfg(test)]

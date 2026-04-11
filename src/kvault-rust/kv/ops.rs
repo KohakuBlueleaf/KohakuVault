@@ -175,10 +175,10 @@ impl _KVault {
             }
 
             // No header - return raw bytes
-            Ok(PyBytes::new_bound(py, &data).into())
+            Ok(PyBytes::new(py, &data).into())
         } else {
             // Auto-pack disabled - always return raw bytes
-            Ok(PyBytes::new_bound(py, &data).into())
+            Ok(PyBytes::new(py, &data).into())
         }
     }
 
@@ -265,7 +265,7 @@ impl _KVault {
                 .map_err(VaultError::from)?;
             for r in iter {
                 let kb = r.map_err(VaultError::from)?;
-                out.push(PyBytes::new_bound(py, &kb).unbind());
+                out.push(PyBytes::new(py, &kb).unbind());
             }
         } else {
             let sql = format!(
@@ -283,7 +283,7 @@ impl _KVault {
                 .map_err(VaultError::from)?;
             for r in iter {
                 let kb = r.map_err(VaultError::from)?;
-                out.push(PyBytes::new_bound(py, &kb).unbind());
+                out.push(PyBytes::new(py, &kb).unbind());
             }
         }
         Ok(out)

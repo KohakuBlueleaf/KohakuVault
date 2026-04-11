@@ -22,11 +22,11 @@ pub fn pack_many_vectors_fixed(
     let count = values.len();
 
     if count == 0 {
-        return Ok(PyBytes::new_bound(py, &[]).unbind());
+        return Ok(PyBytes::new(py, &[]).unbind());
     }
 
     // Import numpy
-    let numpy = py.import_bound("numpy")?;
+    let numpy = py.import("numpy")?;
     let dtype_str = element_type.to_numpy_dtype();
 
     // Calculate sizes
@@ -81,7 +81,7 @@ pub fn pack_many_vectors_fixed(
         }
     }
 
-    Ok(PyBytes::new_bound(py, &result).unbind())
+    Ok(PyBytes::new(py, &result).unbind())
 }
 
 /// Optimized bulk unpack for fixed-shape vectors
@@ -95,11 +95,11 @@ pub fn unpack_many_vectors_fixed(
     shape: &[usize],
 ) -> Result<Py<PyList>, PyErr> {
     if count == 0 {
-        return Ok(PyList::empty_bound(py).unbind());
+        return Ok(PyList::empty(py).unbind());
     }
 
     // Import numpy
-    let numpy = py.import_bound("numpy")?;
+    let numpy = py.import("numpy")?;
 
     // Calculate sizes
     let elem_count: usize = shape.iter().product();
@@ -115,7 +115,7 @@ pub fn unpack_many_vectors_fixed(
         )));
     }
 
-    let list = PyList::empty_bound(py);
+    let list = PyList::empty(py);
     let dtype_str = element_type.to_numpy_dtype();
 
     // Process each vector
@@ -138,11 +138,11 @@ pub fn unpack_many_vectors_fixed(
 
         // Use numpy.frombuffer for efficient conversion
         let array =
-            numpy.call_method1("frombuffer", (PyBytes::new_bound(py, vec_data), dtype_str))?;
+            numpy.call_method1("frombuffer", (PyBytes::new(py, vec_data), dtype_str))?;
 
         // Reshape if multi-dimensional
         let final_array = if shape.len() > 1 {
-            let shape_tuple = pyo3::types::PyTuple::new_bound(py, shape);
+            let shape_tuple = pyo3::types::PyTuple::new(py, shape)?;
             array.call_method1("reshape", (shape_tuple,))?
         } else {
             array

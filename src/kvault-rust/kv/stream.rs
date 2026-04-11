@@ -139,7 +139,7 @@ impl _KVault {
         // Check cache first
         if let Some(cache) = self.cache.lock().unwrap().as_ref() {
             if let Some(v) = cache.map.get(&k) {
-                writer.call_method1("write", (PyBytes::new_bound(py, v),))?;
+                writer.call_method1("write", (PyBytes::new(py, v),))?;
                 return Ok(v.len());
             }
         }
@@ -181,7 +181,7 @@ impl _KVault {
             if n == 0 {
                 break;
             }
-            writer.call_method1("write", (PyBytes::new_bound(py, &buf[..n]),))?;
+            writer.call_method1("write", (PyBytes::new(py, &buf[..n]),))?;
             offset += n;
         }
         Ok(offset)

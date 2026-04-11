@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kohakuvault"
-version = "0.8.0"
+version = "0.8.1"
 description = "SQLite-backed KV store (Rust+PyO3) with vector search, auto-packing, and efficient array storage"
 authors = [
     { name = "KohakuVault Contributors" }
@@ -22,6 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Rust",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
@@ -64,7 +65,7 @@ kohakuvault = ["py.typed", "*.pyi", "*.pyd", "*.so", "*.dylib"]
 
 [tool.black]
 line-length = 100
-target-version = ["py310", "py311", "py312", "py313"]
+target-version = ["py310", "py311", "py312", "py313", "py314"]
 include = '\.pyi?$'
 
 [tool.pytest.ini_options]
