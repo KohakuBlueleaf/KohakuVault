@@ -61,11 +61,11 @@ jobs:
           path: coverage.xml
 
       - name: Format check (Python)
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14'
         run: |
           pip install black
           black --check src/kohakuvault
 
       - name: Format check (Rust)
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14'
         run: cargo fmt --check
