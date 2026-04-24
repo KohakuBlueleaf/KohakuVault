@@ -35,7 +35,7 @@ jobs:
         run: python -m pip install --upgrade pip maturin
 
       - name: Build wheel
-        run: maturin build --release --locked
+        run: maturin build --release
 
       - name: Install built wheel with test dependencies
         shell: bash
@@ -91,7 +91,7 @@ jobs:
         run: python -m pip install --upgrade pip maturin
 
       - name: Build wheel
-        run: maturin build --release --locked
+        run: maturin build --release
 
       - name: Install built wheel with test dependencies
         shell: bash
