@@ -13,6 +13,7 @@
 use pyo3::prelude::*;
 use rusqlite::ffi::sqlite3_auto_extension;
 use sqlite_vec::sqlite3_vec_init;
+use std::ffi::c_char;
 
 mod col;
 mod common;
@@ -36,7 +37,7 @@ fn init_sqlite_vec() {
                 *const (),
                 unsafe extern "C" fn(
                     *mut rusqlite::ffi::sqlite3,
-                    *mut *const i8,
+                    *mut *const c_char,
                     *const rusqlite::ffi::sqlite3_api_routines,
                 ) -> i32,
             >(sqlite3_vec_init as *const ())));

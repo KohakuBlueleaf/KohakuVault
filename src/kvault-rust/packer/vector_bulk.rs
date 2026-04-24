@@ -137,8 +137,7 @@ pub fn unpack_many_vectors_fixed(
         let vec_data = &data[data_start..data_end];
 
         // Use numpy.frombuffer for efficient conversion
-        let array =
-            numpy.call_method1("frombuffer", (PyBytes::new(py, vec_data), dtype_str))?;
+        let array = numpy.call_method1("frombuffer", (PyBytes::new(py, vec_data), dtype_str))?;
 
         // Reshape if multi-dimensional
         let final_array = if shape.len() > 1 {

@@ -23,11 +23,11 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             manylinux: '2_28'
-            args: --release --locked --compatibility pypi
+            args: --release --locked
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             manylinux: '2_28'
-            args: --release --locked --compatibility pypi
+            args: --release --locked
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             manylinux: ''
@@ -36,7 +36,7 @@ jobs:
             target: aarch64-pc-windows-msvc
             manylinux: ''
             args: --release --locked
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             manylinux: ''
             args: --release --locked
@@ -60,7 +60,7 @@ jobs:
           maturin-version: v1.8.7
           target: ${{ matrix.platform.target }}
           manylinux: ${{ matrix.platform.manylinux }}
-          args: ${{ matrix.platform.args }} --interpreter python${{ matrix.python-version }}
+          args: ${{ matrix.platform.args }} --interpreter python${{ matrix.python-version }} --out dist
 
       - name: Build wheels (non-Linux)
         if: runner.os != 'Linux'
@@ -69,13 +69,13 @@ jobs:
           maturin-version: v1.8.7
           target: ${{ matrix.platform.target }}
           manylinux: ${{ matrix.platform.manylinux }}
-          args: ${{ matrix.platform.args }} --interpreter python
+          args: ${{ matrix.platform.args }} --interpreter python --out dist
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.platform.target }}-py${{ matrix.python-version }}
-          path: target/wheels/
+          path: dist/
           retention-days: 7
 
   build-sdist:
@@ -94,13 +94,13 @@ jobs:
         run: pip install maturin
 
       - name: Build sdist
-        run: maturin sdist --locked
+        run: maturin sdist --locked --out dist
 
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:
           name: sdist
-          path: target/wheels/*.tar.gz
+          path: dist/*.tar.gz
           retention-days: 7
 
   publish-to-pypi:
