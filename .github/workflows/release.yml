@@ -32,10 +32,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             manylinux: ''
             args: --release
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            manylinux: ''
-            args: --release
           - os: macos-14
             target: aarch64-apple-darwin
             manylinux: ''
