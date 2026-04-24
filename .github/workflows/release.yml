@@ -36,10 +36,6 @@ jobs:
             target: aarch64-pc-windows-msvc
             manylinux: ''
             args: --release --locked
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            manylinux: ''
-            args: --release --locked
           - os: macos-14
             target: aarch64-apple-darwin
             manylinux: ''
