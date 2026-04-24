@@ -8,66 +8,73 @@ on:
       - 'v*'
   workflow_dispatch:
 
-# Default permissions for all jobs (can be overridden per job)
 permissions:
   contents: read
 
 jobs:
   build-wheels:
-    name: Build wheels on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Build cp${{ matrix.python-version }} for ${{ matrix.platform.target }} on ${{ matrix.platform.os }}
+    runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        platform:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: '2_28'
+            args: --release --locked --compatibility pypi
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: '2_28'
+            args: --release --locked --compatibility pypi
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            manylinux: ''
+            args: --release --locked
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            manylinux: ''
+            args: --release --locked
+          - os: macos-13
+            target: x86_64-apple-darwin
+            manylinux: ''
+            args: --release --locked
+          - os: macos-14
+            target: aarch64-apple-darwin
+            manylinux: ''
+            args: --release --locked
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.10
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-
-      - name: Set up Python 3.14
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.14'
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install maturin
-        run: pip install maturin
+          python-version: ${{ matrix.python-version }}
 
       - name: Build wheels (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          # Build for multiple Python versions
-          maturin build --release --interpreter python3.10 python3.11 python3.12 python3.13 python3.14
-        env:
-          # Enable full CPU optimizations
-          RUSTFLAGS: "-C target-cpu=native"
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.8.7
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          args: ${{ matrix.platform.args }} --interpreter python${{ matrix.python-version }}
 
-      - name: Build wheels (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          maturin build --release --interpreter python3.10 python3.11 python3.12 python3.13 python3.14
-
-      - name: Build wheels (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          # Build for Apple Silicon only (M1/M2/M3)
-          rustup target add aarch64-apple-darwin
-          maturin build --release --interpreter python3.10 python3.11 python3.12 python3.13 python3.14 --target aarch64-apple-darwin
+      - name: Build wheels (non-Linux)
+        if: runner.os != 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.8.7
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          args: ${{ matrix.platform.args }} --interpreter python
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.platform.target }}-py${{ matrix.python-version }}
           path: target/wheels/
           retention-days: 7
 
@@ -87,7 +94,7 @@ jobs:
         run: pip install maturin
 
       - name: Build sdist
-        run: maturin sdist
+        run: maturin sdist --locked
 
       - name: Upload sdist
         uses: actions/upload-artifact@v4
@@ -100,14 +107,13 @@ jobs:
     name: Publish to PyPI
     needs: [build-wheels, build-sdist]
     runs-on: ubuntu-latest
-    # Only publish on tag pushes or releases
     if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
     environment:
       name: pypi
       url: https://pypi.org/p/kohakuvault
     permissions:
-      contents: write      # IMPORTANT: needed to upload to GitHub Releases
-      id-token: write      # IMPORTANT: mandatory for trusted publishing
+      contents: write
+      id-token: write
 
     steps:
       - name: Download all artifacts
