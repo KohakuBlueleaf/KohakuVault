@@ -192,8 +192,10 @@ def benchmark_vectors(n_ops=10000):
         elif "i64" in dtype:
             data = [np.arange(dim_or_total, dtype=np.int64) for _ in range(n_ops)]
         elif "f32" in dtype:
-            if ":" in dtype.split("f32")[1]:  # Fixed shape
-                data = [np.random.randn(dim_or_total).astype(np.float32) for _ in range(n_ops)]
+            if ":" in dtype.split("f32")[1]:  # Fixed shape like vec:f32:28:28
+                dims_str = dtype.split("f32:")[1]
+                shape = tuple(int(d) for d in dims_str.split(":"))
+                data = [np.random.randn(*shape).astype(np.float32) for _ in range(n_ops)]
             else:  # Arbitrary shape
                 data = [np.random.randn(dim_or_total).astype(np.float32) for _ in range(n_ops)]
 
