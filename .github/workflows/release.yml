@@ -88,15 +88,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Only arm64 and x86_64 — these are the two ABIs that
+        # PyO3/maturin-action ships an Android cross-prefix for
+        # (``androidPythonTriplet`` map in maturin-action's
+        # src/index.ts).  armv7 and x86 aren't in that map, so the
+        # action skips its prefix download and maturin's own probe
+        # fails.  arm64 covers all modern devices; x86_64 covers
+        # emulators.  If armv7/x86 ever become a real need, switch
+        # to a hand-rolled NDK + Chaquopy tarball setup for them.
         include:
           - target: aarch64-linux-android
             android_abi: arm64-v8a
-          - target: armv7-linux-androideabi
-            android_abi: armeabi-v7a
           - target: x86_64-linux-android
             android_abi: x86_64
-          - target: i686-linux-android
-            android_abi: x86
     steps:
       - uses: actions/checkout@v4
 
@@ -119,20 +123,21 @@ jobs:
           # ANDROID_NDK_HOME — re-export so maturin sees it.
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          # Pin the target Python version for the cross-compile
-          # sysconfig scan.  Without this, maturin enumerates every
-          # ``lib/pythonX.Y/`` it finds in the cross prefix — which
-          # tripped a bug in <1.9.5 around 3.14's PEP 739
-          # ``build-details.json`` (file vs. dir).
+          # Pin the cross-compile Python prefix to 3.13.  The action
+          # otherwise defaults to 3.14.3 (current python.org Android
+          # build), which doesn't match what Chaquopy/Briefcase ships
+          # downstream.  ``ANDROID_PYTHON_VERSION`` is the action's
+          # own knob (undocumented in README but used in its source).
+          ANDROID_PYTHON_VERSION: '3.13.7'
+          # Match the prefix version explicitly so PyO3 doesn't
+          # accidentally pick up a stray sysconfig.
           PYO3_CROSS_PYTHON_VERSION: '3.13'
         with:
           # >=1.9.5 — fixes the 3.14 build-details.json scan crash
-          # that hit when the bundled cross prefix added a 3.14
-          # sysconfig alongside 3.13.
+          # that hit when the bundled cross prefix had a 3.14
+          # sysconfig.
           maturin-version: v1.9.5
           target: ${{ matrix.target }}
-          # Android minSdk = 24.  Aligns with what Chaquopy ships +
-          # what consumers (KohakuTerrarium) require.
           args: --release --interpreter python3.13 --out dist
           # No manylinux — Android wheels use ``android_X_<abi>``
           # platform tags, not manylinux.
