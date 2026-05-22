@@ -119,8 +119,17 @@ jobs:
           # ANDROID_NDK_HOME — re-export so maturin sees it.
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          # Pin the target Python version for the cross-compile
+          # sysconfig scan.  Without this, maturin enumerates every
+          # ``lib/pythonX.Y/`` it finds in the cross prefix — which
+          # tripped a bug in <1.9.5 around 3.14's PEP 739
+          # ``build-details.json`` (file vs. dir).
+          PYO3_CROSS_PYTHON_VERSION: '3.13'
         with:
-          maturin-version: v1.8.7
+          # >=1.9.5 — fixes the 3.14 build-details.json scan crash
+          # that hit when the bundled cross prefix added a 3.14
+          # sysconfig alongside 3.13.
+          maturin-version: v1.9.5
           target: ${{ matrix.target }}
           # Android minSdk = 24.  Aligns with what Chaquopy ships +
           # what consumers (KohakuTerrarium) require.

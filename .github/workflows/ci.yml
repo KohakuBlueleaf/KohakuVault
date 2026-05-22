@@ -126,8 +126,11 @@ jobs:
         env:
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          # Pin cross-target Python version — see release.yml for
+          # the full reasoning (maturin <1.9.5 + 3.14 sysconfig).
+          PYO3_CROSS_PYTHON_VERSION: '3.13'
         with:
-          maturin-version: v1.8.7
+          maturin-version: v1.9.5
           target: aarch64-linux-android
           args: --release --interpreter python3.13 --out dist
           manylinux: 'off'
