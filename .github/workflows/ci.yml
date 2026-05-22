@@ -101,3 +101,39 @@ jobs:
 
       - name: Run tests
         run: pytest -v
+
+  android-smoke-build:
+    # Cross-compile smoke for Android — catches build regressions
+    # (NDK incompatibility, Rust dep that doesn't have a target,
+    # PyO3 cross-config drift) on every PR so the release.yml's
+    # full matrix doesn't surprise us at tag-time.  Only arm64
+    # is built here; the release matrix covers all four ABIs.
+    name: Android cross-compile smoke (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+      - name: Cross-compile via maturin
+        uses: PyO3/maturin-action@v1
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        with:
+          maturin-version: v1.8.7
+          target: aarch64-linux-android
+          args: --release --interpreter python3.13 --out dist
+          manylinux: 'off'
+      - name: Verify wheel produced
+        run: |
+          ls -lh dist/
+          test -n "$(ls dist/*.whl 2>/dev/null)" || {
+              echo "::error::No Android wheel produced"; exit 1;
+          }

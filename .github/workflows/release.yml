@@ -70,6 +70,72 @@ jobs:
           path: dist/
           retention-days: 7
 
+  # ── Android wheel build ─────────────────────────────────────────────
+  # Cross-compile to Android via maturin's built-in Android target
+  # handling.  Built separately from the desktop matrix because:
+  #
+  # 1. Only Python 3.13 is supported by Chaquopy's curated index, so
+  #    we build only that interpreter version (the one Briefcase
+  #    Android ships).
+  # 2. NDK + cross-toolchain setup is Android-specific; bundling it
+  #    into the desktop matrix would slow + complicate every build.
+  # 3. The wheel tags ``android_<api>_<arch>`` are PEP 738; PyPI
+  #    started accepting them in late 2024.  Older pip / pip on
+  #    desktop ignores them, so they don't pollute desktop installs.
+  build-wheels-android:
+    name: Build Android wheel for ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            android_abi: arm64-v8a
+          - target: armv7-linux-androideabi
+            android_abi: armeabi-v7a
+          - target: x86_64-linux-android
+            android_abi: x86_64
+          - target: i686-linux-android
+            android_abi: x86
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+
+      - name: Build Android wheel via maturin
+        uses: PyO3/maturin-action@v1
+        env:
+          # Maturin reads ANDROID_NDK_ROOT for cross-compile.  The
+          # NDK setup action above sets this implicitly via
+          # ANDROID_NDK_HOME — re-export so maturin sees it.
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        with:
+          maturin-version: v1.8.7
+          target: ${{ matrix.target }}
+          # Android minSdk = 24.  Aligns with what Chaquopy ships +
+          # what consumers (KohakuTerrarium) require.
+          args: --release --interpreter python3.13 --out dist
+          # No manylinux — Android wheels use ``android_X_<abi>``
+          # platform tags, not manylinux.
+          manylinux: 'off'
+
+      - name: Upload Android wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}-py3.13
+          path: dist/
+          retention-days: 7
+
   build-sdist:
     name: Build source distribution
     runs-on: ubuntu-latest
@@ -97,7 +163,14 @@ jobs:
 
   publish-to-pypi:
     name: Publish to PyPI
-    needs: [build-wheels, build-sdist]
+    # Depends on the Android wheel job too so the GitHub Release
+    # has every artifact a downstream consumer (KohakuTerrarium's
+    # Android build) needs in one place.  Android wheels go to the
+    # GH Release; whether they also publish to PyPI depends on
+    # PyPI's PEP 738 enforcement (twine may reject ``android_*``
+    # tags on older PyPI configurations — the ``skip-existing``
+    # + per-file upload pattern below handles both cases).
+    needs: [build-wheels, build-wheels-android, build-sdist]
     runs-on: ubuntu-latest
     if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
     environment:
@@ -118,15 +191,39 @@ jobs:
       - name: List artifacts
         run: ls -lh dist/
 
-      - name: Upload wheels to GitHub Release
+      - name: Upload all wheels + sdist to GitHub Release
+        # Includes the Android wheels.  GH Releases is the
+        # authoritative download site for KohakuTerrarium's
+        # Android build (which fetches via ``--find-links`` into
+        # Chaquopy's pip), since PyPI may or may not accept
+        # ``android_*`` tags depending on its PEP 738 rollout.
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: dist/*
           fail_on_unmatched_files: false
 
-      - name: Publish to PyPI
+      - name: Separate Android wheels (keep them off PyPI)
+        # Some PyPI configurations still reject ``android_*``
+        # platform tags.  Stash them aside before the PyPI publish
+        # step + put them back after.  The GH Release upload
+        # above already shipped them.
+        run: |
+          mkdir -p dist-pypi dist-android
+          cp dist/*.whl dist-pypi/ 2>/dev/null || true
+          cp dist/*.tar.gz dist-pypi/ 2>/dev/null || true
+          # Move android-tagged wheels out of the pypi staging.
+          for f in dist-pypi/*-linux_android*.whl dist-pypi/*-android_*.whl; do
+            [ -e "$f" ] && mv "$f" dist-android/
+          done
+          echo "PyPI batch:"
+          ls -1 dist-pypi/ || true
+          echo "Android-only batch (GH Release only):"
+          ls -1 dist-android/ || true
+
+      - name: Publish desktop wheels + sdist to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          packages-dir: dist-pypi
           skip-existing: true
           verbose: true
