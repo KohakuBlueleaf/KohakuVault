@@ -147,14 +147,31 @@ jobs:
         env:
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          # Tell maturin the Android API level to embed in the wheel
+          # platform tag.  Without this, maturin (1.12.4+) falls back
+          # to scraping the build host's kernel version and emits
+          # garbage tags like ``android_6_12_<kernel>_aarch64`` — not
+          # a hard error, silently broken.  Chaquopy floors at API 24
+          # (Android 7.0).
+          ANDROID_API_VERSION: '24'
         with:
-          maturin-version: v1.9.5
+          # >=1.12.4 emits proper ``android_<api>_<abi>`` PEP 738 tags
+          # for the ``*-linux-android`` Rust targets directly; no
+          # post-build retag step needed.  v1.13.3 is current latest.
+          # 1.11.0 was yanked; 1.12.0-1.12.3 had the fix but were buggy.
+          maturin-version: v1.13.3
           target: aarch64-linux-android
           args: --release --interpreter python3.13 --out dist
           manylinux: 'off'
-      - name: Verify wheel produced
+      - name: Verify android_24_arm64_v8a wheel produced
+        # Sanity check that the env var stuck — if ANDROID_API_VERSION
+        # wasn't picked up, the wheel will have a garbage platform tag
+        # and we want to fail loud here, not at downstream Chaquopy
+        # install time.
         run: |
           ls -lh dist/
-          test -n "$(ls dist/*.whl 2>/dev/null)" || {
-              echo "::error::No Android wheel produced"; exit 1;
+          test -n "$(ls dist/*-android_24_arm64_v8a.whl 2>/dev/null)" || {
+              echo "::error::Expected an *android_24_arm64_v8a.whl in dist/; got:"
+              ls dist/ || true
+              exit 1
           }

@@ -157,17 +157,48 @@ jobs:
         env:
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          # Tell maturin the Android API level to embed in the wheel
+          # platform tag.  Without this, maturin scrapes the build
+          # host's kernel and emits garbage tags like
+          # ``android_6_12_<kernel>_<arch>`` — silent breakage, not a
+          # hard error.  Chaquopy's minSdk floor is 24 (Android 7.0)
+          # and matches Chaquopy's own curated index, e.g.
+          # ``pyyaml-6.0.3-0-cp313-cp313-android_24_arm64_v8a.whl``.
+          ANDROID_API_VERSION: '24'
           # PYO3_CROSS_LIB_DIR + RUSTFLAGS already in $GITHUB_ENV
           # from the staging step above.  maturin-action's own
           # prefix-download path is guarded by ``if (!PYO3_CROSS_LIB_DIR)``,
           # so it skips when ours is pre-set.
         with:
-          maturin-version: v1.9.5
+          # >=1.12.4 emits proper PEP 738 ``android_<api>_<abi>`` tags
+          # for ``*-linux-android`` Rust targets directly (PR #2992 +
+          # #3023).  Older maturin treated those targets as Linux and
+          # emitted ``linux_<arch>``, which Chaquopy's pip rejects.
+          # 1.11.0 was yanked; 1.12.0-1.12.3 had the fix but were
+          # buggy.  v1.13.3 is current latest stable as of 2026-05.
+          maturin-version: v1.13.3
           target: ${{ matrix.target }}
           args: --release --interpreter python3.13 --out dist
-          # No manylinux — Android wheels use ``android_X_<abi>``
+          # No manylinux — Android wheels use PEP 738 ``android_*``
           # platform tags, not manylinux.
           manylinux: 'off'
+
+      - name: Verify android_24_<abi> wheel produced
+        # Sanity check that ANDROID_API_VERSION stuck.  If it didn't,
+        # the wheel filename will contain a kernel version instead of
+        # ``android_24_*`` and Chaquopy will reject it at install time
+        # — fail the build here loudly so we catch it before publish.
+        env:
+          ABI: ${{ matrix.android_abi }}
+        run: |
+          set -euo pipefail
+          expected_tag="android_24_${ABI//-/_}"
+          ls -lh dist/
+          test -n "$(ls dist/*-${expected_tag}.whl 2>/dev/null)" || {
+              echo "::error::Expected an *${expected_tag}.whl in dist/; got:"
+              ls dist/ || true
+              exit 1
+          }
 
       - name: Upload Android wheel
         uses: actions/upload-artifact@v4
