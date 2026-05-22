@@ -115,27 +115,53 @@ jobs:
         with:
           ndk-version: r27c
 
+      - name: Stage Chaquopy Android Python cross-prefix
+        # Download the prefix ourselves rather than let maturin-action
+        # do it.  Two reasons:
+        #
+        # 1. maturin-action defaults to python.org's 3.14.3 PEP 738
+        #    build, which doesn't match Chaquopy/Briefcase 3.13.
+        # 2. Even with ANDROID_PYTHON_VERSION=3.13.7, maturin internally
+        #    re-targets PYO3_CROSS_LIB_DIR to ``prefix/lib/python3.13``
+        #    (where sysconfig lives) but ``libpython3.13.so`` is one
+        #    level up in ``prefix/lib`` — so the linker can't find it.
+        #
+        # Doing it ourselves lets us pin both PYO3_CROSS_LIB_DIR
+        # (sysconfig discovery) AND RUSTFLAGS ``-L native=...``
+        # (libpython3.13.so discovery for the linker).
+        env:
+          PY_VER: '3.13.7'
+          TARGET_TRIPLET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          PREFIX_DIR="$RUNNER_TEMP/python-android-$TARGET_TRIPLET"
+          mkdir -p "$PREFIX_DIR"
+          URL="https://repo.maven.apache.org/maven2/com/chaquo/python/python/${PY_VER}/python-${PY_VER}-${TARGET_TRIPLET}.tar.gz"
+          echo "Fetching $URL"
+          curl -sSfL "$URL" -o "$PREFIX_DIR/python.tar.gz"
+          tar -xzf "$PREFIX_DIR/python.tar.gz" -C "$PREFIX_DIR"
+          LIB_DIR="$PREFIX_DIR/prefix/lib"
+          test -f "$LIB_DIR/libpython3.13.so" || {
+            echo "::error::libpython3.13.so not found at $LIB_DIR"
+            ls -la "$LIB_DIR" || true
+            exit 1
+          }
+          echo "PYO3_CROSS_LIB_DIR=$LIB_DIR"     >> "$GITHUB_ENV"
+          echo "PYO3_CROSS_PYTHON_VERSION=3.13"  >> "$GITHUB_ENV"
+          # Explicit ``-L`` so the linker finds libpython3.13.so even
+          # after maturin's internal PYO3_CROSS_LIB_DIR override.
+          echo "RUSTFLAGS=-L native=$LIB_DIR"    >> "$GITHUB_ENV"
+
       - name: Build Android wheel via maturin
         uses: PyO3/maturin-action@v1
         env:
-          # Maturin reads ANDROID_NDK_ROOT for cross-compile.  The
-          # NDK setup action above sets this implicitly via
-          # ANDROID_NDK_HOME — re-export so maturin sees it.
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          # Pin the cross-compile Python prefix to 3.13.  The action
-          # otherwise defaults to 3.14.3 (current python.org Android
-          # build), which doesn't match what Chaquopy/Briefcase ships
-          # downstream.  ``ANDROID_PYTHON_VERSION`` is the action's
-          # own knob (undocumented in README but used in its source).
-          ANDROID_PYTHON_VERSION: '3.13.7'
-          # Match the prefix version explicitly so PyO3 doesn't
-          # accidentally pick up a stray sysconfig.
-          PYO3_CROSS_PYTHON_VERSION: '3.13'
+          # PYO3_CROSS_LIB_DIR + RUSTFLAGS already in $GITHUB_ENV
+          # from the staging step above.  maturin-action's own
+          # prefix-download path is guarded by ``if (!PYO3_CROSS_LIB_DIR)``,
+          # so it skips when ours is pre-set.
         with:
-          # >=1.9.5 — fixes the 3.14 build-details.json scan crash
-          # that hit when the bundled cross prefix had a 3.14
-          # sysconfig.
           maturin-version: v1.9.5
           target: ${{ matrix.target }}
           args: --release --interpreter python3.13 --out dist

@@ -121,15 +121,32 @@ jobs:
         id: setup-ndk
         with:
           ndk-version: r27c
+      - name: Stage Chaquopy Android Python cross-prefix
+        # See release.yml for the full reasoning — we download the
+        # Chaquopy 3.13 prefix ourselves so we can set PYO3_CROSS_LIB_DIR
+        # AND RUSTFLAGS ``-L`` to the right places.
+        env:
+          PY_VER: '3.13.7'
+          TARGET_TRIPLET: 'aarch64-linux-android'
+        run: |
+          set -euo pipefail
+          PREFIX_DIR="$RUNNER_TEMP/python-android-$TARGET_TRIPLET"
+          mkdir -p "$PREFIX_DIR"
+          URL="https://repo.maven.apache.org/maven2/com/chaquo/python/python/${PY_VER}/python-${PY_VER}-${TARGET_TRIPLET}.tar.gz"
+          curl -sSfL "$URL" -o "$PREFIX_DIR/python.tar.gz"
+          tar -xzf "$PREFIX_DIR/python.tar.gz" -C "$PREFIX_DIR"
+          LIB_DIR="$PREFIX_DIR/prefix/lib"
+          test -f "$LIB_DIR/libpython3.13.so" || {
+            echo "::error::libpython3.13.so not found"; ls -la "$LIB_DIR" || true; exit 1;
+          }
+          echo "PYO3_CROSS_LIB_DIR=$LIB_DIR"    >> "$GITHUB_ENV"
+          echo "PYO3_CROSS_PYTHON_VERSION=3.13" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=-L native=$LIB_DIR"   >> "$GITHUB_ENV"
       - name: Cross-compile via maturin
         uses: PyO3/maturin-action@v1
         env:
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          # Pin cross-prefix + target Python to 3.13.  See
-          # release.yml for the full reasoning.
-          ANDROID_PYTHON_VERSION: '3.13.7'
-          PYO3_CROSS_PYTHON_VERSION: '3.13'
         with:
           maturin-version: v1.9.5
           target: aarch64-linux-android
