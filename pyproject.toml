@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kohakuvault"
-version = "0.8.5"
+version = "0.8.6"
 description = "SQLite-backed KV store (Rust+PyO3) with vector search, auto-packing, and efficient array storage"
 authors = [
     { name = "KohakuVault Contributors" }
@@ -13,7 +13,7 @@ license = { text = "Apache-2.0" }
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=2.0.0",
+    "numpy>=1.26",
 ]
 
 classifiers = [
