@@ -234,13 +234,10 @@ jobs:
 
   publish-to-pypi:
     name: Publish to PyPI
-    # Depends on the Android wheel job too so the GitHub Release
-    # has every artifact a downstream consumer (KohakuTerrarium's
-    # Android build) needs in one place.  Android wheels go to the
-    # GH Release; whether they also publish to PyPI depends on
-    # PyPI's PEP 738 enforcement (twine may reject ``android_*``
-    # tags on older PyPI configurations — the ``skip-existing``
-    # + per-file upload pattern below handles both cases).
+    # Publishes every artifact (desktop wheels, Android wheels, sdist)
+    # to BOTH PyPI and the GH Release.  PyPI started accepting PEP 738
+    # ``android_<api>_<abi>`` tags via warehouse PR #17559 on
+    # 2025-02-10, and maturin >=1.12.4 emits exactly that format.
     needs: [build-wheels, build-wheels-android, build-sdist]
     runs-on: ubuntu-latest
     if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
@@ -252,54 +249,30 @@ jobs:
       id-token: write
 
     steps:
-      - name: Download all artifacts (one dir per artifact)
-        # No ``merge-multiple`` here — we sort by artifact NAME below
-        # because the wheel platform tag isn't always reliable.  In
-        # particular, maturin builds Android wheels against Chaquopy's
-        # Python whose sysconfig identifies as plain ``linux``, so the
-        # wheel filename comes out as ``cp313-cp313-linux_aarch64.whl``
-        # — indistinguishable from a desktop Linux ARM wheel by tag
-        # alone.  The artifact name (``wheels-aarch64-linux-android-*``
-        # vs ``wheels-aarch64-unknown-linux-gnu-*``) is the source of
-        # truth for "is this an Android wheel".
+      - name: Download all artifacts
+        # PyPI accepts PEP 738 ``android_<api>_<abi>`` platform tags
+        # since warehouse PR #17559 (merged 2025-02-10), and maturin
+        # 1.12.4+ emits exactly that format for ``*-linux-android``
+        # Rust targets.  No more filtering Android wheels out — they
+        # ship to both PyPI and the GH Release.
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: dist
+          pattern: '*'
+          merge-multiple: true
 
-      - name: Sort artifacts → dist/ (everything) + dist-pypi/ (no Android)
-        run: |
-          set -euo pipefail
-          mkdir -p dist dist-pypi
-          for dir in artifacts/*/; do
-            name="$(basename "$dir")"
-            # Everything goes to dist/ for the GH Release.
-            cp "$dir"/* dist/
-            # PyPI gets everything EXCEPT wheels from the Android build
-            # job, whose artifact name contains ``linux-android``.
-            if [[ "$name" != *"linux-android"* ]]; then
-              cp "$dir"/* dist-pypi/
-            fi
-          done
-          echo "GH Release batch ($(ls -1 dist/ | wc -l) files):"
-          ls -1 dist/
-          echo
-          echo "PyPI batch ($(ls -1 dist-pypi/ | wc -l) files):"
-          ls -1 dist-pypi/
+      - name: List artifacts
+        run: ls -lh dist/
 
       - name: Upload all wheels + sdist to GitHub Release
-        # Includes the Android wheels.  GH Releases is the
-        # authoritative download site for KohakuTerrarium's
-        # Android build (which fetches via ``--find-links`` into
-        # Chaquopy's pip).
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: dist/*
           fail_on_unmatched_files: false
 
-      - name: Publish desktop wheels + sdist to PyPI
+      - name: Publish to PyPI (all wheels + sdist)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist-pypi
           skip-existing: true
           verbose: true
