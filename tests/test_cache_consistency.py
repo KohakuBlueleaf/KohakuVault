@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+
 from kohakuvault import KVault
 from kohakuvault.errors import DatabaseBusy
 
@@ -19,9 +20,8 @@ def test_failed_flush_preserves_acknowledged_writes(tmp_path):
     vault["first"] = b"old"
     vault["second"] = b"keep"
     try:
-        with _sqlite_writer_lock(path):
-            with pytest.raises(DatabaseBusy):
-                vault.flush_cache()
+        with _sqlite_writer_lock(path), pytest.raises(DatabaseBusy):
+            vault.flush_cache()
         assert vault.get("first") == b"old"
         assert vault.get("second") == b"keep"
         vault["first"] = b"new"
@@ -90,6 +90,7 @@ def _run_in_child(scenario, path):
     result = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), scenario, str(path)],
         capture_output=True,
+        check=False,
         text=True,
         timeout=25,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -129,7 +130,7 @@ def _disable_scenario(path):
     def disable():
         try:
             vault.disable_cache()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - worker errors are asserted by the main thread
             errors.append(repr(exc))
         finally:
             shutdown_done.set()
@@ -138,7 +139,7 @@ def _disable_scenario(path):
         writer_started.set()
         try:
             vault["late"] = b"keep"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - worker errors are asserted by the main thread
             errors.append(repr(exc))
         finally:
             writer_done.set()
@@ -186,14 +187,14 @@ def _lock_scenario(path):
     def hold_connection():
         try:
             vault.get_to_file("persisted-stream", HoldingWriter())
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - worker errors are asserted by the main thread
             errors.append(repr(exc))
 
     def flush():
         flush_started.set()
         try:
             flushed.append(vault.flush_cache())
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - worker errors are asserted by the main thread
             errors.append(repr(exc))
         finally:
             flush_done.set()

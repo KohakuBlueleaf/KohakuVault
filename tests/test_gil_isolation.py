@@ -8,7 +8,22 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+
 from kohakuvault import KVault, TextVault
+
+# Holds a write lock on the database from another process for a fixed window.
+_LOCK_HOLDER = """
+import sqlite3
+import sys
+import time
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("BEGIN IMMEDIATE")
+print("locked", flush=True)
+time.sleep(0.8)
+connection.rollback()
+connection.close()
+"""
 
 
 @pytest.mark.parametrize("operation", ["put", "flush", "disable", "lock", "fts", "open"])
@@ -39,18 +54,15 @@ async def test_native_wait_releases_gil(tmp_path, operation):
 
         else:
             read = lambda: vault.get("existing")
-    child = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "import sqlite3,sys,time; c=sqlite3.connect(sys.argv[1]); c.execute('BEGIN IMMEDIATE'); print('locked',flush=True); time.sleep(0.8); c.rollback(); c.close()",
-            str(path),
-        ],
+    child = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _LOCK_HOLDER,
+        str(path),
         stdout=subprocess.PIPE,
-        text=True,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    assert child.stdout.readline().strip() == "locked"
+    assert (await child.stdout.readline()).strip() == b"locked"
     gaps = []
     running = True
 
@@ -85,8 +97,7 @@ async def test_native_wait_releases_gil(tmp_path, operation):
     finally:
         running = False
         await ticker
-        child.wait(timeout=5)
-        child.stdout.close()
+        await asyncio.wait_for(child.communicate(), timeout=5)
         if operation == "fts":
             del vault._vault
         else:
@@ -134,6 +145,7 @@ v.close()
     result = subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True,
+        check=False,
         text=True,
         timeout=3,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
