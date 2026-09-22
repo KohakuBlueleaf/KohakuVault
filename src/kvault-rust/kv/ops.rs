@@ -71,46 +71,46 @@ impl _KVault {
             }
         };
 
-        // Try to use cache if enabled
-        {
-            let mut guard = self.cache.lock().unwrap();
-            if let Some(cache) = guard.as_mut() {
+        py.allow_threads(|| -> PyResult<()> {
+            // Another detached writer can refill the cache while we flush.
+            // Retry until this value is accepted instead of ignoring a second
+            // NeedFlush result and acknowledging a write that was never stored.
+            loop {
+                let mut guard = self.cache.lock().unwrap();
+                let Some(cache) = guard.as_mut() else {
+                    break;
+                };
                 match cache.insert(k.clone(), v.clone()) {
                     Ok(()) => {
-                        // Successfully cached, check if should auto-flush
                         let should_flush = cache.should_flush();
-                        drop(guard); // Release lock before flush
-
+                        drop(guard);
                         if should_flush {
-                            self.flush_cache(py)?;
+                            self.flush_cache_native()?;
                         }
                         return Ok(());
                     }
                     Err(CacheError::ValueTooLarge) => {
-                        // Value too large for cache, flush existing then bypass cache
                         drop(guard);
-                        self.flush_cache(py)?;
-                        // Fall through to direct write
+                        self.flush_cache_native()?;
+                        break;
                     }
                     Err(CacheError::NeedFlush) => {
-                        // Cache full, flush then retry insert
-                        drop(guard);
-                        self.flush_cache(py)?;
-
-                        // Retry insert after flush
-                        let mut guard = self.cache.lock().unwrap();
-                        if let Some(cache) = guard.as_mut() {
-                            cache.insert(k, v).ok(); // Should succeed now
+                        if self.cache_locked.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err(VaultError::Cache(
+                                "cache is full while flushing is locked".into(),
+                            )
+                            .into());
                         }
-                        return Ok(());
+                        drop(guard);
+                        self.flush_cache_native()?;
                     }
                 }
             }
-        }
 
-        // Direct write (no cache or bypassed for large value)
-        self.write_direct(&k, &v)?;
-        Ok(())
+            // Direct write (no cache or bypassed for large value)
+            self.write_direct(&k, &v)?;
+            Ok(())
+        })
     }
 
     /// Get entire value as bytes (avoid for huge blobs; prefer get_to_file()).
@@ -126,37 +126,40 @@ impl _KVault {
     pub(crate) fn get_impl(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
         let k = to_key_bytes(py, key)?;
 
-        // Check write-back cache first
-        let cached_value = {
-            let cache_guard = self.cache.lock().unwrap();
-            cache_guard
-                .as_ref()
-                .and_then(|cache| cache.map.get(&k).cloned())
-        };
+        let data = py.allow_threads(|| -> PyResult<Vec<u8>> {
+            // Check write-back cache first
+            let cached_value = {
+                let cache_guard = self.cache.lock().unwrap();
+                cache_guard
+                    .as_ref()
+                    .and_then(|cache| cache.map.get(&k).cloned())
+            };
 
-        let data: Vec<u8> = if let Some(v) = cached_value {
-            v
-        } else {
-            let sql = format!(
-                "
+            let data: Vec<u8> = if let Some(v) = cached_value {
+                v
+            } else {
+                let sql = format!(
+                    "
                 SELECT value
                 FROM {}
                 WHERE key = ?1
                 ",
-                self.table
-            );
-            let conn = self.conn.lock().unwrap();
-            conn.query_row(&sql, params![k], |r| r.get(0))
-                .map_err(|e| -> PyErr {
-                    match e {
-                        rusqlite::Error::QueryReturnedNoRows => {
-                            VaultError::NotFound("Key not found".to_string()).into()
+                    self.table
+                );
+                let conn = self.conn.lock().unwrap();
+                conn.query_row(&sql, params![k], |r| r.get(0))
+                    .map_err(|e| -> PyErr {
+                        match e {
+                            rusqlite::Error::QueryReturnedNoRows => {
+                                VaultError::NotFound("Key not found".to_string()).into()
+                            }
+                            other => VaultError::from(other).into(),
                         }
-                        other => VaultError::from(other).into(),
-                    }
-                })?
-        };
+                    })?
+            };
 
+            Ok(data)
+        })?;
         // Check if auto-pack is enabled for auto-decoding
         let has_auto_pack = self.auto_packer.lock().unwrap().is_some();
 
@@ -191,16 +194,19 @@ impl _KVault {
     /// true if key was deleted, false if key didn't exist
     pub(crate) fn delete_impl(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<bool> {
         let k = to_key_bytes(py, key)?;
-        let sql = format!(
-            "
+
+        py.allow_threads(|| {
+            let sql = format!(
+                "
             DELETE FROM {}
             WHERE key = ?1
             ",
-            self.table
-        );
-        let conn = self.conn.lock().unwrap();
-        let n = conn.execute(&sql, params![k]).map_err(VaultError::from)?;
-        Ok(n > 0)
+                self.table
+            );
+            let conn = self.conn.lock().unwrap();
+            let n = conn.execute(&sql, params![k]).map_err(VaultError::from)?;
+            Ok(n > 0)
+        })
     }
 
     /// Check if a key exists.
@@ -212,18 +218,21 @@ impl _KVault {
     /// true if key exists, false otherwise
     pub(crate) fn exists_impl(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<bool> {
         let k = to_key_bytes(py, key)?;
-        let sql = format!(
-            "
+
+        py.allow_threads(|| {
+            let sql = format!(
+                "
             SELECT 1
             FROM {}
             WHERE key = ?1
             LIMIT 1
             ",
-            self.table
-        );
-        let conn = self.conn.lock().unwrap();
-        let found: Result<i32, _> = conn.query_row(&sql, params![k], |r| r.get(0));
-        Ok(found.is_ok())
+                self.table
+            );
+            let conn = self.conn.lock().unwrap();
+            let found: Result<i32, _> = conn.query_row(&sql, params![k], |r| r.get(0));
+            Ok(found.is_ok())
+        })
     }
 
     /// Scan keys (optionally prefix for TEXT-ish keys; for binary prefixes, pass bytes).
@@ -240,52 +249,56 @@ impl _KVault {
         prefix: Option<&Bound<'_, PyAny>>,
         limit: usize,
     ) -> PyResult<Vec<Py<PyBytes>>> {
-        let mut out = Vec::new();
-        let conn = self.conn.lock().unwrap();
+        let prefix = prefix.map(|p| to_key_bytes(py, p)).transpose()?;
+        let raw = py.allow_threads(|| -> PyResult<Vec<Vec<u8>>> {
+            let mut out = Vec::new();
+            let conn = self.conn.lock().unwrap();
 
-        if let Some(p) = prefix {
-            let k = to_key_bytes(py, p)?;
-            // Simple prefix scan with range [prefix, prefix||0xFF...].
-            // Works for raw bytes because SQLite compares blobs lexicographically.
-            let mut hi = k.clone();
-            hi.push(0xFF);
-            let sql = format!(
-                "
+            if let Some(p) = prefix {
+                let k = p;
+                // Simple prefix scan with range [prefix, prefix||0xFF...].
+                // Works for raw bytes because SQLite compares blobs lexicographically.
+                let mut hi = k.clone();
+                hi.push(0xFF);
+                let sql = format!(
+                    "
                 SELECT key
                 FROM {}
                 WHERE key >= ?1 AND key < ?2
                 ORDER BY key
                 LIMIT ?3
                 ",
-                self.table
-            );
-            let mut stmt = conn.prepare(&sql).map_err(VaultError::from)?;
-            let iter = stmt
-                .query_map(params![k, hi, limit as i64], |r| r.get::<_, Vec<u8>>(0))
-                .map_err(VaultError::from)?;
-            for r in iter {
-                let kb = r.map_err(VaultError::from)?;
-                out.push(PyBytes::new(py, &kb).unbind());
-            }
-        } else {
-            let sql = format!(
-                "
+                    self.table
+                );
+                let mut stmt = conn.prepare(&sql).map_err(VaultError::from)?;
+                let iter = stmt
+                    .query_map(params![k, hi, limit as i64], |r| r.get::<_, Vec<u8>>(0))
+                    .map_err(VaultError::from)?;
+                for r in iter {
+                    let kb = r.map_err(VaultError::from)?;
+                    out.push(kb);
+                }
+            } else {
+                let sql = format!(
+                    "
                 SELECT key
                 FROM {}
                 ORDER BY key
                 LIMIT ?1
                 ",
-                self.table
-            );
-            let mut stmt = conn.prepare(&sql).map_err(VaultError::from)?;
-            let iter = stmt
-                .query_map(params![limit as i64], |r| r.get::<_, Vec<u8>>(0))
-                .map_err(VaultError::from)?;
-            for r in iter {
-                let kb = r.map_err(VaultError::from)?;
-                out.push(PyBytes::new(py, &kb).unbind());
+                    self.table
+                );
+                let mut stmt = conn.prepare(&sql).map_err(VaultError::from)?;
+                let iter = stmt
+                    .query_map(params![limit as i64], |r| r.get::<_, Vec<u8>>(0))
+                    .map_err(VaultError::from)?;
+                for r in iter {
+                    let kb = r.map_err(VaultError::from)?;
+                    out.push(kb);
+                }
             }
-        }
-        Ok(out)
+            Ok(out)
+        })?;
+        Ok(raw.iter().map(|kb| PyBytes::new(py, kb).unbind()).collect())
     }
 }

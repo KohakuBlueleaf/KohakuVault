@@ -77,8 +77,15 @@ kv.flush_cache()
 
 - Values larger than `cap_bytes` bypass the cache automatically.
 - `flush_cache()` is safe to call repeatedly; it only flushes dirty entries.
-- `lock_cache()` is a context manager that defers auto-flushes when you need deterministic batching.
+- `lock_cache()` is a context manager that defers auto-flushes when you need deterministic batching. If the bounded cache fills while flushing is locked, a write raises `DatabaseBusy`; leave the context and flush before retrying, or reserve enough cache capacity for the batch.
 - Every operation is wrapped in `_with_retries` (exponential backoff, 4 attempts by default) to deal with SQLite `BUSY`/`LOCKED` cases.
+
+Database operations release the Python GIL around native connection/SQLite waits.
+For asyncio applications, call these synchronous methods through a worker, for
+example `await asyncio.to_thread(kv.put, key, value)`. The write still waits for
+SQLite's writer lock, but that wait does not block unrelated Python threads.
+Python value conversion and streaming reader/writer callbacks still require the
+GIL; this does not make CPU-heavy Python serialization asynchronous.
 
 ## Streaming APIs
 

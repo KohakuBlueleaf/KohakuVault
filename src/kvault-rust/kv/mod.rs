@@ -66,44 +66,46 @@ impl _KVault {
         mmap_size: u64,
         cache_kb: i64,
     ) -> PyResult<Self> {
-        let conn = open_connection(path, enable_wal, page_size, mmap_size, cache_kb)
-            .map_err(VaultError::from)?;
+        _py.allow_threads(|| {
+            let conn = open_connection(path, enable_wal, page_size, mmap_size, cache_kb)
+                .map_err(VaultError::from)?;
 
-        // Create metadata table (shared with ColumnVault)
-        MetaTable::ensure_table(&conn).map_err(VaultError::from)?;
+            // Create metadata table (shared with ColumnVault)
+            MetaTable::ensure_table(&conn).map_err(VaultError::from)?;
 
-        // Create schema - minimal design with key as primary key
-        conn.execute_batch(&format!(
-            "
+            // Create schema - minimal design with key as primary key
+            conn.execute_batch(&format!(
+                "
             CREATE TABLE IF NOT EXISTS {t} (
                 key   BLOB PRIMARY KEY NOT NULL,
                 value BLOB NOT NULL
             );
             ",
-            t = rusqlite::types::ValueRef::from(table)
-                .as_str()
-                .unwrap_or("kv") // defensive
-        ))
-        .map_err(VaultError::from)?;
+                t = rusqlite::types::ValueRef::from(table)
+                    .as_str()
+                    .unwrap_or("kv") // defensive
+            ))
+            .map_err(VaultError::from)?;
 
-        // Check if header feature is registered (indicates this DB has been used with headers)
-        let _headers_supported = MetaTable::has_feature(
-            &conn,
-            crate::common::meta::KV_FEATURES_KEY,
-            crate::common::meta::KV_FEATURE_HEADERS,
-        )
-        .unwrap_or(false);
-        // Note: Always start with headers disabled for backward compat
-        // User must explicitly enable if needed
+            // Check if header feature is registered (indicates this DB has been used with headers)
+            let _headers_supported = MetaTable::has_feature(
+                &conn,
+                crate::common::meta::KV_FEATURES_KEY,
+                crate::common::meta::KV_FEATURE_HEADERS,
+            )
+            .unwrap_or(false);
+            // Note: Always start with headers disabled for backward compat
+            // User must explicitly enable if needed
 
-        Ok(Self {
-            conn: Mutex::new(conn),
-            table: table.to_string(),
-            cache: Mutex::new(None),
-            chunk_size,
-            cache_locked: Arc::new(AtomicBool::new(false)),
-            use_headers: AtomicBool::new(true), // DEFAULT: headers enabled for auto-packing
-            auto_packer: Mutex::new(Some(AutoPacker::new(true))), // DEFAULT: auto-pack enabled
+            Ok(Self {
+                conn: Mutex::new(conn),
+                table: table.to_string(),
+                cache: Mutex::new(None),
+                chunk_size,
+                cache_locked: Arc::new(AtomicBool::new(false)),
+                use_headers: AtomicBool::new(true), // DEFAULT: headers enabled for auto-packing
+                auto_packer: Mutex::new(Some(AutoPacker::new(true))), // DEFAULT: auto-pack enabled
+            })
         })
     }
 
@@ -116,19 +118,21 @@ impl _KVault {
     /// - Compression/encryption flags (future)
     ///
     /// Note: Existing values without headers are still readable (backward compatible)
-    fn enable_headers(&self) -> PyResult<()> {
-        self.use_headers.store(true, Ordering::Relaxed);
+    fn enable_headers(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.use_headers.store(true, Ordering::Relaxed);
 
-        // Register feature in meta table
-        let conn = self.conn.lock().unwrap();
-        MetaTable::register_feature(
-            &conn,
-            crate::common::meta::KV_FEATURES_KEY,
-            crate::common::meta::KV_FEATURE_HEADERS,
-        )
-        .map_err(VaultError::from)?;
+            // Register feature in meta table
+            let conn = self.conn.lock().unwrap();
+            MetaTable::register_feature(
+                &conn,
+                crate::common::meta::KV_FEATURES_KEY,
+                crate::common::meta::KV_FEATURE_HEADERS,
+            )
+            .map_err(VaultError::from)?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Disable header format (return to raw bytes mode)
@@ -150,23 +154,26 @@ impl _KVault {
     /// - bytes → Raw (no header)
     /// - Custom objects → Pickle (if use_pickle=True)
     #[pyo3(signature = (use_pickle=true))]
-    fn enable_auto_pack(&self, use_pickle: bool) -> PyResult<()> {
+    fn enable_auto_pack(&self, py: Python<'_>, use_pickle: bool) -> PyResult<()> {
         let mut guard = self.auto_packer.lock().unwrap();
         *guard = Some(AutoPacker::new(use_pickle));
 
         // Also enable headers (required for auto-pack)
         self.use_headers.store(true, Ordering::Relaxed);
 
-        // Register features in meta table
-        let conn = self.conn.lock().unwrap();
-        MetaTable::register_feature(
-            &conn,
-            crate::common::meta::KV_FEATURES_KEY,
-            crate::common::meta::KV_FEATURE_AUTO_PACK,
-        )
-        .map_err(VaultError::from)?;
+        drop(guard);
+        py.allow_threads(|| {
+            // Register features in meta table
+            let conn = self.conn.lock().unwrap();
+            MetaTable::register_feature(
+                &conn,
+                crate::common::meta::KV_FEATURES_KEY,
+                crate::common::meta::KV_FEATURE_AUTO_PACK,
+            )
+            .map_err(VaultError::from)?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Disable auto-packing (return to bytes-only mode)
@@ -188,10 +195,18 @@ impl _KVault {
     /// * `flush_threshold` - Auto-flush trigger point (default 16MB)
     /// * `_flush_interval` - Ignored (handled by Python daemon thread)
     #[pyo3(signature = (cap_bytes=64<<20, flush_threshold=16<<20, _flush_interval=None))]
-    fn enable_cache(&self, cap_bytes: usize, flush_threshold: usize, _flush_interval: Option<f64>) {
-        let mut guard = self.cache.lock().unwrap();
-        *guard = Some(WriteBackCache::new(cap_bytes, flush_threshold));
-        // Note: flush_interval is used by Python daemon thread, not Rust
+    fn enable_cache(
+        &self,
+        py: Python<'_>,
+        cap_bytes: usize,
+        flush_threshold: usize,
+        _flush_interval: Option<f64>,
+    ) {
+        py.allow_threads(|| {
+            let mut guard = self.cache.lock().unwrap();
+            *guard = Some(WriteBackCache::new(cap_bytes, flush_threshold));
+            // Note: flush_interval is used by Python daemon thread, not Rust
+        })
     }
 
     /// Disable cache (auto-flushes first).
@@ -210,69 +225,36 @@ impl _KVault {
     /// # Returns
     /// Number of entries flushed
     fn flush_cache(&self, _py: Python<'_>) -> PyResult<usize> {
-        // Check if cache is locked (for lock_cache() context manager)
-        if self.cache_locked.load(Ordering::Relaxed) {
-            return Ok(0); // Skip flush if locked
-        }
-
-        let mut guard = self.cache.lock().unwrap();
-        let Some(cache) = guard.as_mut() else {
-            return Ok(0);
-        };
-
-        // Don't flush if empty
-        if cache.is_empty() {
-            return Ok(0);
-        }
-
-        let entries = cache.drain();
-        drop(guard); // Release lock before transaction
-
-        let sql = format!(
-            "
-            INSERT INTO {t}(key, value)
-            VALUES (?1, ?2)
-            ON CONFLICT(key)
-            DO UPDATE SET
-                value = excluded.value
-            ",
-            t = self.table
-        );
-        let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction().map_err(VaultError::from)?;
-        let mut stmt = tx.prepare(&sql).map_err(VaultError::from)?;
-        let mut count = 0usize;
-        for (k, v) in entries {
-            stmt.execute(params![k, &v]).map_err(VaultError::from)?;
-            count += 1;
-        }
-        drop(stmt);
-        tx.commit().map_err(VaultError::from)?;
-        Ok(count)
+        _py.allow_threads(|| self.flush_cache_native())
+            .map_err(Into::into)
     }
 
     /// Vacuum & optimize (blocks writer).
     fn optimize(&self, _py: Python<'_>) -> PyResult<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch("PRAGMA optimize; VACUUM;")
-            .map_err(VaultError::from)?;
-        Ok(())
+        _py.allow_threads(|| {
+            let conn = self.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA optimize; VACUUM;")
+                .map_err(VaultError::from)?;
+            Ok(())
+        })
     }
 
     /// Get number of keys in the store.
     fn len(&self, _py: Python<'_>) -> PyResult<i64> {
-        let sql = format!(
-            "
+        _py.allow_threads(|| {
+            let sql = format!(
+                "
             SELECT COUNT(*)
             FROM {}
             ",
-            self.table
-        );
-        let conn = self.conn.lock().unwrap();
-        let n: i64 = conn
-            .query_row(&sql, [], |r| r.get(0))
-            .map_err(VaultError::from)?;
-        Ok(n)
+                self.table
+            );
+            let conn = self.conn.lock().unwrap();
+            let n: i64 = conn
+                .query_row(&sql, [], |r| r.get(0))
+                .map_err(VaultError::from)?;
+            Ok(n)
+        })
     }
 
     /// Set cache lock status (for Python lock_cache() context manager).
@@ -285,9 +267,11 @@ impl _KVault {
     ///
     /// # Returns
     /// Success indicator (0 on success)
-    fn checkpoint_wal(&self) -> PyResult<i64> {
-        let conn = self.conn.lock().unwrap();
-        checkpoint_wal(&conn).map_err(|e| e.into())
+    fn checkpoint_wal(&self, py: Python<'_>) -> PyResult<i64> {
+        py.allow_threads(|| {
+            let conn = self.conn.lock().unwrap();
+            checkpoint_wal(&conn).map_err(|e| e.into())
+        })
     }
 
     // ===== Core Operations =====
@@ -367,5 +351,49 @@ impl _KVault {
         conn.execute(&sql, params![k, v])
             .map_err(VaultError::from)?;
         Ok(())
+    }
+}
+
+impl _KVault {
+    pub(crate) fn flush_cache_native(&self) -> Result<usize, VaultError> {
+        // Check if cache is locked (for lock_cache() context manager)
+        if self.cache_locked.load(Ordering::Relaxed) {
+            return Ok(0); // Skip flush if locked
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut guard = self.cache.lock().unwrap();
+        let Some(cache) = guard.as_mut() else {
+            return Ok(0);
+        };
+
+        // Don't flush if empty
+        if cache.is_empty() {
+            return Ok(0);
+        }
+
+        let entries = cache.drain();
+        drop(guard); // Release lock before transaction
+
+        let sql = format!(
+            "
+            INSERT INTO {t}(key, value)
+            VALUES (?1, ?2)
+            ON CONFLICT(key)
+            DO UPDATE SET
+                value = excluded.value
+            ",
+            t = self.table
+        );
+        let tx = conn.unchecked_transaction().map_err(VaultError::from)?;
+        let mut stmt = tx.prepare(&sql).map_err(VaultError::from)?;
+        let mut count = 0usize;
+        for (k, v) in entries {
+            stmt.execute(params![k, &v]).map_err(VaultError::from)?;
+            count += 1;
+        }
+        drop(stmt);
+        tx.commit().map_err(VaultError::from)?;
+        Ok(count)
     }
 }

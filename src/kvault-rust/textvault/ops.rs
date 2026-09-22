@@ -38,49 +38,51 @@ impl TextVault {
             }
         };
 
-        let conn = self.conn.lock();
+        py.allow_threads(|| {
+            let conn = self.conn.lock();
 
-        // Insert value into blob table
-        let value_id: i64 = conn
-            .query_row(
-                &format!("INSERT INTO {}_values (value) VALUES (?) RETURNING id", &self.table),
-                params![value_bytes],
-                |row| row.get(0),
-            )
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to insert value: {}", e)))?;
+            // Insert value into blob table
+            let value_id: i64 = conn
+                .query_row(
+                    &format!("INSERT INTO {}_values (value) VALUES (?) RETURNING id", &self.table),
+                    params![value_bytes],
+                    |row| row.get(0),
+                )
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to insert value: {}", e)))?;
 
-        // Build INSERT statement for FTS5 table
-        let col_names: Vec<&str> = self.columns.iter().map(|s| s.as_str()).collect();
-        let placeholders: Vec<&str> = col_names.iter().map(|_| "?").collect();
+            // Build INSERT statement for FTS5 table
+            let col_names: Vec<&str> = self.columns.iter().map(|s| s.as_str()).collect();
+            let placeholders: Vec<&str> = col_names.iter().map(|_| "?").collect();
 
-        let sql = format!(
-            "INSERT INTO {} ({}, value_ref) VALUES ({}, ?)",
-            &self.table,
-            col_names.join(", "),
-            placeholders.join(", ")
-        );
+            let sql = format!(
+                "INSERT INTO {} ({}, value_ref) VALUES ({}, ?)",
+                &self.table,
+                col_names.join(", "),
+                placeholders.join(", ")
+            );
 
-        // Build parameters: text values + value_ref
-        let mut stmt = conn.prepare(&sql).map_err(|e| {
-            PyRuntimeError::new_err(format!("Failed to prepare insert statement: {}", e))
-        })?;
-
-        // Execute with text values and value_ref
-        let mut param_values: Vec<rusqlite::types::Value> = text_values
-            .iter()
-            .map(|s| rusqlite::types::Value::Text(s.clone()))
-            .collect();
-        param_values.push(rusqlite::types::Value::Integer(value_id));
-
-        stmt.execute(rusqlite::params_from_iter(param_values))
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("Failed to insert into FTS5 table: {}", e))
+            // Build parameters: text values + value_ref
+            let mut stmt = conn.prepare(&sql).map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to prepare insert statement: {}", e))
             })?;
 
-        // Get the rowid of the inserted document
-        let doc_id: i64 = conn.last_insert_rowid();
+            // Execute with text values and value_ref
+            let mut param_values: Vec<rusqlite::types::Value> = text_values
+                .iter()
+                .map(|s| rusqlite::types::Value::Text(s.clone()))
+                .collect();
+            param_values.push(rusqlite::types::Value::Integer(value_id));
 
-        Ok(doc_id)
+            stmt.execute(rusqlite::params_from_iter(param_values))
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to insert into FTS5 table: {}", e))
+                })?;
+
+            // Get the rowid of the inserted document
+            let doc_id: i64 = conn.last_insert_rowid();
+
+            Ok(doc_id)
+        })
     }
 
     /// Parse text input based on column configuration
@@ -126,30 +128,33 @@ impl TextVault {
 
     /// Get document text and value by ID
     pub fn get_by_id(&self, py: Python<'_>, id: i64) -> PyResult<(PyObject, PyObject)> {
-        let conn = self.conn.lock();
+        let result = py.allow_threads(|| -> PyResult<_> {
+            let conn = self.conn.lock();
 
-        // Build SELECT for all text columns
-        let col_names = self.columns.join(", ");
-        let sql = format!(
-            "SELECT {}, b.value
+            // Build SELECT for all text columns
+            let col_names = self.columns.join(", ");
+            let sql = format!(
+                "SELECT {}, b.value
              FROM {} t
              JOIN {}_values b ON t.value_ref = b.id
              WHERE t.rowid = ?",
-            col_names, &self.table, &self.table
-        );
+                col_names, &self.table, &self.table
+            );
 
-        let result: Option<(Vec<String>, Vec<u8>)> = conn
-            .query_row(&sql, params![id], |row| {
-                let mut texts = Vec::with_capacity(self.columns.len());
-                for i in 0..self.columns.len() {
-                    texts.push(row.get::<_, String>(i)?);
-                }
-                let value: Vec<u8> = row.get(self.columns.len())?;
-                Ok((texts, value))
-            })
-            .optional()
-            .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
+            let result: Option<(Vec<String>, Vec<u8>)> = conn
+                .query_row(&sql, params![id], |row| {
+                    let mut texts = Vec::with_capacity(self.columns.len());
+                    for i in 0..self.columns.len() {
+                        texts.push(row.get::<_, String>(i)?);
+                    }
+                    let value: Vec<u8> = row.get(self.columns.len())?;
+                    Ok((texts, value))
+                })
+                .optional()
+                .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
 
+            Ok(result)
+        })?;
         match result {
             Some((texts, value_bytes)) => {
                 // Return texts as dict if multiple columns, string if single column
@@ -187,24 +192,27 @@ impl TextVault {
             ));
         }
 
-        let conn = self.conn.lock();
+        let result = py.allow_threads(|| -> PyResult<_> {
+            let conn = self.conn.lock();
 
-        // Use exact phrase matching with escaped quotes
-        let escaped_key = key.replace('"', "\"\"");
-        let sql = format!(
-            "SELECT b.value
+            // Use exact phrase matching with escaped quotes
+            let escaped_key = key.replace('"', "\"\"");
+            let sql = format!(
+                "SELECT b.value
              FROM {} t
              JOIN {}_values b ON t.value_ref = b.id
              WHERE t.{} MATCH '\"{}\"'
              LIMIT 1",
-            &self.table, &self.table, &self.columns[0], escaped_key
-        );
+                &self.table, &self.table, &self.columns[0], escaped_key
+            );
 
-        let result: Option<Vec<u8>> = conn
-            .query_row(&sql, [], |row| row.get(0))
-            .optional()
-            .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
+            let result: Option<Vec<u8>> = conn
+                .query_row(&sql, [], |row| row.get(0))
+                .optional()
+                .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
 
+            Ok(result)
+        })?;
         match result {
             Some(value_bytes) => self.decode_and_deserialize(py, &value_bytes),
             None => Err(pyo3::exceptions::PyKeyError::new_err(format!("Key not found: {}", key))),
@@ -255,36 +263,8 @@ impl TextVault {
             return Err(PyValueError::new_err("Must provide either texts or value to update"));
         }
 
-        let conn = self.conn.lock();
-
-        // Update texts if provided
-        if let Some(text_input) = texts {
-            let text_values = self.parse_text_input(text_input)?;
-
-            // Build UPDATE statement
-            let set_clauses: Vec<String> = self
-                .columns
-                .iter()
-                .map(|col| format!("{} = ?", col))
-                .collect();
-
-            let sql =
-                format!("UPDATE {} SET {} WHERE rowid = ?", &self.table, set_clauses.join(", "));
-
-            let mut param_values: Vec<rusqlite::types::Value> = text_values
-                .iter()
-                .map(|s| rusqlite::types::Value::Text(s.clone()))
-                .collect();
-            param_values.push(rusqlite::types::Value::Integer(id));
-
-            conn.execute(&sql, rusqlite::params_from_iter(param_values))
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("Failed to update document: {}", e))
-                })?;
-        }
-
-        // Update value if provided
-        if let Some(val) = value {
+        let text_values = texts.map(|t| self.parse_text_input(t)).transpose()?;
+        let packed_value = if let Some(val) = value {
             // Convert value to bytes using auto-packing
             let value_bytes = {
                 let auto_pack_guard = self.auto_packer.lock();
@@ -298,23 +278,61 @@ impl TextVault {
                 }
             };
 
-            // Get value_ref
-            let value_ref: i64 = conn
-                .query_row(
-                    &format!("SELECT value_ref FROM {} WHERE rowid = ?", &self.table),
-                    params![id],
-                    |row| row.get(0),
+            Some(value_bytes)
+        } else {
+            None
+        };
+
+        py.allow_threads(|| {
+            let conn = self.conn.lock();
+
+            // Update texts if provided
+            if let Some(text_values) = text_values {
+                // Build UPDATE statement
+                let set_clauses: Vec<String> = self
+                    .columns
+                    .iter()
+                    .map(|col| format!("{} = ?", col))
+                    .collect();
+
+                let sql = format!(
+                    "UPDATE {} SET {} WHERE rowid = ?",
+                    &self.table,
+                    set_clauses.join(", ")
+                );
+
+                let mut param_values: Vec<rusqlite::types::Value> = text_values
+                    .iter()
+                    .map(|s| rusqlite::types::Value::Text(s.clone()))
+                    .collect();
+                param_values.push(rusqlite::types::Value::Integer(id));
+
+                conn.execute(&sql, rusqlite::params_from_iter(param_values))
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!("Failed to update document: {}", e))
+                    })?;
+            }
+
+            // Update value if provided
+            if let Some(value_bytes) = packed_value {
+                // Get value_ref
+                let value_ref: i64 = conn
+                    .query_row(
+                        &format!("SELECT value_ref FROM {} WHERE rowid = ?", &self.table),
+                        params![id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| PyRuntimeError::new_err(format!("ID {} not found: {}", id, e)))?;
+
+                conn.execute(
+                    &format!("UPDATE {}_values SET value = ? WHERE id = ?", &self.table),
+                    params![value_bytes, value_ref],
                 )
-                .map_err(|e| PyRuntimeError::new_err(format!("ID {} not found: {}", id, e)))?;
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to update value: {}", e)))?;
+            }
 
-            conn.execute(
-                &format!("UPDATE {}_values SET value = ? WHERE id = ?", &self.table),
-                params![value_bytes, value_ref],
-            )
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to update value: {}", e)))?;
-        }
-
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Clear all documents from the vault
