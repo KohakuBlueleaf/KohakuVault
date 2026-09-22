@@ -4,7 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "kohakuvault"
-version = "0.8.6"
+# maturin reads the version from Cargo.toml.
+dynamic = ["version"]
 description = "SQLite-backed KV store (Rust+PyO3) with vector search, auto-packing, and efficient array storage"
 authors = [
     { name = "KohakuVault Contributors" }

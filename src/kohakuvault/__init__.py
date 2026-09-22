@@ -10,7 +10,7 @@ Features:
 - Thread-safe with retry logic
 """
 
-__version__ = "0.8.2"
+from importlib.metadata import version as _distribution_version
 
 from .column_proxy import Column, ColumnVault, VarSizeColumn
 from .errors import DatabaseBusy, InvalidArgument, IoError, KohakuVaultError, NotFound
@@ -18,6 +18,9 @@ from .proxy import KVault
 from .text_proxy import TextVault
 from .vector_proxy import VectorKVault
 from .wrappers import Cbor, Json, MsgPack, Pickle
+
+# The installed distribution's version, which maturin takes from Cargo.toml.
+__version__ = _distribution_version("kohakuvault")
 
 # Try to import DataPacker and CSBTree (will be available after maturin build)
 try:
