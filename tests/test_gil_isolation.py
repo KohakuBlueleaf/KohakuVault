@@ -77,12 +77,14 @@ async def test_native_wait_releases_gil(tmp_path, operation):
     ticker = asyncio.create_task(pulse())
     await asyncio.sleep(0.02)
     start = time.perf_counter()
-    result = None
+    workers = []
     try:
         writer = asyncio.create_task(asyncio.to_thread(write))
+        workers.append(writer)
         await asyncio.sleep(0.05)
         reader = asyncio.create_task(asyncio.to_thread(read))
-        result, old = await asyncio.gather(writer, reader)
+        workers.append(reader)
+        result, old = await asyncio.gather(*(asyncio.shield(task) for task in workers))
         elapsed = time.perf_counter() - start
         await asyncio.sleep(0.02)
         running = False
@@ -99,9 +101,10 @@ async def test_native_wait_releases_gil(tmp_path, operation):
     finally:
         running = False
         await ticker
+        outcomes = await asyncio.gather(*workers, return_exceptions=True)
         await asyncio.wait_for(child.communicate(), timeout=5)
-        if operation == "open" and result is not None:
-            result.close()
+        if operation == "open" and outcomes and isinstance(outcomes[0], KVault):
+            outcomes[0].close()
         if operation == "fts":
             del vault._vault
         else:
