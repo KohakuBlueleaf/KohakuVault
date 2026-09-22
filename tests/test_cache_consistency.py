@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -17,23 +18,19 @@ def test_failed_flush_preserves_acknowledged_writes(tmp_path):
     vault.enable_cache(cap_bytes=1 << 20, flush_threshold=1 << 20)
     vault["first"] = b"old"
     vault["second"] = b"keep"
-    blocker = sqlite3.connect(path)
     try:
-        blocker.execute("BEGIN IMMEDIATE")
-        with pytest.raises(DatabaseBusy):
-            vault.flush_cache()
-        blocker.rollback()
+        with _sqlite_writer_lock(path):
+            with pytest.raises(DatabaseBusy):
+                vault.flush_cache()
         assert vault.get("first") == b"old"
         assert vault.get("second") == b"keep"
         vault["first"] = b"new"
         assert vault.flush_cache() == 2
-        assert dict(blocker.execute("SELECT key, value FROM kv")) == {
-            b"first": b"new",
-            b"second": b"keep",
-        }
+        with sqlite3.connect(path) as observer:
+            stored = dict(observer.execute("SELECT key, value FROM kv"))
+        observer.close()
+        assert stored == {b"first": b"new", b"second": b"keep"}
     finally:
-        blocker.rollback()
-        blocker.close()
         vault.close()
 
 
@@ -50,6 +47,43 @@ def test_disable_locked_cache_keeps_pending_writes(tmp_path):
         assert vault.get("pending") == b"keep"
     finally:
         vault.close()
+
+
+@contextmanager
+def _sqlite_writer_lock(path):
+    # Python and Rust can load separate SQLite libraries. Their connection
+    # registries cannot coordinate process-scoped POSIX locks, so the blocker
+    # must live in another process to exercise real contention on every OS.
+    script = """
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("BEGIN IMMEDIATE")
+print("locked", flush=True)
+sys.stdin.readline()
+connection.rollback()
+connection.close()
+"""
+    blocker = subprocess.Popen(
+        [sys.executable, "-c", script, str(path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        assert blocker.stdout.readline().strip() == "locked"
+        yield
+    finally:
+        try:
+            _, error = blocker.communicate("release\n", timeout=5)
+        except subprocess.TimeoutExpired:
+            blocker.kill()
+            blocker.communicate()
+            raise
+        assert blocker.returncode == 0, error
 
 
 def _run_in_child(scenario, path):
@@ -112,9 +146,7 @@ def _disable_scenario(path):
     shutdown = threading.Thread(target=disable, daemon=True)
     shutdown.start()
     assert first_flushed.wait(5)
-    blocker = sqlite3.connect(path)
-    try:
-        blocker.execute("BEGIN IMMEDIATE")
+    with _sqlite_writer_lock(path):
         vault["native-batch"] = b"batch"
         proceed.set()
         assert not shutdown_done.wait(0.1)
@@ -124,9 +156,6 @@ def _disable_scenario(path):
         # Both accepting into a cache and waiting for shutdown are legal.
         # In either case a successful put must survive the transition.
         writer_done.wait(0.1)
-    finally:
-        blocker.rollback()
-        blocker.close()
     assert shutdown_done.wait(5)
     assert writer_done.wait(5)
     assert not errors, errors
