@@ -11,7 +11,7 @@ import pytest
 from kohakuvault import KVault, TextVault
 
 
-@pytest.mark.parametrize("operation", ["put", "flush", "fts", "open"])
+@pytest.mark.parametrize("operation", ["put", "flush", "disable", "lock", "fts", "open"])
 async def test_native_wait_releases_gil(tmp_path, operation):
     path = tmp_path / "native.db"
     if operation == "fts":
@@ -22,15 +22,23 @@ async def test_native_wait_releases_gil(tmp_path, operation):
     else:
         vault = KVault(path)
         vault["existing"] = {"value": "old"}
-        if operation == "flush":
+        if operation in ("flush", "disable", "lock"):
             vault.enable_cache(cap_bytes=1 << 20, flush_threshold=1 << 19, flush_interval=None)
             vault["next"] = {"value": "new"}
-            write = vault.flush_cache
+            write = vault.disable_cache if operation == "disable" else vault.flush_cache
         elif operation == "open":
             write = lambda: KVault(path, table="additional")
         else:
             write = lambda: vault.put("next", {"value": "new"})
-        read = lambda: vault.get("existing")
+        if operation == "lock":
+
+            def read():
+                # Entering the context waits for an in-flight cache transaction.
+                with vault.lock_cache():
+                    return vault.get("existing")
+
+        else:
+            read = lambda: vault.get("existing")
     child = subprocess.Popen(
         [
             sys.executable,

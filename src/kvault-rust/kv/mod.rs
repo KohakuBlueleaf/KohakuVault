@@ -210,13 +210,25 @@ impl _KVault {
     }
 
     /// Disable cache (auto-flushes first).
-    fn disable_cache(&self, _py: Python<'_>) -> PyResult<()> {
-        // Flush before disabling
-        self.flush_cache(_py)?;
-
-        let mut guard = self.cache.lock().unwrap();
-        *guard = None;
-        Ok(())
+    fn disable_cache(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| -> PyResult<()> {
+            // Use the same connection -> cache order as flushing. Keep the
+            // cache locked through commit and removal so no put is discarded.
+            let conn = self.conn.lock().unwrap();
+            let mut guard = self.cache.lock().unwrap();
+            let Some(cache) = guard.as_mut() else {
+                return Ok(());
+            };
+            if self.cache_locked.load(Ordering::Relaxed) {
+                return Err(VaultError::Cache(
+                    "cannot disable cache while flushing is locked".into(),
+                )
+                .into());
+            }
+            self.flush_cache_locked(&conn, cache)?;
+            *guard = None;
+            Ok(())
+        })
     }
 
     /// Flush write-back cache (if enabled) in a single transaction.
@@ -258,8 +270,12 @@ impl _KVault {
     }
 
     /// Set cache lock status (for Python lock_cache() context manager).
-    fn set_cache_locked(&self, locked: bool) {
-        self.cache_locked.store(locked, Ordering::Relaxed);
+    fn set_cache_locked(&self, py: Python<'_>, locked: bool) {
+        py.allow_threads(|| {
+            // Serialize transitions with flush/disable without holding the GIL.
+            let _guard = self.cache.lock().unwrap();
+            self.cache_locked.store(locked, Ordering::Relaxed);
+        });
     }
 
     /// Manually checkpoint WAL file to main database.
@@ -367,13 +383,26 @@ impl _KVault {
             return Ok(0);
         };
 
+        // The flag may have changed while this flush waited for either lock.
+        if self.cache_locked.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+        self.flush_cache_locked(&conn, cache)
+    }
+
+    // Callers hold the connection and cache guards for the entire transaction.
+    fn flush_cache_locked(
+        &self,
+        conn: &Connection,
+        cache: &mut WriteBackCache<Vec<u8>, Vec<u8>>,
+    ) -> Result<usize, VaultError> {
         // Don't flush if empty
         if cache.is_empty() {
             return Ok(0);
         }
 
-        let entries = cache.drain();
-        drop(guard); // Release lock before transaction
+        // Keep the batch and its accounting intact until the transaction commits.
+        // The cache guard also orders concurrent puts after this batch.
 
         let sql = format!(
             "
@@ -388,12 +417,13 @@ impl _KVault {
         let tx = conn.unchecked_transaction().map_err(VaultError::from)?;
         let mut stmt = tx.prepare(&sql).map_err(VaultError::from)?;
         let mut count = 0usize;
-        for (k, v) in entries {
-            stmt.execute(params![k, &v]).map_err(VaultError::from)?;
+        for (k, v) in &cache.map {
+            stmt.execute(params![k, v]).map_err(VaultError::from)?;
             count += 1;
         }
         drop(stmt);
         tx.commit().map_err(VaultError::from)?;
+        cache.drain();
         Ok(count)
     }
 }
