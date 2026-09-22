@@ -42,70 +42,72 @@ impl _KVault {
         let k = to_key_bytes(py, key)?;
         let chunk = chunk_size.unwrap_or(self.chunk_size);
 
-        // 1) Upsert a zeroblob of desired size
-        let sql = format!(
-            "
+        let reader = reader.clone().unbind();
+        py.allow_threads(move || {
+            // 1) Upsert a zeroblob of desired size
+            let sql = format!(
+                "
             INSERT INTO {t}(key, value)
             VALUES (?1, zeroblob(?2))
             ON CONFLICT(key)
             DO UPDATE SET
                 value = excluded.value
             ",
-            t = self.table
-        );
-        let conn = self.conn.lock().unwrap();
-        conn.execute(&sql, params![&k, size as i64])
-            .map_err(VaultError::from)?;
+                t = self.table
+            );
+            let conn = self.conn.lock().unwrap();
+            conn.execute(&sql, params![&k, size as i64])
+                .map_err(VaultError::from)?;
 
-        // 2) Get rowid
-        let rowid: i64 = conn
-            .query_row(
-                &format!(
-                    "
+            // 2) Get rowid
+            let rowid: i64 = conn
+                .query_row(
+                    &format!(
+                        "
                     SELECT rowid
                     FROM {}
                     WHERE key = ?1
                     ",
-                    self.table
-                ),
-                params![&k],
-                |r| r.get(0),
-            )
-            .map_err(VaultError::from)?;
+                        self.table
+                    ),
+                    params![&k],
+                    |r| r.get(0),
+                )
+                .map_err(VaultError::from)?;
 
-        // 3) Open BLOB for incremental write
-        let mut blob = open_blob(&conn, &self.table, "value", rowid, false)?;
+            // 3) Open BLOB for incremental write
+            let mut blob = open_blob(&conn, &self.table, "value", rowid, false)?;
 
-        // 4) Copy in chunks
-        let mut written: usize = 0;
-        while written < size {
-            let to_read = std::cmp::min(chunk, size - written);
-            // Call Python reader.read(to_read)
-            let data: Vec<u8> = {
-                let pybuf = reader.call_method1("read", (to_read,))?;
-                if pybuf.is_none() {
-                    return Err(VaultError::Py("reader.read() returned None".into()).into());
+            // 4) Copy in chunks
+            let mut written: usize = 0;
+            while written < size {
+                let to_read = std::cmp::min(chunk, size - written);
+                // Call Python reader.read(to_read)
+                let data = Python::with_gil(|py| -> PyResult<Vec<u8>> {
+                    let pybuf = reader.bind(py).call_method1("read", (to_read,))?;
+                    if pybuf.is_none() {
+                        return Err(VaultError::Py("reader.read() returned None".into()).into());
+                    }
+                    let bytes = pybuf
+                        .downcast::<PyBytes>()
+                        .map_err(|_| VaultError::Py("reader.read() must return bytes".into()))?;
+                    Ok(bytes.as_bytes().to_vec())
+                })?;
+                if data.is_empty() {
+                    break;
                 }
-                if let Ok(b) = pybuf.downcast::<PyBytes>() {
-                    b.as_bytes().to_vec()
-                } else {
-                    return Err(VaultError::Py("reader.read() must return bytes".into()).into());
-                }
-            };
-            if data.is_empty() {
-                break;
+                blob.write_at(&data, written).map_err(VaultError::from)?;
+                written += data.len();
             }
-            blob.write_at(&data, written).map_err(VaultError::from)?;
-            written += data.len();
-        }
-        if written != size {
-            return Err(VaultError::Py(format!(
-                "short write: wrote {} of {} bytes",
-                written, size
-            ))
-            .into());
-        }
-        Ok(())
+            if written != size {
+                return Err(VaultError::Py(format!(
+                    "short write: wrote {} of {} bytes",
+                    written, size
+                ))
+                .into());
+            }
+            Ok(())
+        })
     }
 
     /// Stream value into a Python file-like object with write(b) method.
@@ -136,54 +138,67 @@ impl _KVault {
         let k = to_key_bytes(py, key)?;
         let chunk = chunk_size.unwrap_or(self.chunk_size);
 
-        // Check cache first
-        if let Some(cache) = self.cache.lock().unwrap().as_ref() {
-            if let Some(v) = cache.map.get(&k) {
-                writer.call_method1("write", (PyBytes::new(py, v),))?;
-                return Ok(v.len());
+        let writer = writer.clone().unbind();
+        py.allow_threads(move || {
+            let cached = {
+                let guard = self.cache.lock().unwrap();
+                guard.as_ref().and_then(|cache| cache.map.get(&k).cloned())
+            };
+            if let Some(value) = cached {
+                Python::with_gil(|py| -> PyResult<()> {
+                    writer
+                        .bind(py)
+                        .call_method1("write", (PyBytes::new(py, &value),))?;
+                    Ok(())
+                })?;
+                return Ok(value.len());
             }
-        }
-
-        // Fetch rowid & size (using LENGTH() to get blob size without reading blob)
-        let conn = self.conn.lock().unwrap();
-        let (rowid, size): (i64, i64) = conn
-            .query_row(
-                &format!(
-                    "
+            // Fetch rowid & size (using LENGTH() to get blob size without reading blob)
+            let conn = self.conn.lock().unwrap();
+            let (rowid, size): (i64, i64) = conn
+                .query_row(
+                    &format!(
+                        "
                     SELECT rowid, LENGTH(value)
                     FROM {}
                     WHERE key = ?1
                     ",
-                    self.table
-                ),
-                params![&k],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .map_err(|e| -> PyErr {
-                match e {
-                    rusqlite::Error::QueryReturnedNoRows => {
-                        VaultError::NotFound("Key not found".to_string()).into()
+                        self.table
+                    ),
+                    params![&k],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| -> PyErr {
+                    match e {
+                        rusqlite::Error::QueryReturnedNoRows => {
+                            VaultError::NotFound("Key not found".to_string()).into()
+                        }
+                        other => VaultError::from(other).into(),
                     }
-                    other => VaultError::from(other).into(),
+                })?;
+
+            let blob = open_blob(&conn, &self.table, "value", rowid, true)?;
+
+            let mut offset: usize = 0;
+            let total = size as usize;
+            let mut buf = vec![0u8; chunk];
+            while offset < total {
+                let to_read = std::cmp::min(chunk, total - offset);
+                let n = blob
+                    .read_at(&mut buf[..to_read], offset)
+                    .map_err(VaultError::from)?;
+                if n == 0 {
+                    break;
                 }
-            })?;
-
-        let blob = open_blob(&conn, &self.table, "value", rowid, true)?;
-
-        let mut offset: usize = 0;
-        let total = size as usize;
-        let mut buf = vec![0u8; chunk];
-        while offset < total {
-            let to_read = std::cmp::min(chunk, total - offset);
-            let n = blob
-                .read_at(&mut buf[..to_read], offset)
-                .map_err(VaultError::from)?;
-            if n == 0 {
-                break;
+                Python::with_gil(|py| -> PyResult<()> {
+                    writer
+                        .bind(py)
+                        .call_method1("write", (PyBytes::new(py, &buf[..n]),))?;
+                    Ok(())
+                })?;
+                offset += n;
             }
-            writer.call_method1("write", (PyBytes::new(py, &buf[..n]),))?;
-            offset += n;
-        }
-        Ok(offset)
+            Ok(offset)
+        })
     }
 }

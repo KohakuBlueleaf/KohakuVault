@@ -51,61 +51,64 @@ impl TextVault {
         column: Option<&str>,
         escape: bool,
     ) -> PyResult<Vec<(i64, f64, PyObject)>> {
-        let conn = self.conn.lock();
+        let results = py.allow_threads(|| -> PyResult<Vec<_>> {
+            let conn = self.conn.lock();
 
-        // Escape query if requested (default: true for safety)
-        let safe_query = if escape {
-            escape_fts5_query(query)
-        } else {
-            query.to_string()
-        };
+            // Escape query if requested (default: true for safety)
+            let safe_query = if escape {
+                escape_fts5_query(query)
+            } else {
+                query.to_string()
+            };
 
-        // Handle empty query after escaping
-        if safe_query.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Build FTS5 query with optional column prefix
-        let fts_query = if let Some(col) = column {
-            // Validate column exists
-            if !self.columns.contains(&col.to_string()) {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Column '{}' not found. Available columns: {:?}",
-                    col, &self.columns
-                )));
+            // Handle empty query after escaping
+            if safe_query.is_empty() {
+                return Ok(Vec::new());
             }
-            format!("{}:{}", col, safe_query)
-        } else {
-            safe_query
-        };
 
-        // Use bm25() function for ranking
-        // FTS5 bm25() returns negative scores (more negative = more relevant)
-        // Note: FTS5 tables require using table name directly for rowid, not aliases
-        let sql = format!(
-            "SELECT {table}.rowid, bm25({table}), {table}_values.value
+            // Build FTS5 query with optional column prefix
+            let fts_query = if let Some(col) = column {
+                // Validate column exists
+                if !self.columns.contains(&col.to_string()) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Column '{}' not found. Available columns: {:?}",
+                        col, &self.columns
+                    )));
+                }
+                format!("{}:{}", col, safe_query)
+            } else {
+                safe_query
+            };
+
+            // Use bm25() function for ranking
+            // FTS5 bm25() returns negative scores (more negative = more relevant)
+            // Note: FTS5 tables require using table name directly for rowid, not aliases
+            let sql = format!(
+                "SELECT {table}.rowid, bm25({table}), {table}_values.value
              FROM {table}
              JOIN {table}_values ON {table}.value_ref = {table}_values.id
              WHERE {table} MATCH ?
              ORDER BY bm25({table})
              LIMIT ?",
-            table = &self.table
-        );
+                table = &self.table
+            );
 
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to prepare query: {}", e)))?;
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to prepare query: {}", e)))?;
 
-        let k_i64 = k as i64;
-        let results = stmt
-            .query_map(params![fts_query, k_i64], |row| {
-                let id: i64 = row.get(0)?;
-                let score: f64 = row.get(1)?;
-                let value: Vec<u8> = row.get(2)?;
-                Ok((id, score, value))
-            })
-            .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
+            let k_i64 = k as i64;
+            let results = stmt
+                .query_map(params![fts_query, k_i64], |row| {
+                    let id: i64 = row.get(0)?;
+                    let score: f64 = row.get(1)?;
+                    let value: Vec<u8> = row.get(2)?;
+                    Ok((id, score, value))
+                })
+                .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
 
+            Ok(results.collect::<Vec<_>>())
+        })?;
         let mut output = Vec::new();
         for result in results {
             let (id, score, value_bytes) = result
@@ -134,69 +137,72 @@ impl TextVault {
         column: Option<&str>,
         escape: bool,
     ) -> PyResult<Vec<(i64, f64, PyObject, PyObject)>> {
-        let conn = self.conn.lock();
+        let results = py.allow_threads(|| -> PyResult<Vec<_>> {
+            let conn = self.conn.lock();
 
-        // Escape query if requested
-        let safe_query = if escape {
-            escape_fts5_query(query)
-        } else {
-            query.to_string()
-        };
+            // Escape query if requested
+            let safe_query = if escape {
+                escape_fts5_query(query)
+            } else {
+                query.to_string()
+            };
 
-        if safe_query.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Build FTS5 query with optional column prefix
-        let fts_query = if let Some(col) = column {
-            if !self.columns.contains(&col.to_string()) {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Column '{}' not found. Available columns: {:?}",
-                    col, &self.columns
-                )));
+            if safe_query.is_empty() {
+                return Ok(Vec::new());
             }
-            format!("{}:{}", col, safe_query)
-        } else {
-            safe_query
-        };
 
-        // Build SELECT for all text columns with table prefix
-        let col_names: Vec<String> = self
-            .columns
-            .iter()
-            .map(|c| format!("{}.{}", &self.table, c))
-            .collect();
-        let col_select = col_names.join(", ");
-        let sql = format!(
-            "SELECT {table}.rowid, bm25({table}), {cols}, {table}_values.value
+            // Build FTS5 query with optional column prefix
+            let fts_query = if let Some(col) = column {
+                if !self.columns.contains(&col.to_string()) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Column '{}' not found. Available columns: {:?}",
+                        col, &self.columns
+                    )));
+                }
+                format!("{}:{}", col, safe_query)
+            } else {
+                safe_query
+            };
+
+            // Build SELECT for all text columns with table prefix
+            let col_names: Vec<String> = self
+                .columns
+                .iter()
+                .map(|c| format!("{}.{}", &self.table, c))
+                .collect();
+            let col_select = col_names.join(", ");
+            let sql = format!(
+                "SELECT {table}.rowid, bm25({table}), {cols}, {table}_values.value
              FROM {table}
              JOIN {table}_values ON {table}.value_ref = {table}_values.id
              WHERE {table} MATCH ?
              ORDER BY bm25({table})
              LIMIT ?",
-            table = &self.table,
-            cols = col_select
-        );
+                table = &self.table,
+                cols = col_select
+            );
 
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to prepare query: {}", e)))?;
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to prepare query: {}", e)))?;
 
-        let num_cols = self.columns.len();
-        let k_i64 = k as i64;
-        let results = stmt
-            .query_map(params![fts_query, k_i64], |row| {
-                let id: i64 = row.get(0)?;
-                let score: f64 = row.get(1)?;
-                let mut texts = Vec::with_capacity(num_cols);
-                for i in 0..num_cols {
-                    texts.push(row.get::<_, String>(2 + i)?);
-                }
-                let value: Vec<u8> = row.get(2 + num_cols)?;
-                Ok((id, score, texts, value))
-            })
-            .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
+            let num_cols = self.columns.len();
+            let k_i64 = k as i64;
+            let results = stmt
+                .query_map(params![fts_query, k_i64], |row| {
+                    let id: i64 = row.get(0)?;
+                    let score: f64 = row.get(1)?;
+                    let mut texts = Vec::with_capacity(num_cols);
+                    for i in 0..num_cols {
+                        texts.push(row.get::<_, String>(2 + i)?);
+                    }
+                    let value: Vec<u8> = row.get(2 + num_cols)?;
+                    Ok((id, score, texts, value))
+                })
+                .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
 
+            Ok(results.collect::<Vec<_>>())
+        })?;
         let mut output = Vec::new();
         for result in results {
             let (id, score, texts, value_bytes) = result
@@ -256,6 +262,7 @@ impl TextVault {
         highlight_end: Option<&str>,
         escape: bool,
     ) -> PyResult<Vec<(i64, f64, String, PyObject)>> {
+        let results = py.allow_threads(|| -> PyResult<Vec<_>> {
         let conn = self.conn.lock();
 
         // Escape query if requested
@@ -316,6 +323,9 @@ impl TextVault {
             })
             .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
 
+
+            Ok(results.collect::<Vec<_>>())
+        })?;
         let mut output = Vec::new();
         for result in results {
             let (id, score, snippet, value_bytes) = result

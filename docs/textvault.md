@@ -265,6 +265,12 @@ def hybrid_search(query: str, k: int = 10, alpha: float = 0.5):
 - Use `escape=True` (default) unless you need FTS5 operators
 - For very large result sets, use `k` to limit results rather than post-filtering
 
+Database and connection-mutex waits release the Python GIL. In asyncio code,
+dispatch synchronous calls through a worker (for example,
+`await asyncio.to_thread(tv.search, query)`); unrelated Python tasks can then run
+while the worker waits. Python argument/result conversion still uses the GIL,
+and the database call itself remains synchronous.
+
 ## Schema Design
 
 TextVault creates two tables:

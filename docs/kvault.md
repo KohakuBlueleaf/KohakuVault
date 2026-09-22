@@ -76,9 +76,19 @@ kv.flush_cache()
 ```
 
 - Values larger than `cap_bytes` bypass the cache automatically.
-- `flush_cache()` is safe to call repeatedly; it only flushes dirty entries.
-- `lock_cache()` is a context manager that defers auto-flushes when you need deterministic batching.
-- Every operation is wrapped in `_with_retries` (exponential backoff, 4 attempts by default) to deal with SQLite `BUSY`/`LOCKED` cases.
+- `flush_cache()` only clears dirty entries after its transaction commits. A failed flush leaves the batch cached and readable so the caller can retry; `flush_cache()` and `disable_cache()` do not automatically retry failures.
+- `disable_cache()` flushes and removes the cache as one synchronized operation. Concurrent successful writes survive the transition. Calling it while `lock_cache()` is active raises `DatabaseBusy` and keeps the cache enabled; retry after leaving the context.
+- `lock_cache()` defers cache flushes until the context exits. Entering the context waits for an already executing cache transaction to finish; a flush waiting for the connection rechecks the lock before starting a transaction. This controls flushing, not access by other writers. If the bounded cache fills while flushing is locked, a write raises `DatabaseBusy`; leave the context and flush before retrying, or reserve enough cache capacity for the batch.
+- Data operations such as `put()`, `get()`, `delete()`, and `exists()` use `_with_retries` (exponential backoff, 4 attempts by default) for SQLite `BUSY`/`LOCKED` cases.
+
+Database operations release the Python GIL around native connection/SQLite waits.
+For asyncio applications, call these synchronous methods through a worker, for
+example `await asyncio.to_thread(kv.put, key, value)`. The write still waits for
+SQLite's writer lock, but that wait does not block unrelated Python threads.
+A cache transaction holds that vault's cache mutex through commit, so concurrent
+cache access and `lock_cache()` entry may also wait without holding the GIL.
+Python value conversion and streaming reader/writer callbacks still require the
+GIL; this does not make CPU-heavy Python serialization asynchronous.
 
 ## Streaming APIs
 

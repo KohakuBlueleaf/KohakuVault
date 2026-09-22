@@ -117,7 +117,7 @@ impl TextVault {
         let dict = PyDict::new(py);
         dict.set_item("table", &self.table)?;
         dict.set_item("columns", &self.columns)?;
-        dict.set_item("count", self.count()?)?;
+        dict.set_item("count", py.allow_threads(|| self.count())?)?;
 
         Ok(dict.unbind())
     }

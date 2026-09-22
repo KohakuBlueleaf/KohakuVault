@@ -44,8 +44,13 @@ impl _TextVault {
     ///     columns: List of indexed text columns (default: ["content"])
     #[new]
     #[pyo3(signature = (path, table="text_vault", columns=None))]
-    fn new(path: &str, table: &str, columns: Option<Vec<String>>) -> PyResult<Self> {
-        Ok(Self { inner: TextVault::new(path, table, columns)? })
+    fn new(
+        py: Python<'_>,
+        path: &str,
+        table: &str,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<Self> {
+        py.allow_threads(|| Ok(Self { inner: TextVault::new(path, table, columns)? }))
     }
 
     /// Insert a document with text content and value
@@ -183,8 +188,8 @@ impl _TextVault {
     /// Args:
     ///     id: Row ID to delete
     #[pyo3(signature = (id))]
-    fn delete(&self, id: i64) -> PyResult<()> {
-        self.inner.delete(id)
+    fn delete(&self, py: Python<'_>, id: i64) -> PyResult<()> {
+        py.allow_threads(|| self.inner.delete(id))
     }
 
     /// Update document text or value by ID
@@ -212,16 +217,16 @@ impl _TextVault {
     /// Returns:
     ///     bool: True if exists
     #[pyo3(signature = (id))]
-    fn exists(&self, id: i64) -> PyResult<bool> {
-        self.inner.exists(id)
+    fn exists(&self, py: Python<'_>, id: i64) -> PyResult<bool> {
+        py.allow_threads(|| self.inner.exists(id))
     }
 
     /// Get total count of documents
     ///
     /// Returns:
     ///     int: Number of documents
-    fn count(&self) -> PyResult<i64> {
-        self.inner.count()
+    fn count(&self, py: Python<'_>) -> PyResult<i64> {
+        py.allow_threads(|| self.inner.count())
     }
 
     /// Count documents matching a query
@@ -232,8 +237,8 @@ impl _TextVault {
     /// Returns:
     ///     int: Number of matching documents
     #[pyo3(signature = (query))]
-    fn count_matches(&self, query: &str) -> PyResult<i64> {
-        self.inner.count_matches(query)
+    fn count_matches(&self, py: Python<'_>, query: &str) -> PyResult<i64> {
+        py.allow_threads(|| self.inner.count_matches(query))
     }
 
     /// Get TextVault info
@@ -253,8 +258,8 @@ impl _TextVault {
     }
 
     /// Clear all documents
-    fn clear(&self) -> PyResult<()> {
-        self.inner.clear()
+    fn clear(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.inner.clear())
     }
 
     /// Get document IDs with optional pagination
@@ -266,8 +271,8 @@ impl _TextVault {
     /// Returns:
     ///     list: Rowids in the vault
     #[pyo3(signature = (limit=None, offset=None))]
-    fn keys(&self, limit: Option<i64>, offset: Option<i64>) -> PyResult<Vec<i64>> {
-        self.inner.keys(limit, offset)
+    fn keys(&self, py: Python<'_>, limit: Option<i64>, offset: Option<i64>) -> PyResult<Vec<i64>> {
+        py.allow_threads(|| self.inner.keys(limit, offset))
     }
 
     // ----------------------------
