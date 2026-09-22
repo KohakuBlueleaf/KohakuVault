@@ -77,27 +77,31 @@ async def test_native_wait_releases_gil(tmp_path, operation):
     ticker = asyncio.create_task(pulse())
     await asyncio.sleep(0.02)
     start = time.perf_counter()
+    result = None
     try:
         writer = asyncio.create_task(asyncio.to_thread(write))
         await asyncio.sleep(0.05)
         reader = asyncio.create_task(asyncio.to_thread(read))
         result, old = await asyncio.gather(writer, reader)
-        assert time.perf_counter() - start >= 0.5, "write never encountered the external lock"
+        elapsed = time.perf_counter() - start
+        await asyncio.sleep(0.02)
+        running = False
+        await ticker
+        assert elapsed >= 0.5, "write never encountered the external lock"
+        assert max(gaps) < 0.2, f"event loop stalled for {max(gaps):.3f}s during native wait"
         if operation == "fts":
             assert old[1] == {"value": "old"}
             assert vault.get_by_id(result)[1] == {"value": "new"}
         else:
             assert old == {"value": "old"}
-            if operation == "open":
-                result.close()
-            else:
+            if operation != "open":
                 assert vault["next"] == {"value": "new"}
-        await asyncio.sleep(0.02)
-        assert max(gaps) < 0.2, f"native wait held GIL for {max(gaps):.3f}s"
     finally:
         running = False
         await ticker
         await asyncio.wait_for(child.communicate(), timeout=5)
+        if operation == "open" and result is not None:
+            result.close()
         if operation == "fts":
             del vault._vault
         else:
