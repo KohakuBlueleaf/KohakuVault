@@ -10,7 +10,7 @@ This page complements the [ColumnVault Guide](columnvault.md) with recipes focus
 | IoT / IETF interoperability | `cbor` or `cbor:256` | Standardized, supports more numeric types, optional schema validation. |
 | Short human-readable tags | `str:32:utf8` | Fixed width keeps the column on the fast fixed-size path. |
 | Mixed binary/text payloads | `bytes` + companion `msgpack` column | Keeps heavy blobs separate from structured metadata. |
-| Deterministic record sizes | `msgpack:256`, `cbor:512` | Avoids `_idx` tables altogether by keeping every element the same width. |
+| Deterministic record sizes | `msgpack:256`, `cbor:512` | Uses fixed-width payload blocks without variable-record offsets. |
 
 ## Schema Validation
 
@@ -30,12 +30,14 @@ schema = {
 }
 
 packer = DataPacker.with_json_schema(schema)
-vault = ColumnVault("users.db")
-users = vault.ensure("users", "msgpack")
-users.append({"id": 1, "name": "Rin"})
+with ColumnVault("users.db") as vault:
+    users = vault.ensure("validated_users", "bytes")
+    # Explicitly validate and encode before storing the serialized record.
+    users.append(packer.pack({"id": 1, "name": "Rin"}))
+    record = packer.unpack(users[0], 0)
 ```
 
-Failures raise `ValueError` before the write reaches SQLite, so consider validating in Python for hot loops and reserving schema enforcement for ingestion boundaries.
+The explicit `packer.pack()` call enforces the schema before the write reaches SQLite. Creating a separate validating packer does not automatically attach it to a `msgpack` column. This recipe stores already-validated bytes and decodes them explicitly.
 
 ## Hybrid Layouts
 
@@ -72,22 +74,22 @@ for _, rid in index.range(42, 42):
     handle(events[rid])
 ```
 
-CSBTree/SkipList live inside the same PyO3 module, so you can build in-memory indexes keyed by user id, timestamp buckets, or composite keys while keeping the canonical record in a column.
+CSBTree/SkipList are independent in-memory indexes. Their contents are not persisted or committed atomically with column writes. Close the column vault explicitly when finished.
 
 ## Performance Tips
 
-- Batch operations (`extend`, slice assignment) beat Python loops—every call crosses the PyO3 boundary.
+- Prefer `extend()` for structured ingestion and `append_array()`/`read_array()` for numeric or fixed-shape tensor batches. Structured records still require per-record serialization.
 - Enable caches when appending many records: `with events.cache(cap_bytes=8 << 20): ...`.
-- Tune `min_chunk_bytes`/`max_chunk_bytes` if you store large, variable payloads. Smaller chunks reduce rewrite cost when editing random rows.
-- For large hot columns, occasionally call `ColumnVault.checkpoint()` to merge WAL changes and keep sqlite-vec (if you also use vectors) snappy.
+- Tune `block_bytes` for append and range-read workloads. Variable-width replacements currently rebuild the entire column; changing the block size does not remove that cost.
+- Use explicit `close()` or a context manager. `checkpoint()` reports WAL checkpoint progress, but a long-running reader can prevent full progress; it is not a general search-speed optimization.
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| `ValueError: Invalid dtype` | Typo in dtype string | Use `DataPacker(dtype)` in a REPL to validate before creating the column. |
+| `ValueError: Invalid dtype` | Typo in dtype string | Check the type table in the ColumnVault guide; column numeric codecs and standalone DataPacker do not support identical type sets. |
 | `TypeError: Expected bytes` | Value not serializable under current dtype | Switch to a structured dtype (`msgpack`, `cbor`, etc.) or pre-serialize before appending (auto-pack wrappers only affect KVault). |
 | Slice assignment raises `ValueError` | Replacement batch length mismatch | Ensure `len(values) == high - low`. |
-| Updates are slow | Column is variable-size | Switch to fixed-size (`msgpack:NN`) where possible or increase chunk sizes. |
+| Updates are slow | Column is variable-size | Prefer append-heavy use, move frequently mutated records to KV, or use fixed-width records with a suitable maximum size. |
 
 See [ColumnVault Guide](columnvault.md) for base APIs and [vectors.md](vectors.md) for vector-specific advice.

@@ -11,6 +11,8 @@
 //! - Metadata table management
 
 pub mod meta;
+pub(crate) mod read_pool;
+
 
 use std::collections::HashMap;
 use std::fs;

@@ -1,1455 +1,568 @@
-"""
-Columnar storage for KohakuVault.
+"""Buffer-oriented columns backed by transactional SQLite blocks."""
 
-Provides list-like interface for storing large arrays/sequences in SQLite.
-"""
-
+import operator
+import os
 import struct
 import threading
-import time
-from collections.abc import MutableSequence
+import warnings
+from collections.abc import Iterator, MutableSequence
 from contextlib import contextmanager
-from typing import Any, Iterator, Optional, Union
 
-import kohakuvault.errors as E
-from kohakuvault._kvault import _ColumnVault
+import numpy as np
 
-try:
-    from kohakuvault._kvault import DataPacker
-except ImportError:  # pragma: no cover - optional extension
-    DataPacker = None
-
-# Type aliases
-ValueType = Union[int, float, bytes]
-
-
-# ======================================================================================
-# Data Type Packers/Unpackers
-# ======================================================================================
-
-
-def pack_i64(value: int) -> bytes:
-    """Pack int64 to 8 bytes (little-endian)."""
-    return struct.pack("<q", value)
-
-
-def unpack_i64(data: bytes, offset: int = 0) -> int:
-    """Unpack int64 from 8 bytes (little-endian)."""
-    return struct.unpack_from("<q", data, offset)[0]
-
-
-def pack_i32(value: int) -> bytes:
-    """Pack int32 to 4 bytes (little-endian)."""
-    return struct.pack("<i", value)
-
-
-def unpack_i32(data: bytes, offset: int = 0) -> int:
-    """Unpack int32 from 4 bytes (little-endian)."""
-    return struct.unpack_from("<i", data, offset)[0]
-
-
-def pack_f64(value: float) -> bytes:
-    """Pack float64 to 8 bytes."""
-    return struct.pack("<d", value)
-
-
-def unpack_f64(data: bytes, offset: int = 0) -> float:
-    """Unpack float64 from 8 bytes."""
-    return struct.unpack_from("<d", data, offset)[0]
-
-
-def pack_bytes(value: bytes, size: int) -> bytes:
-    """Pack fixed-size bytes. Pads with zeros if too short."""
-    if len(value) > size:
-        raise ValueError(f"Value too long: {len(value)} > {size}")
-    return value.ljust(size, b"\x00")
-
-
-def unpack_bytes(data: bytes, offset: int, size: int) -> bytes:
-    """Unpack fixed-size bytes."""
-    return data[offset : offset + size]
-
-
-# ======================================================================================
-# Type Registry
-# ======================================================================================
-
-
-DTYPE_INFO = {
-    "i64": {
-        "elem_size": 8,
-        "pack": lambda v: pack_i64(int(v)),
-        "unpack": lambda d, o: unpack_i64(d, o),
-    },
-    "f64": {
-        "elem_size": 8,
-        "pack": lambda v: pack_f64(float(v)),
-        "unpack": lambda d, o: unpack_f64(d, o),
-    },
-}
-
-
-def _create_data_packer(dtype: str) -> Optional[Any]:
-    """Instantiate DataPacker when the Rust extension is available."""
-    if DataPacker is None:
-        return None
-    try:
-        return DataPacker(dtype)
-    except Exception:
-        return None
+from . import errors as E
+from ._kvault import _ColumnVault
+from .column_codec import ColumnCodec
 
 
 def parse_dtype(dtype: str) -> tuple[str, int, bool]:
-    """
-    Parse dtype string and return (base_type, elem_size, is_varsize).
-
-    Supported:
-    - "i64" → ("i64", 8, False)
-    - "f64" → ("f64", 8, False)
-    - "bytes:N" → ("bytes", N, False) - fixed-size
-    - "bytes" → ("bytes", 0, True) - variable-size
-    - "str:N:encoding" → ("str:N:encoding", N, False) - fixed-size string
-    - "str:encoding" → ("str:encoding", 0, True) - variable-size string
-    - "msgpack" → ("msgpack", 0, True) - variable-size structured
-    - "cbor" → ("cbor", 0, True) - variable-size structured
-    """
-    # Try to use DataPacker to determine if dtype is valid
-    packer = _create_data_packer(dtype)
-    if packer is not None:
-        # Create packer to validate dtype and get size info
-        elem_size = packer.elem_size
-        is_varsize = packer.is_varsize
-        # Base type is the dtype itself (DataPacker handles it)
-        return dtype, elem_size, is_varsize
-
-    # Legacy parsing (for backward compatibility)
-    if dtype in DTYPE_INFO:
-        return dtype, DTYPE_INFO[dtype]["elem_size"], False
-
-    if dtype == "bytes":
-        return "bytes", 0, True
-
-    if dtype.startswith("bytes:"):
-        try:
-            size = int(dtype.split(":")[1])
-            if size <= 0:
-                raise ValueError("bytes size must be > 0")
-            return "bytes", size, False
-        except (IndexError, ValueError) as e:
-            raise E.InvalidArgument(f"Invalid bytes dtype: {dtype}") from e
-
-    raise E.InvalidArgument(f"Unknown dtype: {dtype}")
+    codec = ColumnCodec(dtype)
+    return dtype, codec.elem_size, codec.elem_size == 0
 
 
-def get_packer(dtype: str, elem_size: int):
-    """Get pack function for dtype."""
-    if dtype in DTYPE_INFO:
-        return DTYPE_INFO[dtype]["pack"]
-    elif dtype == "bytes":
-        return lambda v: pack_bytes(v, elem_size)
-    else:
-        raise E.InvalidArgument(f"No packer for dtype: {dtype}")
+class _ColumnState:
+    """Shared lifetime state without a vault/column reference cycle."""
 
+    def __init__(self, read_only: bool):
+        self.closed = False
+        self.closing = False
+        self.read_only = read_only
+        self.error = None
 
-def get_unpacker(dtype: str, elem_size: int):
-    """Get unpack function for dtype."""
-    if dtype in DTYPE_INFO:
-        return DTYPE_INFO[dtype]["unpack"]
-    elif dtype == "bytes":
-        return lambda d, o: unpack_bytes(d, o, elem_size)
-    else:
-        raise E.InvalidArgument(f"No unpacker for dtype: {dtype}")
+    def _check_open(self) -> None:
+        if self.closed:
+            raise ValueError("ColumnVault is closed")
+        if self.error is not None:
+            error, self.error = self.error, None
+            raise RuntimeError("Automatic column flush failed; pending data is retained") from error
 
-
-# ======================================================================================
-# Column Class (List-like Interface)
-# ======================================================================================
+    def _check_writable(self) -> None:
+        self._check_open()
+        if self.closing:
+            raise ValueError("ColumnVault is closing")
+        if self.read_only:
+            raise PermissionError("ColumnVault is read-only")
 
 
 class Column(MutableSequence):
-    """
-    List-like interface for a columnar storage.
+    """A typed column with scalar convenience and contiguous batch operations."""
 
-    Supports:
-    - Indexing: col[0], col[-1]
-    - Assignment: col[0] = value
-    - Deletion: del col[0]
-    - Append: col.append(value)
-    - Insert: col.insert(0, value)
-    - Iteration: for x in col
-    - Length: len(col)
-    """
-
-    def __init__(
-        self,
-        inner: _ColumnVault,
-        col_id: int,
-        name: str,
-        dtype: str,
-        elem_size: int,
-        chunk_bytes: int,  # This is now max_chunk_bytes from Rust
-        use_rust_packer: bool = True,  # NEW: Use Rust DataPacker by default
-    ):
-        self._inner = inner
+    def __init__(self, vault, col_id: int, name: str, codec: ColumnCodec, block_bytes: int):
+        self._vault = vault._state
+        self._inner = vault._inner
         self._col_id = col_id
         self._name = name
-        self._dtype = dtype
-        self._elem_size = elem_size
-        self._chunk_bytes = chunk_bytes  # max_chunk_bytes for addressing
-
-        # NEW: Try to use Rust DataPacker
-        self._rust_packer = None
-        self._use_rust_packer = use_rust_packer
-        if self._use_rust_packer:
-            packer = _create_data_packer(dtype)
-            if packer is not None:
-                self._rust_packer = packer
-            else:
-                # Fall back to Python packing if DataPacker not available
-                self._use_rust_packer = False
-
-        # Keep Python packing as fallback
-        if not self._use_rust_packer:
-            base_dtype, _, _ = parse_dtype(dtype)
-            self._pack = get_packer(base_dtype, elem_size)
-            self._unpack = get_unpacker(base_dtype, elem_size)
-
-        # Cache length (updated on mutations)
-        self._length = None
-
-        # Cache enablement flag
+        self._codec = codec
+        self._dtype = codec.dtype
+        self._elem_size = codec.elem_size
+        self._block_bytes = block_bytes
+        self._lock = threading.RLock()
         self._cache_enabled = False
+        self._cap_bytes = 0
+        self._flush_threshold = 0
+        self._buffer = bytearray()
+        self._offsets = bytearray(8)
+        self._pending_rows = 0
 
-    def _get_length(self) -> int:
-        """Get current length from database."""
-        if self._length is None:
-            _, _, length, _ = self._inner.get_column_info(self._name)
-            self._length = length
-        return self._length
+    @property
+    def name(self) -> str:
+        return self._name
 
-    def _normalize_index(self, idx: int) -> int:
-        """Normalize index (handle negative indices)."""
-        length = len(self)
-        if idx < 0:
-            idx += length
-        if idx < 0 or idx >= length:
-            raise IndexError(f"Column index out of range: {idx} (length={length})")
-        return idx
-
-    # ==================================================================================
-    # MutableSequence Protocol
-    # ==================================================================================
+    @property
+    def dtype(self) -> str:
+        return self._dtype
 
     def __len__(self) -> int:
-        return self._get_length()
-
-    def __getitem__(self, key):
-        """
-        Get element(s) by index or slice.
-
-        Single element access:
-            value = col[42]
-
-        Slice access (v0.4.2 - FAST batch read with integrated unpacking!):
-            values = col[10:100]    # Read 90 elements in single Rust call
-            values = col[:50]        # First 50 elements
-            values = col[-10:]       # Last 10 elements
-
-        Performance:
-            - Single element: ~0.1ms
-            - Slice of 100 elements: ~0.1ms (10-100x faster than loop)
-
-        Note: Step slicing (col[::2]) not currently supported.
-        """
-        if isinstance(key, slice):
-            # Batch read using Rust
-            length = len(self)
-            start, stop, step = key.indices(length)
-
-            if step != 1:
-                raise ValueError("Step slicing not supported")
-
-            count = stop - start
-            if count <= 0:
-                return []
-
-            # Use optimized batch read with integrated unpacking
-            return self._inner.batch_read_fixed(
-                self._col_id,
-                start,
-                count,
-                self._elem_size,
-                self._chunk_bytes,
-                self._rust_packer if self._use_rust_packer else None,
-            )
-
-        elif isinstance(key, int):
-            # Single element access (existing logic)
-            key = self._normalize_index(key)
-
-            # Read one element (use max_chunk_bytes for addressing)
-            data = self._inner.read_range(self._col_id, key, 1, self._elem_size, self._chunk_bytes)
-
-            # Unpack: use Rust packer if available, otherwise Python
-            if self._use_rust_packer:
-                return self._rust_packer.unpack(data, 0)
-            else:
-                return self._unpack(data, 0)
-
-        else:
-            raise TypeError("Column indices must be integers or slices")
-
-    def __setitem__(self, key, value):
-        """
-        Set element(s) at index or slice.
-
-        Single element:
-            col[42] = 100
-
-        Slice (NEW in v0.4.2):
-            col[10:20] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # Batch write!
-            col[:5] = [100, 200, 300, 400, 500]
-        """
-        if isinstance(key, slice):
-            # Slice setitem - batch write
-            return self._setitem_slice(key, value)
-        elif isinstance(key, int):
-            # Single element setitem (existing logic)
-            key = self._normalize_index(key)
-
-            # Pack value: use Rust packer if available
-            if self._use_rust_packer:
-                packed = self._rust_packer.pack(value)
-            else:
-                packed = self._pack(value)
-
-            # Write one element
-            self._inner.write_range(self._col_id, key, packed, self._elem_size, self._chunk_bytes)
-        else:
-            raise TypeError("Column indices must be integers or slices")
-
-    def _setitem_slice(self, key: slice, values) -> None:
-        """
-        Set multiple elements via slice using batch write.
-
-        Args:
-            key: slice object
-            values: list of values matching column dtype
-
-        Raises:
-            ValueError: If step != 1 or length mismatch
-            TypeError: If values don't match dtype
-        """
-        length = len(self)
-        start, stop, step = key.indices(length)
-
-        if step != 1:
-            raise ValueError("Step slicing not supported for setitem")
-
-        count = stop - start
-        if count <= 0:
-            # Empty slice - nothing to do
-            return
-
-        # Validate values length
-        if len(values) != count:
-            raise ValueError(
-                f"Slice length mismatch: slice has {count} elements, "
-                f"but {len(values)} values provided"
-            )
-
-        # Pack all values (batch in Rust for speed!)
-        if self._use_rust_packer:
-            packed_data = self._rust_packer.pack_many(values)
-        else:
-            # Python fallback
-            packed_data = b"".join(self._pack(v) for v in values)
-
-        # Write using existing write_range (handles multi-chunk automatically)
-        self._inner.write_range(
-            self._col_id, start, packed_data, self._elem_size, self._chunk_bytes
-        )
-
-    def __delitem__(self, idx: int) -> None:
-        """
-        Delete element at index.
-
-        WARNING: This is O(n) - shifts all elements after idx.
-        """
-        # Flush cache before structural operation
-        if self._cache_enabled:
-            self._inner.flush_cache(self._col_id)
-
-        if not isinstance(idx, int):
-            raise TypeError("Column indices must be integers")
-
-        idx = self._normalize_index(idx)
-        length = len(self)
-
-        if idx == length - 1:
-            # Deleting last element - just update length
-            self._inner.set_length(self._col_id, length - 1)
-            self._length = length - 1
-            return
-
-        # Read all elements after idx
-        count = length - idx - 1
-        data = self._inner.read_range(
-            self._col_id, idx + 1, count, self._elem_size, self._chunk_bytes
-        )
-
-        # Write them back one position earlier
-        self._inner.write_range(self._col_id, idx, data, self._elem_size, self._chunk_bytes)
-
-        # Update length
-        self._inner.set_length(self._col_id, length - 1)
-        self._length = length - 1
-
-    def __iter__(self) -> Iterator[ValueType]:
-        """Iterate over all elements using optimized batch unpacking (v0.4.2)."""
-        length = len(self)
-        if length == 0:
-            return
-
-        # Read in chunks for efficiency
-        chunk_size = 1000
-        for start in range(0, length, chunk_size):
-            count = min(chunk_size, length - start)
-
-            # OPTIMIZED: Use batch unpack in Rust (10-20x faster!)
-            if self._use_rust_packer:
-                # Batch unpack: unpacking loop runs in Rust, not Python
-                data = self._inner.read_range(
-                    self._col_id, start, count, self._elem_size, self._chunk_bytes
-                )
-                values = self._rust_packer.unpack_many(data, count=count)
-                for val in values:
-                    yield val
-            else:
-                # Python fallback: keep old loop for non-Rust packers
-                data = self._inner.read_range(
-                    self._col_id, start, count, self._elem_size, self._chunk_bytes
-                )
-                for i in range(count):
-                    yield self._unpack(data, i * self._elem_size)
-
-    def insert(self, idx: int, value: ValueType) -> None:
-        """
-        Insert element at index.
-
-        WARNING: This is O(n) - shifts all elements after idx.
-        """
-        # Flush cache before structural operation
-        if self._cache_enabled:
-            self._inner.flush_cache(self._col_id)
-
-        length = len(self)
-
-        # Handle negative/boundary indices
-        if idx < 0:
-            idx = max(0, length + idx)
-        else:
-            idx = min(idx, length)
-
-        if idx == length:
-            # Insert at end - just append
-            self.append(value)
-            return
-
-        # Read all elements from idx to end
-        count = length - idx
-        data = self._inner.read_range(self._col_id, idx, count, self._elem_size, self._chunk_bytes)
-
-        # Pack new value
-        if self._use_rust_packer:
-            packed = self._rust_packer.pack(value)
-        else:
-            packed = self._pack(value)
-
-        # Write new value at idx
-        self._inner.write_range(self._col_id, idx, packed, self._elem_size, self._chunk_bytes)
-
-        # Write old elements one position later
-        self._inner.write_range(self._col_id, idx + 1, data, self._elem_size, self._chunk_bytes)
-
-        # Update length
-        self._inner.set_length(self._col_id, length + 1)
-        self._length = length + 1
-
-    # ==================================================================================
-    # Additional Methods
-    # ==================================================================================
-
-    def append(self, value: ValueType) -> None:
-        """
-        Append element to end.
-
-        This is O(1) and the most efficient operation.
-        Now uses Rust DataPacker for ~5-10x performance improvement!
-        Uses cache if enabled for even better performance!
-        """
-        current_length = self._get_length()
-
-        if self._cache_enabled:
-            # CACHED PATH: Use cached interface
-            if self._use_rust_packer:
-                self._inner.append_typed_cached(
-                    self._col_id, value, self._rust_packer, current_length
-                )
-            else:
-                packed = self._pack(value)
-                self._inner.append_cached(self._col_id, packed, self._elem_size, current_length)
-        else:
-            # DIRECT PATH: Write directly to disk
-            if self._use_rust_packer:
-                # Use Rust typed interface (packs in Rust)
-                self._inner.append_typed(
-                    self._col_id, value, self._rust_packer, self._chunk_bytes, current_length
-                )
-            else:
-                # Python packing (fallback)
-                packed = self._pack(value)
-                self._inner.append_raw(
-                    self._col_id, packed, self._elem_size, self._chunk_bytes, current_length
-                )
-
-        self._length = current_length + 1
-
-    def extend(self, values: list[ValueType]) -> None:
-        """
-        Extend column with multiple values.
-        Now uses Rust DataPacker for ~10-20x performance improvement on bulk operations!
-        Uses cache if enabled for even better performance!
-        """
-        if not values:
-            return
-
-        current_length = self._get_length()
-
-        if self._cache_enabled:
-            # CACHED PATH: Use cached interface
-            if self._use_rust_packer:
-                self._inner.extend_typed_cached(self._col_id, values, self._rust_packer)
-            else:
-                # Pack individually and extend cache
-                packed_list = [self._pack(v) for v in values]
-                self._inner.extend_cached(self._col_id, packed_list, False)
-        else:
-            # DIRECT PATH: Write directly to disk
-            if self._use_rust_packer:
-                # Use Rust typed interface (packs all in Rust with single FFI call)
-                self._inner.extend_typed(
-                    self._col_id, values, self._rust_packer, self._chunk_bytes, current_length
-                )
-            else:
-                # Python packing (fallback)
-                packed_data = b"".join(self._pack(v) for v in values)
-                self._inner.append_raw(
-                    self._col_id, packed_data, self._elem_size, self._chunk_bytes, current_length
-                )
-
-        self._length = current_length + len(values)
-
-    def clear(self) -> None:
-        """Remove all elements."""
-        # Flush cache before structural operation
-        if self._cache_enabled:
-            self._inner.flush_cache(self._col_id)
-
-        self._inner.set_length(self._col_id, 0)
-        self._length = 0
-
-    # ========================================
-    # CACHE METHODS
-    # ========================================
-
-    def enable_cache(
-        self, cap_bytes: int = 64 * 1024 * 1024, flush_threshold: int = 16 * 1024 * 1024
-    ) -> None:
-        """
-        Enable write-back cache for this column.
-
-        Args:
-            cap_bytes: Maximum cache size in bytes (default 64MB)
-            flush_threshold: Auto-flush when cache exceeds this size (default 16MB)
-        """
-        self._inner.enable_cache(self._col_id, cap_bytes, flush_threshold, False, None)
-        self._cache_enabled = True
-
-    def disable_cache(self) -> None:
-        """Disable cache for this column (auto-flushes first)."""
-        if self._cache_enabled:
-            self._inner.disable_cache(self._col_id)
-            self._cache_enabled = False
-
-    def flush_cache(self) -> int:
-        """
-        Flush this column's cache.
-
-        Returns:
-            Number of bytes flushed
-        """
-        if self._cache_enabled:
-            return self._inner.flush_cache(self._col_id)
-        return 0
-
-    @contextmanager
-    def cache(self, cap_bytes: int = 64 * 1024 * 1024, flush_threshold: int = 16 * 1024 * 1024):
-        """
-        Context manager for temporary cache enablement.
-
-        Example:
-            with col.cache():
-                for i in range(1000):
-                    col.append(i)
-        """
-        self.enable_cache(cap_bytes, flush_threshold)
+        self._vault._check_open()
+        with self._lock:
+            return self._inner.length(self._col_id) + self._pending_rows
+
+    def _index(self, index: int) -> int:
         try:
-            yield self
-        finally:
-            self.disable_cache()
+            index = operator.index(index)
+        except TypeError as error:
+            raise TypeError("Column indices must be integers or slices") from error
+        length = len(self)
+        if index < 0:
+            index += length
+        if not 0 <= index < length:
+            raise IndexError("Column index out of range")
+        return index
 
-    # ========================================
-    # END CACHE METHODS
-    # ========================================
+    def _read_ready(self) -> None:
+        self._vault._check_open()
+        # Reads on a buffering writer publish its pending rows first.
+        if self._cache_enabled:
+            self.flush_cache()
 
-    def __repr__(self) -> str:
-        return f"Column(name={self._name!r}, dtype={self._dtype!r}, length={len(self)})"
+    def read_buffer(self, start: int = 0, count: int | None = None) -> bytes:
+        """Read packed fixed-width bytes without constructing scalar objects."""
+        self._read_ready()
+        if not self._elem_size:
+            raise TypeError("Use read_buffers() for variable-width columns")
+        return self._inner.read_fixed(self._col_id, start, count)
 
+    def read_buffers(self, start: int = 0, count: int | None = None) -> tuple[bytes, np.ndarray]:
+        """Read variable-width payload and u64 offsets in one snapshot."""
+        self._read_ready()
+        if self._elem_size:
+            raise TypeError("Use read_buffer() for fixed-width columns")
+        payload, offsets = self._inner.read_variable(self._col_id, start, count)
+        return payload, np.frombuffer(offsets, dtype="<u8")
 
-# ======================================================================================
-# VarSizeColumn Class (Variable-Size Bytes)
-# ======================================================================================
+    def read_array(
+        self, start: int = 0, count: int | None = None, *, copy: bool = False
+    ) -> np.ndarray:
+        """Return a read-only numeric batch, or a writable copy when requested."""
+        return self._codec.array(self.read_buffer(start, count), copy=copy)
 
-
-class VarSizeColumn(MutableSequence):
-    """
-    Variable-size bytes column using prefix sum index.
-
-    Stores two underlying columns:
-    - {name}_data: Packed bytes (all elements concatenated)
-    - {name}_idx: Prefix sum of byte offsets (i64)
-
-    This allows O(1) random access to variable-length elements.
-    """
-
-    def __init__(
-        self,
-        inner: _ColumnVault,
-        data_col_id: int,
-        idx_col_id: int,
-        name: str,
-        dtype: str,
-        chunk_bytes: int,  # This is max_chunk_bytes from Rust
-        use_rust_packer: bool = True,
-    ):
-        self._inner = inner
-        self._data_col_id = data_col_id
-        self._idx_col_id = idx_col_id
-        self._name = name
-        self._dtype = dtype
-
-        # CRITICAL (v0.4.0): Get ALIGNED max_chunk_bytes for index column
-        # Index has elem_size=12, so max gets aligned to (max/12)*12
-        _, idx_elem_size, _, idx_max_chunk = inner.get_column_info(f"{name}_idx")
-        self._idx_chunk_bytes = idx_max_chunk  # Use aligned value for index addressing
-
-        # Data column max_chunk_bytes for adaptive append
-        _, _, _, data_max_chunk = inner.get_column_info(f"{name}_data")
-        self._data_max_chunk = data_max_chunk
-
-        self._chunk_bytes = chunk_bytes  # Keep for compatibility
-        self._length = None
-
-        # NEW: Support DataPacker for structured types (msgpack, cbor, strings)
-        self._packer = None
-        self._use_rust_packer = use_rust_packer and dtype != "bytes"
-        if self._use_rust_packer:
-            packer = _create_data_packer(dtype)
-            if packer is not None:
-                self._packer = packer
-            else:
-                self._use_rust_packer = False
-
-        # Cache enablement flag
-        self._cache_enabled = False
-
-    def _get_length(self) -> int:
-        """Get number of elements (from index column)."""
-        if self._length is None:
-            _, _, length, _ = self._inner.get_column_info(f"{self._name}_idx")
-            self._length = length
-        return self._length
-
-    def _get_offsets(self, start_idx: int, count: int) -> tuple[int, int]:
-        """
-        Get byte offsets for element range [start_idx, start_idx+count).
-
-        Returns:
-            (start_offset, end_offset) in bytes
-        """
-        # Read prefix sums from index column
-        offsets_data = self._inner.read_range(
-            self._idx_col_id, start_idx, count + 1, 8, self._chunk_bytes
-        )
-
-        # Unpack offsets
-        start_offset = unpack_i64(offsets_data, 0) if start_idx > 0 else 0
-        if start_idx == 0:
-            start_offset = 0
-            end_offset = unpack_i64(offsets_data, count * 8)
-        else:
-            start_offset = unpack_i64(offsets_data, 0)
-            end_offset = unpack_i64(offsets_data, count * 8)
-
-        return start_offset, end_offset
-
-    def __len__(self) -> int:
-        return self._get_length()
+    def read(self, start: int = 0, count: int | None = None) -> list:
+        self._read_ready()
+        if self._elem_size:
+            return self._codec.unpack_fixed(self._inner.read_fixed(self._col_id, start, count))
+        payload, offsets = self._inner.read_variable(self._col_id, start, count)
+        return self._codec.unpack_variable(payload, offsets)
 
     def __getitem__(self, key):
-        """
-        Get element(s) by index or slice.
-
-        Single element access:
-            value = col[42]
-
-        Slice access (v0.4.2 - FAST batch read!):
-            values = col[10:100]    # Read 90 elements in single Rust call
-            values = col[:50]        # First 50 elements
-            values = col[-10:]       # Last 10 elements
-
-        Note: Step slicing (col[::2]) not currently supported.
-        """
         if isinstance(key, slice):
-            # Batch read using Rust
-            length = len(self)
-            start, stop, step = key.indices(length)
+            start, stop, step = key.indices(len(self))
+            if step == 1:
+                return self.read(start, max(0, stop - start))
+            raise ValueError("Step slicing not supported; use take(indices) instead")
+        return self.read(self._index(key), 1)[0]
 
-            if step != 1:
-                raise ValueError("Step slicing not supported for variable-size columns")
+    def take(self, indices, *, as_array: bool = True):
+        """Gather fixed-width rows by block, preserving order and duplicates."""
+        self._read_ready()
+        indices = [operator.index(index) for index in indices]
+        if not self._elem_size:
+            # Variable-width gathers remain a convenience path.
+            return [self[index] for index in indices]
+        data = self._inner.take_fixed(self._col_id, indices)
+        if as_array and self._codec.numpy_dtype is not None:
+            return self._codec.array(data)
+        return self._codec.unpack_fixed(data)
 
-            count = stop - start
-            if count <= 0:
-                return []
-
-            # SINGLE RUST CALL for entire slice!
-            if self._use_rust_packer and self._packer:
-                # Integrated unpack (msgpack, cbor, strings, etc.)
-                return self._inner.batch_read_varsize_unpacked(
-                    self._idx_col_id,
-                    self._data_col_id,
-                    start,
-                    count,
-                    12,  # idx elem_size
-                    self._idx_chunk_bytes,
-                    self._packer,
-                )
-            else:
-                # Raw bytes
-                return self._inner.batch_read_varsize(
-                    self._idx_col_id,
-                    self._data_col_id,
-                    start,
-                    count,
-                    12,
-                    self._idx_chunk_bytes,
-                )
-
-        elif isinstance(key, int):
-            # Single element access (existing logic)
-            length = len(self)
-            if key < 0:
-                key += length
-            if key < 0 or key >= length:
-                raise IndexError(f"Column index out of range: {key}")
-
-            # NEW: Read 12-byte index (i32 chunk_id, i32 start, i32 end)
-            # CRITICAL: Use aligned index chunk size, not self._chunk_bytes!
-            index_data = self._inner.read_range(self._idx_col_id, key, 1, 12, self._idx_chunk_bytes)
-            chunk_id = unpack_i32(index_data, 0)
-            start_byte = unpack_i32(index_data, 4)
-            end_byte = unpack_i32(index_data, 8)
-
-            # Read data from single chunk (no cross-chunk!)
-            data = self._inner.read_adaptive(self._data_col_id, chunk_id, start_byte, end_byte)
-
-            # If using packer for structured types, unpack the bytes
-            if self._use_rust_packer and self._packer:
-                return self._packer.unpack(bytes(data), 0)
-            else:
-                return bytes(data)
-
-        else:
-            raise TypeError("Column indices must be integers or slices")
-
-    def __setitem__(self, key, value):
-        """
-        Set element(s) at index (NEW in v0.4.2 with size-aware logic!).
-
-        Single element:
-            col[42] = b"new data"  # Works even if size different!
-
-        Strategy:
-        - new_size ≤ old_size: Direct replace (leaves fragment for vacuum)
-        - new_size > old_size: Insert-like rebuild (may need chunk rebuild)
-
-        Note: Slice setitem not yet implemented.
-        """
-        if isinstance(key, slice):
-            # Slice setitem - batch update
-            return self._setitem_slice(key, value)
-        elif isinstance(key, int):
-            # Flush cache before modification
-            if self._cache_enabled:
-                self._inner.flush_cache(self._data_col_id)
-
-            # Validate index
-            length = len(self)
-            if key < 0:
-                key += length
-            if key < 0 or key >= length:
-                raise IndexError(f"Index out of range: {key}")
-
-            # Pack new value
-            if self._use_rust_packer and self._packer:
-                new_data = self._packer.pack(value)
-            else:
-                if not isinstance(value, bytes):
-                    raise TypeError("Value must be bytes")
-                new_data = value
-
-            # Read current index entry
-            index_data = self._inner.read_range(self._idx_col_id, key, 1, 12, self._idx_chunk_bytes)
-            chunk_id = unpack_i32(index_data, 0)
-            old_start = unpack_i32(index_data, 4)
-            old_end = unpack_i32(index_data, 8)
-
-            # Delegate to Rust for size-aware update
-            self._inner.update_varsize_element(
-                self._data_col_id,
-                self._idx_col_id,
-                key,
-                new_data,
-                chunk_id,
-                old_start,
-                old_end,
-                self._data_max_chunk,
-            )
-        else:
-            raise TypeError("Column indices must be integers or slices")
-
-    def _setitem_slice(self, key: slice, values) -> None:
-        """
-        Set multiple variable-size elements via slice using batch update.
-
-        Strategy:
-        - total_new ≤ total_old: Direct replace (leaves fragments)
-        - total_new > total_old: Rebuild chunks
-
-        Args:
-            key: slice object
-            values: list of new values
-
-        Raises:
-            ValueError: If step != 1 or length mismatch
-        """
-        # Flush cache before modification
-        if self._cache_enabled:
-            self._inner.flush_cache(self._data_col_id)
-
+    def iter_batches(
+        self,
+        batch_size: int | None = None,
+        *,
+        batch_bytes: int = 1 << 20,
+        start: int = 0,
+        stop: int | None = None,
+        as_array: bool = True,
+    ) -> Iterator:
+        """Iterate to the initial row count, with no total-row limit."""
+        self._read_ready()
+        if batch_bytes <= 0:
+            raise ValueError("batch_bytes must be positive")
+        if batch_size is None:
+            batch_size = max(1, batch_bytes // (self._elem_size or 256))
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
         length = len(self)
-        start, stop, step = key.indices(length)
+        start, stop, _ = slice(start, stop).indices(length)
 
-        if step != 1:
-            raise ValueError("Step slicing not supported for setitem")
+        for offset in range(start, stop, batch_size):
+            count = min(batch_size, stop - offset)
+            if as_array and self._codec.numpy_dtype is not None:
+                yield self.read_array(offset, count)
+            else:
+                yield self.read(offset, count)
 
-        count = stop - start
-        if count <= 0:
-            # Empty slice - nothing to do
+    def __iter__(self) -> Iterator:
+        for batch in self.iter_batches(as_array=False):
+            yield from batch
+
+    def _commit(self, payload: bytes, offsets: bytes | None) -> None:
+        if self._elem_size:
+            self._inner.append_fixed(self._col_id, payload)
+        else:
+            self._inner.append_variable(self._col_id, payload, offsets)
+
+    def _buffer_bytes(self) -> int:
+        return len(self._buffer) + (len(self._offsets) - 8 if not self._elem_size else 0)
+
+    def _queue(self, payload: bytes, offsets: bytes | None, count: int) -> None:
+        # Recheck after serialization and acquiring the column lock.
+        self._vault._check_writable()
+        if count == 0:
+            return
+        cost = len(payload) + (count * 8 if offsets is not None else 0)
+        if not self._cache_enabled:
+            self._commit(payload, offsets)
             return
 
-        # Validate values length
-        if len(values) != count:
-            raise ValueError(
-                f"Slice length mismatch: slice has {count} elements, "
-                f"but {len(values)} values provided"
-            )
+        if self._buffer_bytes() + cost > self._cap_bytes:
+            self.flush_cache()
+        if cost > self._cap_bytes:
+            # Oversized batches bypass the cache instead of breaking its bound.
+            self._commit(payload, offsets)
+            return
 
-        # Pack all values
-        packed_values = []
-        for v in values:
-            if self._use_rust_packer and self._packer:
-                packed_values.append(self._packer.pack(v))
+        base = len(self._buffer)
+        self._buffer.extend(payload)
+        if offsets is not None:
+            if count == 1:
+                self._offsets.extend(struct.pack("<Q", len(self._buffer)))
             else:
-                if not isinstance(v, bytes):
-                    raise TypeError("Value must be bytes")
-                packed_values.append(v)
-
-        # Delegate to Rust for efficient batch update
-        self._inner.update_varsize_slice(
-            self._data_col_id,
-            self._idx_col_id,
-            start,
-            count,
-            packed_values,
-            self._data_max_chunk,
-        )
-
-    def __delitem__(self, idx: int) -> None:
-        """Delete element (marks for vacuum, doesn't shift data)."""
-        if not isinstance(idx, int):
-            raise TypeError("Column indices must be integers")
-
-        length = len(self)
-        if idx < 0:
-            idx += length
-        if idx < 0 or idx >= length:
-            raise IndexError(f"Column index out of range: {idx}")
-
-        # Delete index entry (shifts remaining entries in index column)
-        # This is a fixed-size column operation (12 bytes per entry)
-        count = length - idx - 1
-        if count > 0:
-            # Read remaining index entries
-            index_data = self._inner.read_range(
-                self._idx_col_id, idx + 1, count, 12, self._idx_chunk_bytes
-            )
-            # Write them back one position earlier
-            self._inner.write_range(self._idx_col_id, idx, index_data, 12, self._idx_chunk_bytes)
-
-        # Update length
-        new_length = length - 1
-        self._inner.set_length(self._idx_col_id, new_length)
-        self._length = new_length
-
-        # Mark the data chunk as having deletions
-        # (actual cleanup happens in vacuum)
-
-    def __iter__(self) -> Iterator[bytes]:
-        """Iterate over all elements using optimized batch reads (v0.4.2)."""
-        length = len(self)
-        batch_size = 100  # Batch size for variable-size columns
-
-        for start in range(0, length, batch_size):
-            end = min(start + batch_size, length)
-            batch = self[start:end]  # Uses batch_read_varsize internally
-            for item in batch:
-                yield item
-
-    def insert(self, idx: int, value: bytes) -> None:
-        """Insert not supported for variable-size columns."""
-        raise NotImplementedError(
-            "Insert not supported for variable-size columns. Use append instead."
-        )
+                shifted = np.frombuffer(offsets, dtype="<u8")[1:] + base
+                self._offsets.extend(shifted.astype("<u8", copy=False).tobytes())
+        self._pending_rows += count
+        if self._buffer_bytes() >= self._flush_threshold:
+            self.flush_cache()
 
     def append(self, value) -> None:
-        """
-        Append a variable-size element using adaptive chunking (v0.4.0+).
-        Uses cache if enabled for even better performance!
-        """
-        current_length = self._get_length()
+        self._vault._check_writable()
+        payload = self._codec.pack_one(value)
+        offsets = struct.pack("<QQ", 0, len(payload)) if not self._elem_size else None
+        with self._lock:
+            self._queue(payload, offsets, 1)
 
-        # Pack value if using DataPacker for structured types
-        if self._use_rust_packer and self._packer:
-            packed_value = self._packer.pack(value)
+    def extend(self, values) -> None:
+        self._vault._check_writable()
+        payload, offsets, count = self._codec.pack_batch(values)
+        with self._lock:
+            self._queue(payload, offsets, count)
+
+    def append_array(self, values: np.ndarray) -> None:
+        """Append an (N, *shape) numeric batch without per-element serialization."""
+        if self._codec.numpy_dtype is None:
+            raise TypeError("append_array requires a numeric or fixed-shape vector column")
+        self.extend(values)
+
+    def __setitem__(self, key, values) -> None:
+        self._vault._check_writable()
+        with self._lock:
+            self.flush_cache()
+            if isinstance(key, slice):
+                start, stop, step = key.indices(len(self))
+                values = list(values)
+                if len(values) != len(range(start, stop, step)):
+                    raise ValueError(
+                        "Slice length mismatch: assignment must preserve the number of rows"
+                    )
+                if step != 1:
+                    raise ValueError("Step slicing not supported; use explicit updates instead")
+            else:
+                start = self._index(key)
+                stop = start + 1
+                values = [values]
+
+            if self._elem_size:
+                payload, _, _ = self._codec.pack_batch(values)
+                self._inner.overwrite_fixed(self._col_id, start, payload)
+            else:
+                current = self.read()
+                current[start:stop] = values
+                self._replace(current)
+
+    def _replace(self, values) -> None:
+        payload, offsets, _ = self._codec.pack_batch(values)
+        if self._elem_size:
+            self._inner.replace_fixed(self._col_id, payload)
         else:
-            if not isinstance(value, bytes):
-                raise TypeError("Value must be bytes")
-            packed_value = value
+            self._inner.replace_variable(self._col_id, payload, offsets)
 
-        if self._cache_enabled:
-            # CACHED PATH: Buffer in cache
-            self._inner.append_raw_adaptive_cached(self._data_col_id, packed_value)
-        else:
-            # DIRECT PATH: Write directly to disk
-            # Use adaptive append (returns chunk_id, start, end as i32 triple)
-            chunk_id, start_byte, end_byte = self._inner.append_raw_adaptive(
-                self._data_col_id, packed_value, self._data_max_chunk
-            )
+    def __delitem__(self, key) -> None:
+        self._vault._check_writable()
+        with self._lock:
+            self.flush_cache()
+            current = self.read()
+            del current[key]
+            self._replace(current)
 
-            # Store 12-byte index: (i32 chunk_id, i32 start, i32 end)
-            index_entry = pack_i32(chunk_id) + pack_i32(start_byte) + pack_i32(end_byte)
-            # Index column has elem_size=12, use aligned chunk size for addressing
-            self._inner.append_raw(
-                self._idx_col_id, index_entry, 12, self._idx_chunk_bytes, current_length
-            )
-
-        self._length = current_length + 1
-
-    def extend(self, values: list) -> None:
-        """
-        Extend with multiple variable-size elements (v0.4.0+ - optimized in Rust!).
-        Uses cache if enabled for even better performance!
-        """
-        if not values:
-            return
-
-        # Pack values if using DataPacker
-        if self._use_rust_packer and self._packer:
-            packed_values = [self._packer.pack(v) for v in values]
-        else:
-            # Raw bytes - validate type
-            for v in values:
-                if not isinstance(v, bytes):
-                    raise TypeError("Value must be bytes")
-            packed_values = values
-
-        current_length = self._get_length()
-
-        if self._cache_enabled:
-            # CACHED PATH: Buffer in cache
-            self._inner.extend_adaptive_cached(self._data_col_id, packed_values)
-        else:
-            # DIRECT PATH: Write directly to disk
-            # Call extend_adaptive - ALL processing in Rust!
-            # Returns packed index data (12 bytes per element)
-            all_index_data = self._inner.extend_adaptive(
-                self._data_col_id,
-                packed_values,
-                self._data_max_chunk,
-            )
-
-            # Append index data (already packed in Rust!)
-            self._inner.append_raw(
-                self._idx_col_id, all_index_data, 12, self._idx_chunk_bytes, current_length
-            )
-
-        self._length = current_length + len(values)
+    def insert(self, index: int, value) -> None:
+        self._vault._check_writable()
+        with self._lock:
+            self.flush_cache()
+            current = self.read()
+            current.insert(operator.index(index), value)
+            self._replace(current)
 
     def clear(self) -> None:
-        """Remove all elements."""
-        # Flush cache before structural operation
-        if self._cache_enabled:
-            self._inner.flush_cache(self._data_col_id)
+        self._vault._check_writable()
+        with self._lock:
+            self.flush_cache()
+            self._inner.clear(self._col_id)
 
-        self._inner.set_length(self._data_col_id, 0)
-        self._inner.set_length(self._idx_col_id, 0)
-        self._length = 0
-
-    # ========================================
-    # CACHE METHODS
-    # ========================================
-
-    def enable_cache(
-        self, cap_bytes: int = 64 * 1024 * 1024, flush_threshold: int = 16 * 1024 * 1024
-    ) -> None:
-        """
-        Enable write-back cache for this variable-size column.
-
-        Args:
-            cap_bytes: Maximum cache size in bytes (default 64MB)
-            flush_threshold: Auto-flush when cache exceeds this size (default 16MB)
-        """
-        # Enable cache with idx_col_id for variable-size column
-        self._inner.enable_cache(
-            self._data_col_id, cap_bytes, flush_threshold, True, self._idx_col_id
-        )
-        self._cache_enabled = True
-
-    def disable_cache(self) -> None:
-        """Disable cache for this column (auto-flushes first)."""
-        if self._cache_enabled:
-            self._inner.disable_cache(self._data_col_id)
-            self._cache_enabled = False
+    def enable_cache(self, cap_bytes: int = 8 << 20, flush_threshold: int | None = None) -> None:
+        self._vault._check_writable()
+        if cap_bytes <= 0 or (flush_threshold is not None and flush_threshold <= 0):
+            raise ValueError("Cache sizes must be positive")
+        with self._lock:
+            self.flush_cache()
+            self._cap_bytes = cap_bytes
+            self._flush_threshold = min(cap_bytes, flush_threshold or (1 << 20))
+            self._cache_enabled = True
 
     def flush_cache(self) -> int:
-        """
-        Flush this column's cache.
+        self._vault._check_open()
+        with self._lock:
+            if not self._pending_rows:
+                return 0
+            size = self._buffer_bytes()
+            offsets = bytes(self._offsets) if not self._elem_size else None
+            self._commit(bytes(self._buffer), offsets)
 
-        Returns:
-            Number of bytes flushed
-        """
-        if self._cache_enabled:
-            return self._inner.flush_cache(self._data_col_id)
-        return 0
+            # A failed transaction leaves the complete buffer available for retry.
+            self._buffer.clear()
+            self._offsets = bytearray(8)
+            self._pending_rows = 0
+            return size
+
+    def disable_cache(self) -> None:
+        with self._lock:
+            self.flush_cache()
+            self._cache_enabled = False
 
     @contextmanager
-    def cache(self, cap_bytes: int = 64 * 1024 * 1024, flush_threshold: int = 16 * 1024 * 1024):
-        """
-        Context manager for temporary cache enablement.
-
-        Example:
-            with col.cache():
-                for i in range(1000):
-                    col.append(data)
-        """
+    def cache(self, cap_bytes: int = 8 << 20, flush_threshold: int | None = None):
+        previous = (self._cap_bytes, self._flush_threshold) if self._cache_enabled else None
         self.enable_cache(cap_bytes, flush_threshold)
         try:
             yield self
         finally:
-            self.disable_cache()
+            if previous is None:
+                self.disable_cache()
+            else:
+                self.enable_cache(*previous)
 
-    # ========================================
-    # END CACHE METHODS
-    # ========================================
+    def storage_info(self) -> dict[str, int]:
+        self._read_ready()
+        blocks, used, capacity = self._inner.storage_info(self._col_id)
+        return {"blocks": blocks, "payload_bytes": used, "capacity_bytes": capacity}
 
     def __repr__(self) -> str:
-        return f"VarSizeColumn(name={self._name!r}, length={len(self)})"
+        return (
+            f"{type(self).__name__}(name={self.name!r}, dtype={self.dtype!r}, length={len(self)})"
+        )
 
 
-# ======================================================================================
-# ColumnVault Class (Container)
-# ======================================================================================
+class VarSizeColumn(Column):
+    """Variable-width column using bounded payload blocks and u64 offsets."""
 
 
 class ColumnVault:
-    """
-    Container for columnar storage.
+    """Column catalog sharing a SQLite file with KV and vector vaults.
 
-    Usage:
-        vault = ColumnVault(kvault_instance)
-        vault.create_column("temperatures", "f64")
-        temps = vault["temperatures"]
-        temps.append(23.5)
+    The new column format does not read legacy col_* tables. Use close() or a
+    context manager to flush pending writes and release file handles explicitly.
     """
 
     def __init__(
         self,
-        kvault_or_path: Union[Any, str],
-        min_chunk_bytes: int = 128 * 1024,
-        max_chunk_bytes: int = 16 * 1024 * 1024,
+        kvault_or_path,
+        min_chunk_bytes: int | None = None,
+        max_chunk_bytes: int | None = None,
+        *,
+        block_bytes: int = 1 << 20,
+        read_only: bool = False,
     ):
-        """
-        Initialize ColumnVault.
+        # Old sizing keywords remain API aliases, not legacy-format support.
+        if max_chunk_bytes is not None:
+            block_bytes = max_chunk_bytes
+        if block_bytes <= 0 or block_bytes > 512 << 20:
+            raise ValueError("block_bytes must be between 1 and 512 MiB")
+        if min_chunk_bytes is not None and not 0 < min_chunk_bytes <= block_bytes:
+            raise ValueError("min_chunk_bytes must be positive and no larger than block_bytes")
 
-        Args:
-            kvault_or_path: Either a KVault instance (to share DB) or a path string
-            chunk_bytes: Default chunk size for new columns (1 MiB, for compatibility)
-            min_chunk_bytes: Minimum chunk size (128KB, first chunk starts here)
-            max_chunk_bytes: Maximum chunk size (16MB, chunks don't grow beyond this)
-        """
-        self._min_chunk_bytes = min_chunk_bytes
-        self._max_chunk_bytes = max_chunk_bytes
+        source = getattr(kvault_or_path, "_path", kvault_or_path)
+        self._path = os.fspath(source)
+        self._inner = _ColumnVault(self._path, read_only)
+        self._block_bytes = block_bytes
+        self._read_only = read_only
+        self._state = _ColumnState(read_only)
+        self._columns = {}
+        self._lock = threading.RLock()
+        self._cache_config = None
+        self._pause_flush = 0
+        self._daemon_stop = threading.Event()
+        self._daemon_thread = None
 
-        # Get path from KVault or use string directly
-        if isinstance(kvault_or_path, str):
-            path = kvault_or_path
-        else:
-            # Assume it's a KVault instance
-            path = kvault_or_path._path
+    @property
+    def _closed(self) -> bool:
+        return self._state.closed
 
-        self._inner = _ColumnVault(path)
-        self._columns = {}  # Cache of Column instances
-        self._daemon_thread = None  # Cache flush daemon thread
-        self._daemon_stop = threading.Event()  # Signal to stop daemon
+    def _check_open(self) -> None:
+        self._state._check_open()
 
-    def __del__(self):
-        """Clean up: checkpoint WAL before closing to prevent hangs on database cleanup."""
-        try:
-            # CRITICAL: Checkpoint WAL before Python garbage collects the Rust connection
-            # This prevents SQLite from hanging when trying to close connections with large WAL files
-            self.checkpoint()
-        except Exception:
-            pass  # Ignore errors in destructor
+    def _check_writable(self) -> None:
+        self._state._check_writable()
 
     def create_column(
-        self, name: str, dtype: str, chunk_bytes: int = None, use_rust_packer: bool = True
-    ) -> Union["Column", "VarSizeColumn"]:
-        """
-        Create a new column.
+        self,
+        name: str,
+        dtype: str,
+        chunk_bytes: int | None = None,
+        use_rust_packer: bool = True,
+        *,
+        block_bytes: int | None = None,
+    ) -> Column:
+        self._check_writable()
+        codec = ColumnCodec(dtype)
+        size = block_bytes if block_bytes is not None else chunk_bytes
+        size = self._block_bytes if size is None else size
+        with self._lock:
+            self._check_writable()
+            col_id = self._inner.create(name, dtype, codec.elem_size, size)
+            cls = Column if codec.elem_size else VarSizeColumn
+            column = cls(self, col_id, name, codec, size)
+            self._columns[name] = column
+            if self._cache_config is not None:
+                column.enable_cache(*self._cache_config)
+            return column
 
-        Args:
-            name: Column name (must be unique)
-            dtype: Data type, including:
-                - Primitives: "i64", "f64", "bytes:N" (fixed-size)
-                - Variable bytes: "bytes"
-                - Strings: "str:utf8", "str:32:utf8", "str:ascii", "str:latin1", etc.
-                - Structured: "msgpack", "cbor" (for dicts/lists)
-            chunk_bytes: Chunk size (defaults to vault default)
-            use_rust_packer: Use Rust DataPacker (default True, faster)
+    def __getitem__(self, name: str) -> Column:
+        self._check_open()
+        with self._lock:
+            try:
+                col_id, dtype, _, _, block_bytes = self._inner.info(name)
+            except KeyError as error:
+                raise E.NotFound(name) from error
+            cached = self._columns.get(name)
+            if cached is not None and cached._col_id == col_id:
+                return cached
+            codec = ColumnCodec(dtype)
+            cls = Column if codec.elem_size else VarSizeColumn
+            column = cls(self, col_id, name, codec, block_bytes)
+            self._columns[name] = column
+            if self._cache_config is not None:
+                column.enable_cache(*self._cache_config)
+            return column
 
-        Returns:
-            Column (fixed-size) or VarSizeColumn (variable-size) instance
-        """
-        _, elem_size, is_varsize = parse_dtype(dtype)
-
-        if is_varsize:
-            # Create variable-size column (bytes, strings, msgpack, cbor)
-            return self._create_varsize_column(name, dtype, use_rust_packer)
-
-        # Create fixed-size column
-        col_id = self._inner.create_column(
-            name, dtype, elem_size, self._min_chunk_bytes, self._max_chunk_bytes
-        )
-
-        # IMPORTANT: Get the ALIGNED max_chunk_bytes from database (v0.4.0: element-aligned)
-        _, _, _, aligned_max_chunk = self._inner.get_column_info(name)
-        col = Column(
-            self._inner, col_id, name, dtype, elem_size, aligned_max_chunk, use_rust_packer
-        )
-        self._columns[name] = col
-        return col
-
-    def _create_varsize_column(
-        self, name: str, dtype: str, use_rust_packer: bool = True
-    ) -> "VarSizeColumn":
-        """Create a variable-size column using adaptive chunking (v0.4.0+)."""
-        # Data column stores packed bytes (elem_size=1)
-        # Store the original dtype in the data column's metadata
-        data_col_id = self._inner.create_column(
-            f"{name}_data", dtype, 1, self._min_chunk_bytes, self._max_chunk_bytes
-        )
-
-        # Index column stores 12-byte triples: (i32 chunk_id, i32 start, i32 end)
-        idx_col_id = self._inner.create_column(
-            f"{name}_idx",
-            "adaptive_idx",
-            12,
-            self._min_chunk_bytes,
-            self._max_chunk_bytes,
-        )
-
-        # IMPORTANT: Pass max_chunk_bytes for addressing
-        col = VarSizeColumn(
-            self._inner,
-            data_col_id,
-            idx_col_id,
-            name,
-            dtype,
-            self._max_chunk_bytes,
-            use_rust_packer,
-        )
-        self._columns[name] = col
-        return col
-
-    def __getitem__(self, name: str) -> Union["Column", "VarSizeColumn"]:
-        """Get column by name."""
-        if name in self._columns:
-            return self._columns[name]
-
-        # Check if this is a variable-size column (has _data and _idx companions)
+    def ensure(self, name: str, dtype: str, **options) -> Column:
         try:
-            data_col_id, data_elem_size, data_length, data_chunk_bytes = (
-                self._inner.get_column_info(f"{name}_data")
-            )
-            idx_col_id, idx_elem_size, idx_length, idx_chunk_bytes = self._inner.get_column_info(
-                f"{name}_idx"
-            )
-
-            # Get the dtype from the _data column's metadata (we store it there)
-            cols = self._inner.list_columns()
-            dtype = None
-            for col_name, col_dtype, _ in cols:
-                if col_name == f"{name}_data":
-                    dtype = col_dtype
-                    break
-
-            # This is a varsize column - use the stored dtype
-            col = VarSizeColumn(
-                self._inner,
-                data_col_id,
-                idx_col_id,
-                name,
-                dtype if dtype else "bytes",  # Use stored dtype from _data column
-                data_chunk_bytes,
-            )
-            self._columns[name] = col
-            return col
-        except RuntimeError:
-            pass  # Not a varsize column, try regular column
-
-        # Load regular column from database
-        # Get the dtype from metadata
-        cols = self._inner.list_columns()
-        dtype = None
-        for col_name, col_dtype, _ in cols:
-            if col_name == name:
-                dtype = col_dtype
-                break
-
-        # Load regular column from database
-        try:
-            col_id, elem_size, length, chunk_bytes = self._inner.get_column_info(name)
-        except RuntimeError as ex:
-            # Convert RuntimeError from Rust to NotFound
-            if "not found" in str(ex).lower():
-                raise E.NotFound(name) from ex
-            raise
-
-        if dtype is None:
-            raise E.NotFound(name)
-
-        col = Column(self._inner, col_id, name, dtype, elem_size, chunk_bytes)
-        self._columns[name] = col
-        return col
-
-    def ensure(
-        self, name: str, dtype: str, chunk_bytes: int = None, use_rust_packer: bool = True
-    ) -> Union["Column", "VarSizeColumn"]:
-        """
-        Get column if exists, create if not.
-
-        Args:
-            name: Column name
-            dtype: Data type (only used if creating)
-            chunk_bytes: Chunk size (only used if creating)
-            use_rust_packer: Use Rust DataPacker (default True, faster)
-
-        Returns:
-            Column instance
-        """
-        try:
-            return self[name]
+            column = self[name]
         except E.NotFound:
-            return self.create_column(name, dtype, chunk_bytes, use_rust_packer)
+            return self.create_column(name, dtype, **options)
+        if column.dtype != dtype:
+            raise ValueError(f"Column {name!r} has dtype {column.dtype!r}, not {dtype!r}")
+        return column
 
     def list_columns(self) -> list[tuple[str, str, int]]:
-        """
-        List all columns.
-
-        Returns:
-            List of (name, dtype, length) tuples
-        """
+        self._check_open()
         return self._inner.list_columns()
 
     def delete_column(self, name: str) -> bool:
-        """
-        Delete a column and all its data.
+        self._check_writable()
+        with self._lock:
+            column = self._columns.get(name)
+            if column is not None:
+                column.flush_cache()
+            deleted = self._inner.delete_column(name)
+            self._columns.pop(name, None)
+            return deleted
 
-        Returns:
-            True if deleted, False if not found
-        """
-        if name in self._columns:
-            del self._columns[name]
-
-        return self._inner.delete_column(name)
-
-    def checkpoint(self) -> None:
-        """
-        Manually checkpoint WAL file to main database.
-
-        This merges the WAL file into the main DB file, preventing
-        the WAL from growing indefinitely. Useful for long-running
-        processes with many writes.
-        """
-        try:
-            self._inner.checkpoint_wal()
-        except Exception:
-            pass  # Ignore checkpoint errors (non-critical)
-
-    # ========================================
-    # CACHE METHODS
-    # ========================================
+    def checkpoint(self) -> tuple[int, int, int]:
+        self._check_writable()
+        self.flush_cache()
+        return self._inner.checkpoint_wal()
 
     def enable_cache(
         self,
-        cap_bytes: int = 64 * 1024 * 1024,
-        flush_threshold: int = 16 * 1024 * 1024,
-        flush_interval: float = None,
+        cap_bytes: int = 8 << 20,
+        flush_threshold: int | None = None,
+        flush_interval: float | None = None,
     ) -> None:
-        """
-        Enable write-back cache for ALL columns in this vault.
-
-        Args:
-            cap_bytes: Maximum cache size per column in bytes (default 64MB)
-            flush_threshold: Auto-flush when cache exceeds this size (default 16MB)
-            flush_interval: Optional auto-flush interval in seconds (starts daemon thread)
-
-        Example:
-            vault.enable_cache(cap_bytes=64<<20, flush_threshold=16<<20, flush_interval=5.0)
-        """
-        # Enable cache for all existing columns
-        for col in self._columns.values():
-            col.enable_cache(cap_bytes, flush_threshold)
-
-        # Start daemon thread if flush_interval specified
+        self._check_writable()
+        if cap_bytes <= 0 or (flush_threshold is not None and flush_threshold <= 0):
+            raise ValueError("Cache sizes must be positive")
+        if flush_interval is not None and flush_interval <= 0:
+            raise ValueError("flush_interval must be positive")
+        with self._lock:
+            for column in self._columns.values():
+                column.enable_cache(cap_bytes, flush_threshold)
+            self._cache_config = (cap_bytes, flush_threshold)
         if flush_interval is not None and self._daemon_thread is None:
             self._daemon_stop.clear()
             self._daemon_thread = threading.Thread(
-                target=self._cache_daemon, args=(flush_interval,), daemon=True
+                target=self._flush_worker,
+                args=(flush_interval,),
+                daemon=True,
             )
             self._daemon_thread.start()
 
-    def disable_cache(self) -> None:
-        """
-        Disable cache for ALL columns (auto-flushes first).
-        Stops daemon thread if running.
-        """
-        # Stop daemon thread
-        if self._daemon_thread is not None:
-            self._daemon_stop.set()
-            self._daemon_thread.join(timeout=2.0)
+    def _stop_worker(self) -> None:
+        self._daemon_stop.set()
+        worker = self._daemon_thread
+        if worker is not None:
+            worker.join()
             self._daemon_thread = None
 
-        # Disable cache for all columns
-        for col in self._columns.values():
-            col.disable_cache()
+    def _flush_worker(self, interval: float) -> None:
+        while not self._daemon_stop.wait(interval):
+            with self._lock:
+                paused = self._pause_flush > 0
+            if not paused:
+                try:
+                    self.flush_cache()
+                except Exception as error:
+                    self._state.error = error
+                    return
 
     def flush_cache(self) -> int:
-        """
-        Flush all column caches.
+        self._check_open()
+        with self._lock:
+            columns = list(self._columns.values())
+        return sum(column.flush_cache() for column in columns)
 
-        Returns:
-            Total number of bytes flushed
-        """
-        return self._inner.flush_all_caches()
+    def disable_cache(self) -> None:
+        self._stop_worker()
+        self._check_open()
+        with self._lock:
+            for column in self._columns.values():
+                column.disable_cache()
+            self._cache_config = None
 
     @contextmanager
-    def cache(
-        self,
-        cap_bytes: int = 64 * 1024 * 1024,
-        flush_threshold: int = 16 * 1024 * 1024,
-    ):
-        """
-        Context manager for temporary cache enablement.
-        Auto-flushes and disables cache on exit.
-
-        Example:
-            with vault.cache(cap_bytes=64<<20):
-                for i in range(1000):
-                    col.append(i)
-        """
+    def cache(self, cap_bytes: int = 8 << 20, flush_threshold: int | None = None):
+        previous = self._cache_config
         self.enable_cache(cap_bytes, flush_threshold)
         try:
             yield self
         finally:
-            self.disable_cache()
+            if previous is None:
+                self.disable_cache()
+            else:
+                self.enable_cache(*previous)
 
     @contextmanager
     def lock_cache(self):
-        """
-        Lock cache to prevent daemon flushes during atomic operations.
-
-        Example:
-            with vault.lock_cache():
-                col1.append(data1)
-                col2.append(data2)  # Ensure both go in same flush
-        """
-        self._inner.lock_cache()
+        """Pause timer flushes; this is not a multi-column transaction."""
+        with self._lock:
+            self._pause_flush += 1
         try:
-            yield
+            yield self
         finally:
-            self._inner.unlock_cache()
+            with self._lock:
+                self._pause_flush -= 1
 
-    def _cache_daemon(self, flush_interval: float) -> None:
-        """
-        Background thread that periodically flushes caches.
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._state.closing = True
+        try:
+            self._stop_worker()
+            self.flush_cache()
+            self._inner.close()
+            self._state.closed = True
+        finally:
+            self._state.closing = False
 
-        Args:
-            flush_interval: Idle time in seconds before auto-flush
-        """
-        while not self._daemon_stop.is_set():
-            time.sleep(0.5)  # Check every 500ms
+    def __enter__(self):
+        self._check_open()
+        return self
 
-            # Skip if cache is locked
-            if self._inner.is_cache_locked():
-                continue
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
-            # Check all columns for idle time
-            for col in self._columns.values():
-                if hasattr(col, "_col_id"):
-                    idle_time = self._inner.get_cache_idle_time(col._col_id)
-                    if idle_time is not None and idle_time >= flush_interval:
-                        try:
-                            self._inner.flush_cache(col._col_id)
-                        except Exception:
-                            pass  # Ignore flush errors in daemon
-
-    # ========================================
-    # END CACHE METHODS
-    # ========================================
+    def __del__(self):
+        if hasattr(self, "_closed") and not self._closed:
+            try:
+                self.close()
+            except Exception:
+                warnings.warn("ColumnVault closed without a successful flush", ResourceWarning)
 
     def __repr__(self) -> str:
-        cols = self.list_columns()
-        return f"ColumnVault({len(cols)} columns)"
+        return f"ColumnVault({self._path!r}, closed={self._closed})"
