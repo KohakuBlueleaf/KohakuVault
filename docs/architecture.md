@@ -1,102 +1,73 @@
 # KohakuVault Architecture
 
-KohakuVault is a pure-Python package backed by a Rust extension that talks to SQLite. Python keeps the ergonomic APIs (`Mapping`, `MutableSequence`, context managers, retries) while Rust handles serialization, chunk orchestration, and tight loops. Everything eventually lands in a single SQLite database so deployment stays trivial.
+KohakuVault combines Python APIs, a Rust/PyO3 extension, and SQLite persistence. It requires no database service. All durable collections live in one SQLite database; WAL mode can create `-wal` and `-shm` sidecars while the database is in use. Copying only the main file during active writes is not a safe backup procedure.
 
-## Layered Model
+## Layers
 
-| Layer | Location | Responsibilities |
-|-------|----------|------------------|
-| Python proxies | `src/kohakuvault/proxy.py`, `column_proxy.py`, `vector_proxy.py`, `wrappers.py` | Public API, argument validation, retry/backoff, cache orchestration, type wrappers for auto-pack |
-| PyO3 module | `src/kvault-rust/lib.rs` | Exposes `_KVault`, `_ColumnVault`, `DataPacker`, CSBTree, SkipList, and `_VectorKVault` to Python |
-| Rust subsystems | `src/kvault-rust/kv`, `col`, `packer`, `tree`, `skiplist`, `vkvault`, `vector_utils.rs` | SQLite sessions (rusqlite), chunk/cache management, serialization, ordered containers, sqlite-vec integration |
-| Storage | SQLite database (`.db`, `.db-wal`, `.db-shm`) | ACID persistence, WAL concurrency, single deployment artifact |
+| Layer | Location | Responsibility |
+|---|---|---|
+| Public APIs | `src/kohakuvault/*_proxy.py`, `proxy.py` | Mapping/column/search interfaces, validation, batching, lifecycle |
+| Column codecs | `column_codec.py` | Contiguous numeric/tensor buffers and generic record conversion |
+| Native storage | `src/kvault-rust/kv/`, `col/`, `vkvault/`, `textvault/` | Transactions, BLOB I/O, SQL queries, native serialization |
+| Shared infrastructure | `common/`, `common/read_pool.rs` | Connection setup and read snapshots |
+| KV buffering/batches | `kv/cache.rs`, `kv/batch.rs` | Pending/in-flight ownership, explicit native bulk calls |
+| Durable substrate | SQLite and sqlite-vec | Persistence, locking, recovery, vector-table representation |
 
-## Data Layout
+## Storage and compatibility
 
-All components share one SQLite database file. Default table names are configurable but the on-disk patterns stay consistent:
+KV uses its existing `key BLOB PRIMARY KEY, value BLOB NOT NULL` tables. Raw bytes remain raw. Automatically packed values retain the existing ten-byte header and MessagePack/CBOR/DataPacker/Pickle encodings. `kv/header.rs`, `kv/autopacker.rs`, and `packer/` remain the compatibility boundary; column optimizations do not change them.
 
-- **KVault** – `kv` (default) with `key BLOB PRIMARY KEY, value BLOB NOT NULL`. Values may contain a 10-byte auto-pack header (see below) or raw bytes.
-- **Column metadata** – `col_meta` stores column id, dtype string, logical length, min/max chunk sizes, and cache hints.
-- **Column chunks** – `col_chunks` persists payload blobs keyed by column id and chunk id. Fixed-size columns append contiguous elements, while variable-size columns keep chunk usage metadata.
-- **Variable-size indexes** – for each var-size column we maintain `{name}_data` + `{name}_idx`. Index rows hold 12-byte triples `(chunk_id, start, end)` so we can jump straight to the byte range.
-- **Vector search** – `_VectorKVault` creates a sqlite-vec `vec0` virtual table for dense vectors plus a companion blob table for arbitrary values. Rows reference the value blob id so vector scans remain cache-friendly.
-- **Metadata** – `kohakuvault_meta` records schema versions for migrations and sanity checks.
+Vector storage retains the sqlite-vec 0.1.6 `vec0` table and its companion `{table}_values` table. Insert, update, and delete now publish the vector and associated payload atomically. Normalizing and packing float vectors is unchanged on disk; the Python input path passes contiguous float32 bytes instead of a Python list of coordinates.
 
-WAL (Write-Ahead Logging) keeps readers isolated from writers. Both `_KVault` and `_ColumnVault` expose `checkpoint()` helpers so long-running jobs can merge WAL pages back to the main file.
+Columns use a replacement format with an independent version marker:
 
-## Auto-Pack Pipeline
+| Table | Content |
+|---|---|
+| `kvault_col_format` | Column format version |
+| `kvault_col_columns` | Name, dtype, fixed width, length, block target |
+| `kvault_col_blocks` | Small mutable block-directory records |
+| `kvault_col_data` | Payload BLOBs and optional u64-offset BLOBs |
 
-Auto-packing lets `KVault` accept rich Python objects without manual serialization. The Rust implementation in `kv/autopacker.rs` runs through a priority order:
+Mutable directory metadata is deliberately separate from payload rows. Fixed blocks are addressed arithmetically; variable blocks use a row-position index. Both use bounded preallocation rather than repeated persistent BLOB growth. The old `col_*` format is not migrated, read, or deleted. See [column storage design](columnar_storage.md) for details.
 
-1. `bytes` → stored as-is (no header, zero overhead).
-2. Explicit wrappers (`MsgPack`, `Json`, `Cbor`, `Pickle` from `kohakuvault.wrappers`) → force an encoding when you need one.
-3. NumPy arrays → `vec:*` DataPacker dtype.
-4. Int/float → `i64`/`f64` DataPacker dtypes.
-5. `str` → UTF-8 bytes.
-6. dict/list → MessagePack with a Pickle fallback.
-7. Everything else → Pickle if enabled.
+TextVault retains its FTS5 tables and existing value encodings. Standalone CSBTree/SkipList containers remain independent in-process utilities, not persistent column indexes.
 
-Non-raw values are prefixed with a 10-byte header defined in `kv/header.rs`:
+## Connections and concurrency
 
-```
-|0x89 0x4B|version|encoding|flags|reserved(3)|0x56 0x4B|
-```
+File-backed KV point reads/scans, column reads, and vector queries use independent read-only connections. By default each pool retains at most eight idle connections; KV exposes `reader_idle_limit` and `reader_cache_kb` (8 MiB per reader by default), and propagates `mmap_size`. Idle retention does not cap active readers; the pool lock is not held while executing a query. Single-statement KV point queries use SQLite's implicit statement snapshot; explicit read transactions cover multi-step metadata/payload and bulk accesses. `reader_pool_stats()` reports idle SQLite cache allocations, excluding mmap, active leases and Python memory. In-memory stores retain a single connection and serialize access.
 
-`encoding` tracks MessagePack/CBOR/DataPacker/etc. The header guard makes it safe to mix raw blobs (images, audio) with auto-packed objects in the same table. `KVault.enable_auto_pack()` and `disable_auto_pack()` toggle the behaviour, and `auto_pack_enabled()` reports the current state. Wrappers simply give callers an opt-in way to override the default encoding choice (for example, force JSON bytes for downstream tools).
+`read_only=True` is available for KVault, ColumnVault, and VectorKVault. It opens an existing database without schema creation or journal-mode changes. SQLite work on the new read/write paths releases the GIL. Python result decoding occurs after a read snapshot is released. sqlite-vec extension registration is guarded by a process-wide `Once`.
 
-## Connections, Caches, and Concurrency
+Writes remain serialized by SQLite. Column appends and vector compound mutations use an immediate transaction, acquiring the writer reservation before reading mutable positions/references. A separate writer connection allows existing readers to proceed under WAL. There is no external daemon, distributed writer, cross-interface transaction API, or custom recovery mechanism.
 
-- Each `_KVault` holds a `rusqlite::Connection` behind a `Mutex`. Write-back caches live in Rust (`WriteBackCache`) and are flushed via explicit calls (`flush_cache`, context managers) or daemon timers started from Python.
-- `_ColumnVault` owns its own connection plus per-column caches stored in a `Mutex<HashMap<ColumnCache>>`. The caches buffer appends/updates until thresholds are hit or manual flushes occur.
-- Python’s `_with_retries` helper wraps every call, converting rusqlite errors into typed Python exceptions (`DatabaseBusy`, `NotFound`, `InvalidArgument`). Busy loops use exponential backoff before surfacing an error.
-- Cache lock contexts (`kv.lock_cache()`, `column.cache().lock_cache()`) temporarily block auto-flushes so multi-step transactions can batch writes safely.
+KV stream writes allocate, copy, validate and commit in one immediate transaction. File-backed stream reads use a pooled connection and one snapshot; slow sinks can retain WAL pages. Callback reentry into the same vault is rejected. Known-size streams do not replay consumed callbacks on errors. Sharing a file across vault interfaces does not imply sharing a transaction or an in-memory SQLite connection.
 
-## Chunking Strategy
+## Caches and iteration
 
-Fixed-size columns align chunk boundaries to `elem_size`, so slicing `col[1_000:2_000]` can stream contiguous blobs without reassembling boundaries. Variable-size columns append to `_data` chunks while `_idx` keeps offsets. When an update outgrows its original chunk, the Rust backend rebuilds the affected chunk and updates metadata atomically.
+KV caches use an ordered pending map and one immutable in-flight batch with shared payload ownership. Read precedence is pending → in-flight → committed SQLite. Capacity counts both batches' key/value bytes. Scans take bounded ranges of references from each map, not a copy of all pending payloads for every page.
 
-Chunk growth is exponential between `min_chunk_bytes` and `max_chunk_bytes` (defaults 128 KiB → 16 MiB). You can override these when creating columns to match your workload (e.g., smaller chunks for high-churn logs, larger chunks for wide analytics tables).
+**Lock order and publication:** cached admission takes a shared mutation gate then briefly locks cache state. Direct, streamed, batch, delete and lifecycle mutations take the exclusive mutation gate, then the writer connection, then short cache-state locks. Flush takes the writer connection, moves pending into in-flight under the cache lock, releases that lock for all SQL/commit work, and retires or recovers the batch before releasing the connection. Flush does not take the mutation gate, allowing newer cached admissions while it waits. Readers never take the mutation gate or file-backed writer connection. No cache-state mutex is held across SQLite or Python callbacks. Uncontended memory-only admissions use try-locks under the GIL; contended paths detach before waiting. Serialization/deserialization captures a copy of the packer policy and releases its mutex before Python callbacks, including on vector paths.
 
-## Vector Search Stack
+Successful flush retires only its batch. Failed flush restores unsuperseded entries; newer pending values win. The writer connection serializes recovery before later direct writes can commit. Direct/stream/batch writes and deletes remove superseded pending entries only after successful SQL, while still owning the writer connection and exclusive admission gate. Deletes are synchronous committed operations, not buffered tombstones: by acknowledgment, older in-flight writes have resolved and pending data is removed, so there is no deferred delete overlay to resurrect. Failure leaves the old pending value recoverable.
 
-`VectorKVault` builds on sqlite-vec 0.1.6:
+`lock_cache()` suppresses future batch publication, not an already in-flight transaction. Nested Python contexts count active locks. Reset/disable/close use exclusive admission and a required flush, so skipped locked batches cannot be mistaken for successful final publication. Native close marks the handle closed only after success; writers recheck admission after serialization. In-progress read calls retain native ownership until return. Background flush failure records an inspectable error, warns, and stops the worker; acknowledged pending data remains recoverable by explicit flush.
 
-- `VectorKVault.insert()` normalizes numpy arrays/lists/bytes into float lists and forwards them to the Rust `_VectorKVault` which inserts into the `vec0` virtual table plus a blob table for values.
-- Queries (`search`, `get`) run brute-force scans accelerated by SIMD (AVX/NEON) inside sqlite-vec. Metrics include `cosine`, `l2`, `l1`, and `hamming`. Per-query overrides are supported.
-- Maintenance APIs (`get_by_id`, `update`, `delete`, `exists`, `count`, `info`) expose the sqlite-vec rowid, making it easy to track metadata in other tables.
+`put_many()` serializes an explicit list/tuple before taking database locks and commits all pairs in one transaction (last duplicate wins). `get_many()` captures matching cache references and runs all committed lookups in one snapshot, then decodes outside the database locks. This is not one combined cache/database snapshot under concurrent mutation. `update()` delegates bounded groups of 1024 pairs to the committed batch path. `clear()` uses one atomic DELETE; `pop()` and `setdefault()` combine lookup/mutation under an immediate transaction. These calls fence pending admission and preserve pending state on SQL failure.
 
-Because sqlite-vec currently performs full scans, WAL checkpoints and VACUUMs are important for keeping the file compact and query times predictable.
+Column append caches are contiguous Python bytearrays. Numeric batches avoid splitting a buffer into per-element Rust/Python allocations. Variable caches add a contiguous offsets buffer. Successful flushes publish one transaction; failed flushes retain pending data. A cache context flushes on exit and is not a rollback transaction.
 
-## Maintenance Hooks
+KV `keys()`, `items()`, `values()`, and ordinary iteration are unlimited by default. `limit` is an optional total cap; `batch_size` controls each query. Keyset pagination replaces a one-shot limited scan. `items()` reads key/value pairs together rather than issuing an extra lookup per key. Binary prefixes use an increment-and-truncate upper bound, including empty and all-0xff prefixes.
 
-| Operation | Python method | Notes |
-|-----------|---------------|-------|
-| WAL checkpoint | `KVault.checkpoint()`, `ColumnVault.checkpoint()` | Calls into `common::checkpoint_wal` |
-| Optimization | `KVault.optimize()` | Runs `PRAGMA optimize; VACUUM;` |
-| Cache flush | `flush_cache()` on vaults/columns | Forces buffered writes into SQLite |
-| Auto-pack headers | `KVault.enable_headers()`/`disable_headers()` | Control whether raw bytes get headers (rarely needed) |
+Pages use fresh snapshots, not one pinned iterator-wide snapshot. Column iterators likewise capture an initial end row and read batches separately. Concurrent destructive changes do not provide immutable whole-iteration semantics.
 
-## Repository Map
+## Lifetime and durability
 
-```
-KohakuVault/
-├── src/
-│   ├── kohakuvault/
-│   │   ├── proxy.py          # KVault proxy & auto-pack controls
-│   │   ├── column_proxy.py   # ColumnVault proxies & dtype parsing
-│   │   ├── vector_proxy.py   # VectorKVault proxy
-│   │   ├── wrappers.py       # MsgPack/Json/Cbor/Pickle wrappers
-│   │   └── errors.py         # Exception hierarchy
-│   └── kvault-rust/
-│       ├── kv/               # Key-value subsystem & auto-pack header
-│       ├── col/              # Column subsystem & caches
-│       ├── packer/           # DataPacker
-│       ├── vkvault/          # Vector search
-│       ├── tree/             # CSBTree
-│       └── skiplist/         # Lock-free skip list
-├── docs/                     # Guides (this folder)
-├── examples/                 # Benchmarks and demos
-└── tests/                    # Pytest suite covering KV/columns/vectors
-```
+Use context managers or explicit `close()`. Column closure flushes pending data, waits for native operations, and closes pooled/primary connections. KV/vector closure releases their native handles. Avoid retaining unused writer handles or long-lived read transactions.
 
-Keep this layout handy when onboarding new contributors—most bugs fall into “Python proxy”, “Rust backend”, or “SQLite plumbing”, and this map shows where to dive in.
+WAL with `synchronous=NORMAL` remains the performance-oriented default. Atomic commit is not a guarantee that every acknowledged transaction survives sudden power loss. Journaling has not been disabled to obtain benchmark results. Column `checkpoint()` reports `(busy, log_frames, checkpointed_frames)`; committing and checkpointing are distinct.
+
+## Validation and measurements
+
+The compatibility suite uses an actual database created by the old extension and checks byte-identical KV rewrites alongside legacy vector reads. New column tests cover buffers, cross-block ranges, rollback, empty/oversized records, read-only handles, threaded readers/writers, and a separate-process reader.
+
+The basic benchmarks are `examples/benchmark_columnar.py` and `examples/benchmark_kv.py`. They distinguish buffer/batch throughput from scalar Python conversion and report elapsed time as well as useful payload MiB/s. See [performance notes](performance.md); measurements are workload-specific, not a general claim about SQLite's maximum throughput.

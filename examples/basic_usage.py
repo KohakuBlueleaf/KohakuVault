@@ -43,6 +43,12 @@ def example_1_kvault_auto_pack():
     # Bytes → Raw (NO header, media file compatible!)
     kv["image.jpg"] = b"\xff\xd8\xff\xe0" + b"fake jpeg" * 100
 
+    # Explicit batches commit atomically and retain input order on read.
+    kv.put_many([("batch:1", {"id": 1}), ("batch:2", {"id": 2})])
+    assert kv.get_many(["batch:2", "missing"]) == [{"id": 2}, None]
+    assert kv.setdefault("defaults", ["typed"]) == ["typed"]
+    assert kv.pop("missing", "fallback") == "fallback"
+
     # Retrieve - automatically decoded!
     print("\nRetrieving (automatic deserialization)...")
     embedding = kv["embedding"]
@@ -125,6 +131,7 @@ def example_3_column_vault_vectors():
     print(f"  Embeddings: {len(batch_embeddings)} arrays")
     print(f"  Labels: {batch_labels[:3]}...")
 
+    cv.close()
     print("\n✓ ColumnVault example complete\n")
 
 
@@ -151,6 +158,7 @@ def example_4_vector_search():
     for rank, (id, distance, doc) in enumerate(results, 1):
         print(f"  {rank}. Distance={distance:.4f} | {doc.decode()[:50]}...")
 
+    vkv.close()
     print("\n✓ Vector search complete\n")
 
 
