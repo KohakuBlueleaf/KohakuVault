@@ -88,6 +88,24 @@ The principal contention improvement is separately established by deterministic 
 
 The unchanged column benchmark also ran successfully after the KV follow-up: array append/read 42.562/18.617 ms, list append/read 51.000/17.654 ms, 1,000 small slices 26.124 ms, variable append/list read 4.205/3.093 ms. This smoke run does not replace the original column before/after methodology above.
 
+## Vector comparison with 0.9.0
+
+```bash
+python examples/benchmark_vector.py --repeats 5 --json vector-current.json
+python examples/benchmark_vector.py --package-root /path/to/old/package-root --repeats 5 --json vector-original.json
+```
+
+Same Windows/Python 3.13 release environment, separate processes, median of five fresh-database trials: 2,000 seeded, normalized float32 vectors of dimension 128 with small dict metadata; 200 warm exact cosine queries, top-10. Inserts include commits. Input construction, result validation, worker startup, and cleanup are outside timing. The four-reader row performs 800 queries, not 200. Neither index algorithm nor default WAL/NORMAL policy changes; explicit checkpoint cost is not included. JSON includes every sample and loaded extension hash.
+
+| Workload | Original 0.9.0 | Current | Speedup |
+|---|---:|---:|---:|
+| 2,000 committed inserts | 245.020 ms | 214.565 ms | 1.14× |
+| 2,000 ID lookups | 21.704 ms | 18.399 ms | 1.18× |
+| 200 top-10 searches | 116.300 ms | 97.538 ms | 1.19× |
+| Four shared-handle readers, 800 searches | 481.983 ms | 276.748 ms | 1.74× |
+
+This measures the complete buffer-conversion, transaction, reader-pool and decoding paths, not an isolated improvement in the sqlite-vec search kernel. Original inserts wrote vector/value separately; current inserts commit both atomically. Local artifacts: `target/performance-rework/vector-{original,final}.json`. Results are workload-specific, not a promise for all dimensions, row counts or hardware.
+
 ## Reader policy and memory
 
 Run `python examples/benchmark_readers.py --rows 10000 --repeats 3`. It warms the data, compares native point reads with one-key explicit-snapshot bulk reads, and then runs four readers. The one-key comparison includes bulk dispatch overhead as well as snapshot setup; it does not isolate SQL transaction cost alone. Input construction and result validation are outside timing.
@@ -106,7 +124,7 @@ Connection reuse matters: zero idle retention reopens a database for every lease
 
 `tests/test_column_engine.py` checks the new layout, typed buffers, range boundaries, cache failure recovery, read-only access, threaded reads/writes, and an independent-process reader. `tests/test_storage_compatibility.py` uses an actual original-engine database to verify KV/vector compatibility, byte-identical KV rewrites, unlimited pagination, binary prefixes, and atomic vector mutations.
 
-The KV follow-up added streaming/cache/lifecycle failure regressions, short-lock flush contention/ordering tests, bulk storage compatibility tests, and four independent process readers checking equal version/mirror pairs from one bulk snapshot. The rebuilt-source functional run passed **600 tests**. An actual original 0.9.0 extension also read newly written bulk KV values, a streamed overwrite, and vector data alongside the new column tables.
+The KV follow-up added streaming/cache/lifecycle failure regressions, short-lock flush contention/ordering tests, bulk storage compatibility tests, and four independent process readers checking equal version/mirror pairs from one bulk snapshot. The rebuilt-source functional run passed **602 tests**. An actual original 0.9.0 extension also read newly written bulk KV values, a streamed overwrite, and vector data alongside the new column tables.
 
 Mapping, bounded update, observable background failure, callback reentrancy, and Windows file-release regressions are covered in `test_kv_mapping.py`. `cargo test --lib` passes all 44 native tests, including the restored collection suite.
 

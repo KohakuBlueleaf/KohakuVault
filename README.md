@@ -97,11 +97,30 @@ Use `append_array()`, `read_array()`, and `iter_batches()` for numeric/tensor th
 ```bash
 python examples/benchmark_columnar.py --rows 1000000
 python examples/benchmark_kv.py --structured --repeats 5
+python examples/benchmark_vector.py --repeats 5
 python examples/benchmark_readers.py
 python examples/kvault_demo.py
 ```
 
-A local release-build comparison reduced 1,000 small i64 slices from 7.61 seconds to 29.94 milliseconds by removing repeated whole-BLOB materialization. Other measured gains were smaller: about 2.1x for list append and 2.3x for list read. These are single-run, warm-process results, not universal throughput guarantees. See [method and measurements](docs/performance.md).
+### Compared with 0.9.0
+
+Local Windows/Python 3.13 release builds, same workload per row; lower elapsed time is better. KV/vector numbers are medians of five trials; the original column comparison is a single warm-process run. WAL and synchronization settings were not weakened.
+
+| Interface / workload | 0.9.0 | Current | Speedup |
+|---|---:|---:|---:|
+| **KV**: 10k cached scalar writes including flush, 256-byte values | 25.493 ms | 19.643 ms | **1.30×** |
+| **KV**: 10k point reads | 47.298 ms | 30.019 ms | **1.58×** |
+| **KV**: iterate 10k key/value pairs | 49.668 ms | 5.297 ms | **9.38×** |
+| **KV**: four shared-handle readers, 40k reads | 529.256 ms | 111.759 ms | **4.74×** |
+| **Vector**: insert 2k 128-dimensional float32 vectors + metadata, including commits | 245.020 ms | 214.565 ms | **1.14×** |
+| **Vector**: 2k ID lookups | 21.704 ms | 18.399 ms | **1.18×** |
+| **Vector**: 200 exact cosine searches, top-10 | 116.300 ms | 97.538 ms | **1.19×** |
+| **Vector**: four readers, 800 searches | 481.983 ms | 276.748 ms | **1.74×** |
+| **Column**: append 1M i64 values from a list | 109.94 ms | 53.26 ms | **2.06×** |
+| **Column**: read 1M i64 values into a list | 42.75 ms | 18.74 ms | **2.28×** |
+| **Column**: 1,000 slices of 64 i64 values | 7,611.75 ms | 29.94 ms | **254×** |
+
+New KV batch APIs additionally write/read 10k raw values in **12.596/7.781 ms**; these APIs did not exist in 0.9.0. The column slice gain removes pathological whole-BLOB materialization, not a 254× general database speedup. Vector search remains exact sqlite-vec search, not a new ANN algorithm. Concurrent rows compare equal total work across versions, not scaling relative to one reader. See [methodology, limitations, and detailed results](docs/performance.md).
 
 **Storage compatibility:** KV/vector formats are preserved. The new column format does not read or migrate the legacy `col_*` layout. See [column storage design](docs/columnar_storage.md).
 
