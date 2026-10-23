@@ -1,6 +1,6 @@
 //! Tests for CSB+Tree implementation
 
-use super::*;
+use super::csbtree::CSBPlusTree;
 
 #[test]
 fn test_new_tree() {
@@ -164,7 +164,7 @@ fn test_range_query_empty() {
     }
 
     let results: Vec<_> = tree.range(20..30).map(|(k, _)| *k).collect();
-    assert_eq!(results, vec![]);
+    assert!(results.is_empty());
 }
 
 #[test]
