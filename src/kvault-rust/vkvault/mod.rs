@@ -40,15 +40,20 @@ impl _VectorKVault {
     ///     metric: Distance metric - "cosine", "l2", "l1", or "hamming" (default: "cosine")
     ///     vector_type: Element type - "f32", "int8", or "bit" (default: "f32")
     #[new]
-    #[pyo3(signature = (path, table="vec_kvault", dimensions=768, metric="cosine", vector_type="f32"))]
+    #[pyo3(signature = (path, table="vec_kvault", dimensions=768, metric="cosine", vector_type="f32", read_only=false))]
     fn new(
+        py: Python<'_>,
         path: &str,
         table: &str,
         dimensions: usize,
         metric: &str,
         vector_type: &str,
+        read_only: bool,
     ) -> PyResult<Self> {
-        Ok(Self { inner: VectorKVault::new(path, table, dimensions, metric, vector_type)? })
+        let inner = py.allow_threads(|| {
+            VectorKVault::new(path, table, dimensions, metric, vector_type, read_only)
+        })?;
+        Ok(Self { inner })
     }
 
     /// Insert a vector-value pair
@@ -129,8 +134,8 @@ impl _VectorKVault {
     /// Args:
     ///     id: Row ID to delete
     #[pyo3(signature = (id))]
-    fn delete(&self, id: i64) -> PyResult<()> {
-        self.inner.delete(id)
+    fn delete(&self, py: Python<'_>, id: i64) -> PyResult<()> {
+        py.allow_threads(|| self.inner.delete(id))
     }
 
     /// Update vector or value by ID
@@ -158,16 +163,16 @@ impl _VectorKVault {
     /// Returns:
     ///     bool: True if exists
     #[pyo3(signature = (id))]
-    fn exists(&self, id: i64) -> PyResult<bool> {
-        self.inner.exists(id)
+    fn exists(&self, py: Python<'_>, id: i64) -> PyResult<bool> {
+        py.allow_threads(|| self.inner.exists(id))
     }
 
     /// Get total count of vectors
     ///
     /// Returns:
     ///     int: Number of vectors
-    fn count(&self) -> PyResult<i64> {
-        self.inner.count()
+    fn count(&self, py: Python<'_>) -> PyResult<i64> {
+        py.allow_threads(|| self.inner.count())
     }
 
     /// Get VectorKVault info

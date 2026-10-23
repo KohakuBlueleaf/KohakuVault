@@ -19,6 +19,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 /// Auto-packer that detects type and serializes accordingly
+#[derive(Clone, Copy)]
 pub struct AutoPacker {
     pub use_pickle_fallback: bool,
 }
@@ -40,6 +41,11 @@ impl AutoPacker {
         if obj.is_instance_of::<PyBytes>() {
             let bytes: Vec<u8> = obj.extract()?;
             return Ok((bytes, EncodingType::Raw));
+        }
+
+        // Builtin containers cannot override wrapper/numeric protocols.
+        if obj.is_exact_instance_of::<PyDict>() || obj.is_exact_instance_of::<PyList>() {
+            return self.serialize_container(py, obj);
         }
 
         // 2. Check if it's a wrapped type (MsgPack, Json, Cbor, Pickle)
@@ -108,23 +114,7 @@ impl AutoPacker {
 
         // 7. Try dict/list → MessagePack first, fallback to Pickle if fails
         if obj.is_instance_of::<PyDict>() || obj.is_instance_of::<PyList>() {
-            // Try MessagePack first (more efficient)
-            let packer = DataPacker { dtype: PackerDType::MessagePack { fixed_size: None } };
-            if let Ok(bytes) = packer.pack_impl(py, obj) {
-                return Ok((bytes, EncodingType::MessagePack));
-            }
-
-            // MessagePack failed (unsupported type in dict/list) - fallback to Pickle
-            if self.use_pickle_fallback {
-                let pickle = py.import("pickle")?;
-                let pickled = pickle.call_method1("dumps", (obj,))?;
-                let bytes: Vec<u8> = pickled.extract()?;
-                return Ok((bytes, EncodingType::Pickle));
-            }
-
-            return Err(pyo3::exceptions::PyTypeError::new_err(
-                "Cannot serialize dict/list: MessagePack failed and pickle disabled",
-            ));
+            return self.serialize_container(py, obj);
         }
 
         // 8. Last resort: Pickle (for custom objects)
@@ -137,6 +127,24 @@ impl AutoPacker {
 
         Err(pyo3::exceptions::PyTypeError::new_err(
             "Cannot auto-pack object: unsupported type and pickle fallback disabled",
+        ))
+    }
+
+    fn serialize_container(
+        &self,
+        py: Python<'_>,
+        obj: &Bound<'_, PyAny>,
+    ) -> PyResult<(Vec<u8>, EncodingType)> {
+        let packer = DataPacker { dtype: PackerDType::MessagePack { fixed_size: None } };
+        if let Ok(bytes) = packer.pack_impl(py, obj) {
+            return Ok((bytes, EncodingType::MessagePack));
+        }
+        if self.use_pickle_fallback {
+            let pickled = py.import("pickle")?.call_method1("dumps", (obj,))?;
+            return Ok((pickled.extract()?, EncodingType::Pickle));
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "Cannot serialize dict/list: MessagePack failed and pickle disabled",
         ))
     }
 

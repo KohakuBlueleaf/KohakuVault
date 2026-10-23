@@ -1,13 +1,13 @@
-//! Search operations for VectorKVault
+//! Vector queries on independent read snapshots.
 
-use crate::vkvault::core::VectorKVault;
-use crate::vkvault::metrics::SimilarityMetric;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rusqlite::params;
 
+use super::core::VectorKVault;
+use super::metrics::SimilarityMetric;
+
 impl VectorKVault {
-    /// Search for k-nearest neighbors
     pub fn search(
         &self,
         py: Python<'_>,
@@ -16,73 +16,55 @@ impl VectorKVault {
         metric: Option<&str>,
     ) -> PyResult<Vec<(i64, f32, PyObject)>> {
         let query_blob = self.prepare_vector_blob(query_vector)?;
-
-        let metric = if let Some(m) = metric {
-            SimilarityMetric::from_str(m).map_err(PyValueError::new_err)?
-        } else {
-            self.metric
-        };
-
-        // Validate metric compatibility
-        if !metric.is_compatible_with(self.vector_type) {
-            return Err(PyValueError::new_err(format!(
-                "Metric '{}' is not compatible with vector type '{}'",
-                metric.to_str(),
-                self.vector_type.to_str()
-            )));
+        let metric = metric
+            .map(SimilarityMetric::from_str)
+            .transpose()
+            .map_err(PyValueError::new_err)?
+            .unwrap_or(self.metric);
+        if metric != self.metric {
+            return Err(PyValueError::new_err(
+                "Search metric must match the stored vec0 index metric",
+            ));
         }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(k).map_err(|_| PyValueError::new_err("k is too large"))?;
 
-        let conn = self.conn.lock();
-
-        let sql = format!(
-            "SELECT v.rowid, v.distance, b.value
-             FROM {} v
-             JOIN {}_values b ON v.value_ref = b.id
-             WHERE v.vector MATCH ? AND k = ?
-             ORDER BY v.distance",
-            &self.table, &self.table
-        );
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to prepare query: {}", e)))?;
-
-        let k_i64 = k as i64;
-        let results = stmt
-            .query_map(params![query_blob, k_i64], |row| {
-                let id: i64 = row.get(0)?;
-                let distance: f32 = row.get(1)?;
-                let value: Vec<u8> = row.get(2)?;
-                Ok((id, distance, value))
+        let rows: Vec<(i64, f32, Vec<u8>)> = py.allow_threads(|| {
+            self.with_reader(|conn| {
+                let sql = format!(
+                    "SELECT v.rowid, v.distance, b.value FROM {} v
+                 JOIN {}_values b ON v.value_ref = b.id
+                 WHERE v.vector MATCH ?1 AND k = ?2 ORDER BY v.distance",
+                    self.table, self.table,
+                );
+                let mut statement = conn.prepare_cached(&sql)?;
+                let rows = statement.query_map(params![query_blob, limit], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+                rows.collect()
             })
-            .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
+        })?;
 
-        let mut output = Vec::new();
-        for result in results {
-            let (id, distance, value_bytes) = result
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to read row: {}", e)))?;
-
-            // Auto-decode value (EXACTLY SAME AS KVault)
-            let decoded_value = self.decode_and_deserialize(py, &value_bytes)?;
-            output.push((id, distance, decoded_value));
-        }
-
-        Ok(output)
+        // Decode only after releasing the SQLite snapshot and connection.
+        rows.into_iter()
+            .map(|(id, distance, value)| {
+                Ok((id, distance, self.decode_and_deserialize(py, &value)?))
+            })
+            .collect()
     }
 
-    /// Get value for the most similar vector (KVault-like interface)
     pub fn get(
         &self,
         py: Python<'_>,
         query_vector: &Bound<'_, PyAny>,
         metric: Option<&str>,
     ) -> PyResult<PyObject> {
-        let results = self.search(py, query_vector, 1, metric)?;
-
-        if results.is_empty() {
-            return Err(PyRuntimeError::new_err("No vectors found in database"));
-        }
-
-        Ok(results[0].2.clone_ref(py))
+        self.search(py, query_vector, 1, metric)?
+            .into_iter()
+            .next()
+            .map(|(_, _, value)| value)
+            .ok_or_else(|| PyRuntimeError::new_err("No vectors found in database"))
     }
 }

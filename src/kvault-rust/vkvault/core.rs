@@ -1,5 +1,7 @@
 //! Core VectorKVault struct and initialization
 
+use crate::common::read_pool::ReadPool;
+use crate::common::{open_connection, open_readonly_connection, reader_pool};
 use crate::kv::autopacker::AutoPacker;
 use crate::kv::header::EncodingType;
 use crate::vector_utils::{normalize_l2, py_to_vec_f32, vec_f32_to_blob, VectorType};
@@ -16,6 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Uses sqlite-vec's vec0 virtual table for vector storage and search
 pub struct VectorKVault {
     pub(crate) conn: Mutex<Connection>,
+    pub(crate) readers: Option<ReadPool>,
+    pub(crate) read_only: bool,
     pub(crate) table: String,
     pub(crate) dimensions: usize,
     pub(crate) metric: SimilarityMetric,
@@ -25,6 +29,25 @@ pub struct VectorKVault {
 }
 
 impl VectorKVault {
+    pub(crate) fn ensure_writable(&self) -> PyResult<()> {
+        if self.read_only {
+            return Err(pyo3::exceptions::PyPermissionError::new_err("VectorKVault is read-only"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_reader<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> PyResult<T> {
+        let result = if let Some(readers) = &self.readers {
+            readers.read(operation)
+        } else {
+            operation(&self.conn.lock())
+        };
+        result.map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
     /// Create or open a VectorKVault
     pub fn new(
         path: &str,
@@ -32,6 +55,7 @@ impl VectorKVault {
         dimensions: usize,
         metric: &str,
         vector_type: &str,
+        read_only: bool,
     ) -> PyResult<Self> {
         let metric = SimilarityMetric::from_str(metric).map_err(PyValueError::new_err)?;
 
@@ -56,19 +80,19 @@ impl VectorKVault {
             )));
         }
 
-        let conn = Connection::open(path)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to open database: {}", e)))?;
-
-        // Configure SQLite for performance
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to set WAL mode: {}", e)))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to set synchronous: {}", e)))?;
-        conn.pragma_update(None, "temp_store", "MEMORY")
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to set temp_store: {}", e)))?;
+        if dimensions == 0 {
+            return Err(PyValueError::new_err("dimensions must be positive"));
+        }
+        let conn = if read_only {
+            open_readonly_connection(path, 268_435_456, 8192)?
+        } else {
+            open_connection(path, true, 4096, 268_435_456, 8192)?
+        };
 
         let vkv = Self {
             conn: Mutex::new(conn),
+            readers: reader_pool(path),
+            read_only,
             table: table.to_string(),
             dimensions,
             metric,
@@ -77,7 +101,17 @@ impl VectorKVault {
             auto_packer: Mutex::new(Some(AutoPacker::new(true))), // DEFAULT: auto-pack enabled
         };
 
-        vkv.create_tables()?;
+        if read_only {
+            vkv.conn
+                .lock()
+                .prepare(&format!(
+                "SELECT v.vector, b.value FROM {} v JOIN {}_values b ON v.value_ref = b.id LIMIT 0",
+                table, table,
+            ))
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        } else {
+            vkv.create_tables()?;
+        }
         Ok(vkv)
     }
 
@@ -174,33 +208,27 @@ impl VectorKVault {
         dict.set_item("dimensions", self.dimensions)?;
         dict.set_item("metric", self.metric.to_str())?;
         dict.set_item("vector_type", self.vector_type.to_str())?;
-        dict.set_item("count", self.count()?)?;
+        dict.set_item("count", py.allow_threads(|| self.count())?)?;
 
         Ok(dict.unbind())
     }
 
     /// Get total count of vectors
     pub fn count(&self) -> PyResult<i64> {
-        let conn = self.conn.lock();
-        let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {}", &self.table), [], |row| row.get(0))
-            .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
-
-        Ok(count)
+        self.with_reader(|conn| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {}", self.table), [], |row| row.get(0))
+        })
     }
 
     /// Check if ID exists
     pub fn exists(&self, id: i64) -> PyResult<bool> {
-        let conn = self.conn.lock();
-        let count: i64 = conn
-            .query_row(
-                &format!("SELECT COUNT(*) FROM {} WHERE rowid = ?", &self.table),
-                rusqlite::params![id],
+        self.with_reader(|conn| {
+            conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {} WHERE rowid = ?1)", self.table),
+                [id],
                 |row| row.get(0),
             )
-            .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
-
-        Ok(count > 0)
+        })
     }
 
     /// Encode value with header if headers are enabled and encoding is not Raw
@@ -303,8 +331,8 @@ impl VectorKVault {
 
             if let Some(h) = header {
                 // Has header - auto-decode based on encoding type
-                let auto_pack_guard = self.auto_packer.lock();
-                if let Some(ref packer) = *auto_pack_guard {
+                let packer = *self.auto_packer.lock();
+                if let Some(packer) = packer {
                     return packer.deserialize(py, &decoded_data, h.encoding);
                 }
             }

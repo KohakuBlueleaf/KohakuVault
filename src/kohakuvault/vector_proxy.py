@@ -7,6 +7,7 @@ Built on top of sqlite-vec's vec0 virtual table.
 Uses numpy arrays as the standard interface for vectors.
 """
 
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -67,30 +68,49 @@ class VectorKVault:
         dimensions: int = 768,
         metric: str = "cosine",
         vector_type: str = "f32",
+        *,
+        read_only: bool = False,
     ):
-        self._vault = _VectorKVault(path, table, dimensions, metric, vector_type)
+        self._native = _VectorKVault(
+            os.fspath(path), table, dimensions, metric, vector_type, read_only
+        )
         self.path = path
         self.table = table
         self.dimensions = dimensions
         self.metric = metric
         self.vector_type = vector_type
 
-    def _prepare_vector(self, vector: VectorInput) -> List[float]:
-        """Convert vector to list format for Rust backend."""
-        if isinstance(vector, np.ndarray):
-            # Ensure it's float32 or float64, then convert to list
-            if not np.issubdtype(vector.dtype, np.floating):
-                vector = vector.astype(np.float32)
-            return vector.tolist()
-        elif isinstance(vector, list):
+    @property
+    def _vault(self):
+        if self._native is None:
+            raise ValueError("VectorKVault is closed")
+        return self._native
+
+    def close(self) -> None:
+        """Release native connections; vector writes commit before returning."""
+        self._native = None
+
+    def __enter__(self):
+        self._vault
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def _prepare_vector(self, vector: VectorInput) -> bytes:
+        """Pass a contiguous float32 buffer instead of boxing each coordinate."""
+        if isinstance(vector, bytes):
+            if len(vector) != self.dimensions * 4:
+                raise ValueError(f"Expected {self.dimensions * 4} vector bytes, got {len(vector)}")
             return vector
-        elif isinstance(vector, bytes):
-            # Assume bytes represent float32 array
-            num_floats = len(vector) // 4
-            arr = np.frombuffer(vector, dtype=np.float32, count=num_floats)
-            return arr.tolist()
-        else:
-            raise TypeError(f"Vector must be numpy array, list, or bytes, got {type(vector)}")
+        if not isinstance(vector, (np.ndarray, list, tuple)):
+            raise TypeError(
+                f"Vector must be numpy array, list, tuple, or bytes, got {type(vector)}"
+            )
+        array = np.asarray(vector, dtype="<f4")
+        if array.shape != (self.dimensions,):
+            raise ValueError(f"Expected vector shape ({self.dimensions},), got {array.shape}")
+        return array.tobytes(order="C")
 
     def insert(
         self,

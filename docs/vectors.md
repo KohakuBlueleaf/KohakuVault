@@ -1,6 +1,6 @@
 # Vector Storage & Search
 
-KohakuVault 0.7 ships two complementary vector features:
+KohakuVault provides two complementary vector features:
 
 1. `vec:*` dtypes inside `ColumnVault` for storing dense arrays/tensors alongside other columns.
 2. `VectorKVault`, a sqlite-vec powered similarity search engine for k-NN queries.
@@ -19,10 +19,11 @@ import numpy as np
 
 cv = ColumnVault("vectors.db")
 embeddings = cv.create_column("bert", "vec:f32:768")
-embeddings.extend(np.random.randn(10_000, 768).astype(np.float32))
+embeddings.append_array(np.random.randn(10_000, 768).astype(np.float32))
+batch = embeddings.read_array(0, 256)
 ```
 
-Overhead: 1 byte per vector (type byte). Ideal for embeddings, image tensors, and matrices with stable shapes (`vec:u8:3:224:224`).
+The new column format stores contiguous scalar values, without a per-vector type byte. Dtype/shape live in column metadata. `read_array()` and `iter_batches()` return numeric batches rather than lists of coordinate objects. This layout is separate from the unchanged KV/DataPacker serialization format.
 
 ### Arbitrary-Shape Vectors
 
@@ -32,11 +33,11 @@ generic.append(np.random.randn(100).astype(np.float32))
 generic.append(np.random.randn(10, 20).astype(np.float32))
 ```
 
-Overhead: `2 + ndim * 4` bytes (stores ndim and each dimension). Use when shapes vary but you still want zero-copy serialization.
+Overhead: `2 + ndim * 4` bytes (stores ndim and each dimension). Use when shapes vary; this uses the generic DataPacker path and is not zero-copy serialization.
 
 ### Supported Element Types
 
-`f32`, `f64`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` – matching `DataPacker`’s `ElementType` enum. Mixed precision? Convert before writing.
+Fixed-shape columns support numeric types including `f16`, `f32`, `f64`, signed/unsigned 8/16/32/64-bit integers, and bool. Arbitrary-shape DataPacker vectors retain their existing type set; see the DataPacker reference.
 
 ### Batch Operations with DataPacker
 
@@ -49,7 +50,7 @@ buffer = packer.pack_many(vectors)
 unpacked = packer.unpack_many(buffer, count=len(vectors))
 ```
 
-Use this when you need to preprocess vectors before inserting or when marshaling data over the network. Arbitrary-shape vectors use `offsets=` instead of `count=`.
+Use this for the standalone DataPacker encoding or marshaling data over the network. Its fixed-vector type byte is unchanged; do not treat those bytes as the new raw numeric column format. Arbitrary-shape vectors use `offsets=` instead of `count=`.
 
 ## VectorKVault (Similarity Search)
 
@@ -70,7 +71,7 @@ for row_id, distance, payload in results:
 
 closest = vkv.get(vector)
 vector2, payload2 = vkv.get_by_id(doc_id)
-vkv.update(doc_id, vector=new_vector)
+vkv.update(doc_id, vector=vector)
 vkv.delete(doc_id)
 ```
 
@@ -79,7 +80,7 @@ vkv.delete(doc_id)
 | Parameter | Meaning |
 |-----------|---------|
 | `dimensions` | Length of every vector you insert (enforced). |
-| `metric` | `"cosine"`, `"l2"`, `"l1"`, or `"hamming"`. Per-query overrides allowed via `search(..., metric="l2")`. |
+| `metric` | `"cosine"`, `"l2"`, `"l1"`, or `"hamming"`. A supplied per-query metric must match the stored index metric; mismatches are rejected rather than silently ignored. |
 | `vector_type` | `"f32"`, `"int8"`, or `"bit"` depending on sqlite-vec support. Defaults to `f32`. |
 | `table` | Logical table name; both the vec0 virtual table and blob table derive from this. |
 
@@ -97,11 +98,18 @@ vkv.delete(doc_id)
 | `count()` | Number of rows inside the vec0 table. |
 | `info()` | Dict with table, dimensions, metric, vector type, and count. |
 
-### Performance Characteristics
+### Performance, concurrency, and compatibility
 
-- sqlite-vec 0.1.6 performs brute-force scans with SIMD acceleration (AVX on x86, NEON on Apple Silicon). Expect <1 ms for 1K rows, <10 ms for 100K rows on modern hardware.
-- Because scans touch the entire table, keep WALs short (`checkpoint()` regularly) and VACUUM after bulk deletes.
-- Use `vector_type="int8"` plus quantized vectors when you need smaller storage or faster Hamming metrics.
+The existing sqlite-vec 0.1.6 index and companion value table are retained. The rewrite does not add ANN indexes or change persisted vector/value encodings. Exact-scan latency depends on vector count, dimension, hardware, and cache state; benchmark the actual workload rather than relying on a fixed row-count latency estimate.
+
+NumPy/list inputs now cross the binding as a contiguous little-endian float32 buffer, not a Python list of scalar coordinates. Input shapes are validated. Float32 input is the optimized path; legacy int8/bit conversion behavior has not been redesigned in this change.
+
+Insert, update, and delete use one transaction across vector and value tables. Search and ID lookup run on independent short read snapshots, release the GIL during native SQLite work, and decode payloads after releasing the snapshot. `VectorKVault(..., read_only=True)` opens existing storage without creating tables. Use `close()` or a context manager to release connections. Serialization/deserialization captures packer configuration before invoking Python and does not hold its mutex during callbacks; callbacks may reenter the vault, but their own mutations are independent side effects, not rolled back with an outer failure.
+
+```python
+with VectorKVault("search.db", table="search", dimensions=384, read_only=True) as reader:
+    print(reader.search(np.zeros(384, dtype=np.float32), k=5))
+```
 
 ## Putting It Together
 

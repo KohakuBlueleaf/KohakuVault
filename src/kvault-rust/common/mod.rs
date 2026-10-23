@@ -198,6 +198,29 @@ pub fn open_connection(
     Ok(conn)
 }
 
+/// Open existing storage without schema or journal-mode changes.
+pub(crate) fn open_readonly_connection(
+    path: &str,
+    mmap_size: u64,
+    cache_kb: i64,
+) -> Result<Connection, VaultError> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.pragma_update(None, "mmap_size", mmap_size)?;
+    conn.pragma_update(None, "cache_size", -cache_kb)?;
+    Ok(conn)
+}
+
+/// Retain independent readers for ordinary filesystem databases.
+pub(crate) fn reader_pool(path: &str) -> Option<read_pool::ReadPool> {
+    if path == ":memory:" || path.starts_with("file:") { return None; }
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|path| read_pool::ReadPool::new(path.to_string_lossy().into_owned(), 8192))
+}
+
+
 /// Manually checkpoint WAL file to main database.
 ///
 /// This helps prevent WAL from growing too large.

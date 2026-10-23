@@ -1,13 +1,27 @@
-//! CRUD operations for VectorKVault
+//! Atomic vector/payload mutations with Python conversion outside database locks.
 
-use crate::vkvault::core::VectorKVault;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
+
+use super::core::VectorKVault;
+
+fn sql_error(error: rusqlite::Error) -> PyErr {
+    PyRuntimeError::new_err(error.to_string())
+}
 
 impl VectorKVault {
-    /// Insert a vector-value pair
+    fn pack_value(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+        let packer = *self.auto_packer.lock();
+        if let Some(packer) = packer {
+            let (bytes, encoding) = packer.serialize(py, value)?;
+            Ok(self.encode_value(&bytes, encoding))
+        } else {
+            self.extract_bytes(value)
+        }
+    }
+
     pub fn insert(
         &self,
         py: Python<'_>,
@@ -15,111 +29,77 @@ impl VectorKVault {
         value: &Bound<'_, PyAny>,
         _metadata: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<i64> {
-        // Convert vector to blob
+        self.ensure_writable()?;
         let vector_blob = self.prepare_vector_blob(vector)?;
+        let value_bytes = self.pack_value(py, value)?;
 
-        // Convert value to bytes using auto-packing (EXACTLY SAME AS KVault)
-        let value_bytes = {
-            let auto_pack_guard = self.auto_packer.lock();
-            if let Some(ref packer) = *auto_pack_guard {
-                // Auto-pack mode: serialize automatically
-                let (serialized_bytes, encoding) = packer.serialize(py, value)?;
-                drop(auto_pack_guard);
+        py.allow_threads(|| {
+            let mut conn = self.conn.lock();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let value_id: i64 = tx
+                .query_row(
+                    &format!("INSERT INTO {}_values (value) VALUES (?1) RETURNING id", self.table),
+                    params![value_bytes],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
 
-                // Add header if encoding is not Raw
-                self.encode_value(&serialized_bytes, encoding)
-            } else {
-                // Legacy mode: must be bytes
-                drop(auto_pack_guard);
-                self.extract_bytes(value)?
-            }
-        };
-
-        let conn = self.conn.lock();
-
-        // Insert value into blob table
-        let value_id: i64 = conn
-            .query_row(
-                &format!("INSERT INTO {}_values (value) VALUES (?) RETURNING id", &self.table),
-                params![value_bytes],
-                |row| row.get(0),
+            // Both tables become visible together, or neither is published.
+            tx.execute(
+                &format!("INSERT INTO {} (vector, value_ref) VALUES (?1, ?2)", self.table),
+                params![vector_blob, value_id],
             )
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to insert value: {}", e)))?;
-
-        // Insert vector into vec0 table
-        conn.execute(
-            &format!("INSERT INTO {} (vector, value_ref) VALUES (?, ?)", &self.table),
-            params![vector_blob, value_id],
-        )
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to insert vector: {}", e)))?;
-
-        // Get the rowid of the inserted vector
-        let vector_id: i64 = conn.last_insert_rowid();
-
-        Ok(vector_id)
+            .map_err(sql_error)?;
+            let id = tx.last_insert_rowid();
+            tx.commit().map_err(sql_error)?;
+            Ok(id)
+        })
     }
 
-    /// Get vector and value by ID
     pub fn get_by_id(&self, py: Python<'_>, id: i64) -> PyResult<(Py<PyBytes>, PyObject)> {
-        let conn = self.conn.lock();
-
-        let sql = format!(
-            "SELECT v.vector, b.value
-             FROM {} v
-             JOIN {}_values b ON v.value_ref = b.id
-             WHERE v.rowid = ?",
-            &self.table, &self.table
-        );
-
-        let result: Option<(Vec<u8>, Vec<u8>)> = conn
-            .query_row(&sql, params![id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()
-            .map_err(|e| PyRuntimeError::new_err(format!("Query failed: {}", e)))?;
-
-        match result {
-            Some((vector, value_bytes)) => {
-                let vector_py = PyBytes::new(py, &vector).unbind();
-
-                // Auto-decode value (EXACTLY SAME AS KVault)
-                let value_py = self.decode_and_deserialize(py, &value_bytes)?;
-
-                Ok((vector_py, value_py))
-            }
-            None => Err(PyRuntimeError::new_err(format!("ID {} not found", id))),
-        }
+        let result: Option<(Vec<u8>, Vec<u8>)> = py.allow_threads(|| {
+            self.with_reader(|conn| {
+                let sql = format!(
+                    "SELECT v.vector, b.value FROM {} v
+                 JOIN {}_values b ON v.value_ref = b.id WHERE v.rowid = ?1",
+                    self.table, self.table,
+                );
+                conn.prepare_cached(&sql)?
+                    .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()
+            })
+        })?;
+        let (vector, value) =
+            result.ok_or_else(|| PyRuntimeError::new_err(format!("ID {id} not found")))?;
+        Ok((PyBytes::new(py, &vector).unbind(), self.decode_and_deserialize(py, &value)?))
     }
 
-    /// Delete by ID
     pub fn delete(&self, id: i64) -> PyResult<()> {
-        let conn = self.conn.lock();
-
-        // Get value_ref before deleting
-        let value_ref: Option<i64> = conn
+        self.ensure_writable()?;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let value_id: Option<i64> = tx
             .query_row(
-                &format!("SELECT value_ref FROM {} WHERE rowid = ?", &self.table),
-                params![id],
-                |row| row.get(0),
+                &format!("SELECT value_ref FROM {} WHERE rowid = ?1", self.table),
+                [id],
+                |r| r.get(0),
             )
             .optional()
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to get value_ref: {}", e)))?;
+            .map_err(sql_error)?;
 
-        if let Some(value_id) = value_ref {
-            // Delete from vec0 table
-            conn.execute(&format!("DELETE FROM {} WHERE rowid = ?", &self.table), params![id])
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete vector: {}", e)))?;
-
-            // Delete from values table
-            conn.execute(
-                &format!("DELETE FROM {}_values WHERE id = ?", &self.table),
-                params![value_id],
-            )
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete value: {}", e)))?;
+        if let Some(value_id) = value_id {
+            tx.execute(&format!("DELETE FROM {} WHERE rowid = ?1", self.table), [id])
+                .map_err(sql_error)?;
+            tx.execute(&format!("DELETE FROM {}_values WHERE id = ?1", self.table), [value_id])
+                .map_err(sql_error)?;
         }
-
-        Ok(())
+        tx.commit().map_err(sql_error)
     }
 
-    /// Update vector or value by ID
     pub fn update(
         &self,
         py: Python<'_>,
@@ -127,57 +107,43 @@ impl VectorKVault {
         vector: Option<&Bound<'_, PyAny>>,
         value: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        self.ensure_writable()?;
         if vector.is_none() && value.is_none() {
             return Err(PyValueError::new_err("Must provide either vector or value to update"));
         }
+        let vector_blob = vector
+            .map(|value| self.prepare_vector_blob(value))
+            .transpose()?;
+        let value_bytes = value.map(|value| self.pack_value(py, value)).transpose()?;
 
-        let conn = self.conn.lock();
-
-        // Update vector if provided
-        if let Some(vec) = vector {
-            let vector_blob = self.prepare_vector_blob(vec)?;
-            conn.execute(
-                &format!("UPDATE {} SET vector = ? WHERE rowid = ?", &self.table),
-                params![vector_blob, id],
-            )
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to update vector: {}", e)))?;
-        }
-
-        // Update value if provided
-        if let Some(val) = value {
-            // Convert value to bytes using auto-packing (EXACTLY SAME AS KVault)
-            let value_bytes = {
-                let auto_pack_guard = self.auto_packer.lock();
-                if let Some(ref packer) = *auto_pack_guard {
-                    // Auto-pack mode: serialize automatically
-                    let (serialized_bytes, encoding) = packer.serialize(py, val)?;
-                    drop(auto_pack_guard);
-
-                    // Add header if encoding is not Raw
-                    self.encode_value(&serialized_bytes, encoding)
-                } else {
-                    // Legacy mode: must be bytes
-                    drop(auto_pack_guard);
-                    self.extract_bytes(val)?
-                }
-            };
-
-            // Get value_ref
-            let value_ref: i64 = conn
+        py.allow_threads(|| {
+            let mut conn = self.conn.lock();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let value_id: i64 = tx
                 .query_row(
-                    &format!("SELECT value_ref FROM {} WHERE rowid = ?", &self.table),
-                    params![id],
-                    |row| row.get(0),
+                    &format!("SELECT value_ref FROM {} WHERE rowid = ?1", self.table),
+                    [id],
+                    |r| r.get(0),
                 )
-                .map_err(|e| PyRuntimeError::new_err(format!("ID {} not found: {}", id, e)))?;
+                .map_err(|error| PyRuntimeError::new_err(format!("ID {id} not found: {error}")))?;
 
-            conn.execute(
-                &format!("UPDATE {}_values SET value = ? WHERE id = ?", &self.table),
-                params![value_bytes, value_ref],
-            )
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to update value: {}", e)))?;
-        }
-
-        Ok(())
+            if let Some(vector_blob) = vector_blob {
+                tx.execute(
+                    &format!("UPDATE {} SET vector = ?1 WHERE rowid = ?2", self.table),
+                    params![vector_blob, id],
+                )
+                .map_err(sql_error)?;
+            }
+            if let Some(value_bytes) = value_bytes {
+                tx.execute(
+                    &format!("UPDATE {}_values SET value = ?1 WHERE id = ?2", self.table),
+                    params![value_bytes, value_id],
+                )
+                .map_err(sql_error)?;
+            }
+            tx.commit().map_err(sql_error)
+        })
     }
 }
