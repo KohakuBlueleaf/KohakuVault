@@ -173,11 +173,11 @@ def _lock_scenario(path):
     errors = []
     flushed = []
 
-    class HoldingWriter:
-        def write(self, value):
+    class HoldingReader:
+        def read(self, size):
             entered.set()
             assert release.wait(5)
-            return len(value)
+            return b"x" * size
 
     vault = KVault(path)
     vault["persisted-stream"] = b"stream"
@@ -186,7 +186,8 @@ def _lock_scenario(path):
 
     def hold_connection():
         try:
-            vault.get_to_file("persisted-stream", HoldingWriter())
+            # A streaming PUT owns the writer connection; pooled GET no longer does.
+            vault.put_file("held-write", HoldingReader(), size=1)
         except Exception as exc:  # noqa: BLE001 - worker errors are asserted by the main thread
             errors.append(repr(exc))
 
@@ -207,8 +208,10 @@ def _lock_scenario(path):
     assert flush_started.wait(5)
     assert not flush_done.wait(0.1)
     with vault.lock_cache():
-        vault["inside-lock"] = b"inside"
         release.set()
+        streamer.join(5)
+        assert not streamer.is_alive()
+        vault["inside-lock"] = b"inside"
         assert flush_done.wait(5)
         with sqlite3.connect(path) as observer:
             visible = observer.execute(

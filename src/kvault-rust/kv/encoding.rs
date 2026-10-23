@@ -5,10 +5,52 @@
 use super::_KVault;
 use super::header::{EncodingType, Header, HEADER_SIZE};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyByteArray, PyBytes, PyMemoryView};
 use std::sync::atomic::Ordering;
 
 impl _KVault {
+    /// Capture serializer policy before invoking arbitrary Python callbacks.
+    pub(crate) fn pack_value(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+        if let Ok(bytes) = value.downcast::<PyBytes>() {
+            return Ok(bytes.as_bytes().to_vec());
+        }
+        if let Ok(bytes) = value.downcast::<PyByteArray>() {
+            return Ok(bytes.to_vec());
+        }
+        if value.is_instance_of::<PyMemoryView>() {
+            return value.call_method0("tobytes")?.extract();
+        }
+        let packer = *self.auto_packer.lock().unwrap();
+        let headers = self.use_headers.load(Ordering::Relaxed);
+        if let Some(packer) = packer {
+            let (bytes, encoding) = packer.serialize(py, value)?;
+            if !headers || encoding == EncodingType::Raw {
+                return Ok(bytes);
+            }
+            let mut result = Vec::with_capacity(HEADER_SIZE + bytes.len());
+            result.extend_from_slice(&Header::new(encoding).encode());
+            result.extend_from_slice(&bytes);
+            Ok(result)
+        } else {
+            Err(pyo3::exceptions::PyTypeError::new_err(
+                "value must be bytes-like (or enable auto-pack)",
+            ))
+        }
+    }
+
+    /// Decode a borrowed value without copying its payload into another Vec.
+    pub(crate) fn decode_result(&self, py: Python<'_>, bytes: &[u8]) -> PyResult<PyObject> {
+        let packer = *self.auto_packer.lock().unwrap();
+        if let Some(packer) = packer {
+            if let Some(header) =
+                Header::decode(bytes).map_err(pyo3::exceptions::PyValueError::new_err)?
+            {
+                return packer.deserialize(py, &bytes[HEADER_SIZE..], header.encoding);
+            }
+        }
+        Ok(PyBytes::new(py, bytes).into())
+    }
+
     /// Encode value with header if headers are enabled and encoding is not Raw
     ///
     /// Smart behavior:

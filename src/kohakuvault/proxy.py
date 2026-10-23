@@ -1,7 +1,11 @@
 import io
 import os
+import operator
 import threading
 import time
+import warnings
+import math
+from itertools import chain, islice
 from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -10,11 +14,11 @@ from typing import Any, BinaryIO, Iterator, Optional, Union
 import kohakuvault.errors as E
 from kohakuvault._kvault import _KVault  # compiled PyO3 class
 
-
 # Type aliases for better readability
 KeyType = Union[bytes, str]
 ValueType = Union[bytes, bytearray, memoryview]
 PathLike = Union[str, Path, os.PathLike]
+_MISSING = object()
 
 
 # ----------------------------
@@ -46,17 +50,44 @@ def _is_writer_like(obj: Any) -> bool:
     return hasattr(obj, "write")
 
 
+def _stream_size(value: Any, name: str, *, positive: bool = False) -> int:
+    """Validate byte counts without silently truncating non-integers."""
+    try:
+        value = operator.index(value)
+    except TypeError as ex:
+        raise E.InvalidArgument(f"{name} must be an integer") from ex
+    if value < 0 or (positive and value == 0):
+        bound = "positive" if positive else "nonnegative"
+        raise E.InvalidArgument(f"{name} must be {bound}")
+    return value
+
+
 def _stream_copy(reader: BinaryIO, writer: BinaryIO, chunk_size: int = 1 << 20) -> int:
-    """Copy data from reader to writer in chunks."""
+    """Copy binary chunks, accounting only for bytes accepted by the sink."""
+    chunk_size = _stream_size(chunk_size, "chunk_size", positive=True)
     total = 0
     while True:
         chunk = reader.read(chunk_size)
+        if not _is_bytes_like(chunk):
+            raise E.IoError("reader.read() must return bytes-like data")
+        chunk = bytes(chunk)
+        if len(chunk) > chunk_size:
+            raise E.IoError("reader.read() returned more bytes than requested")
         if not chunk:
             break
-        n = writer.write(chunk)
-        if n is None:
-            n = len(chunk)
-        total += n
+        offset = 0
+        while offset < len(chunk):
+            count = writer.write(chunk[offset:])
+            if isinstance(count, bool):
+                raise E.IoError("writer.write() must return an integer byte count, not bool")
+            try:
+                count = operator.index(count)
+            except TypeError as ex:
+                raise E.IoError("writer.write() must return an integer byte count", ex) from ex
+            if count <= 0 or count > len(chunk) - offset:
+                raise E.IoError("writer.write() returned an invalid byte count")
+            offset += count
+            total += count
     return total
 
 
@@ -168,7 +199,11 @@ class KVault(Mapping):
     mmap_size : int, default=268_435_456 (256 MiB)
         Memory-mapped I/O size.
     cache_kb : int, default=100_000 (100 MB)
-        SQLite cache size in kilobytes.
+        Writer SQLite cache size in kilobytes.
+    reader_cache_kb : int, default=8192
+        SQLite cache budget per pooled reader. Readers inherit mmap_size.
+    reader_idle_limit : int, default=8
+        Maximum idle readers retained, not an active-reader concurrency limit.
     """
 
     def __init__(
@@ -183,11 +218,23 @@ class KVault(Mapping):
         page_size: int = 32768,
         mmap_size: int = 268_435_456,
         cache_kb: int = 100_000,
+        read_only: bool = False,
+        reader_cache_kb: int = 8192,
+        reader_idle_limit: int = 8,
     ):
-        self._chunk = int(chunk_size)
+        self._chunk = _stream_size(chunk_size, "chunk_size", positive=True)
         self._retries = int(retries)
         self._backoff = float(backoff_base)
+        if self._retries < 1 or not math.isfinite(self._backoff) or self._backoff < 0:
+            raise E.InvalidArgument("retries must be positive and backoff_base finite/nonnegative")
+        self._background_flush_error = None
         self._closed = False
+        self._closing = False
+        self._lifecycle_lock = threading.Lock()
+        self._cache_lock_depth = 0
+        self._cache_lock_transition = False
+        self._cache_unlock_pending = False
+        self._read_only = read_only
         self._daemon_thread = None
         self._daemon_stop = threading.Event()
 
@@ -200,11 +247,14 @@ class KVault(Mapping):
             self._inner = _KVault(
                 db_path,
                 table=table,
-                chunk_size=chunk_size,
+                chunk_size=self._chunk,
                 enable_wal=enable_wal,
                 page_size=page_size,
                 mmap_size=mmap_size,
                 cache_kb=cache_kb,
+                read_only=read_only,
+                reader_cache_kb=reader_cache_kb,
+                reader_idle_limit=reader_idle_limit,
             )
         except Exception as ex:
             raise E.map_exception(ex)
@@ -232,16 +282,61 @@ class KVault(Mapping):
         """Exit context manager, flushing cache."""
         self.close()
 
+    def _native(self) -> _KVault:
+        """Capture a live native reference without holding a lock during I/O."""
+        # Capture ownership once; native admission rejects mutations after close.
+        inner = self._inner
+        if inner is None:
+            raise ValueError("Cannot operate on closed KVault")
+        return inner
+
+    def _retry_error(self, error, method, args, key=None):
+        """Allocate retry machinery only on an actual transient failure."""
+        mapped = E.map_exception(error, key=key)
+        if not isinstance(mapped, E.DatabaseBusy) or self._retries <= 1:
+            raise mapped from error
+        time.sleep(self._backoff)
+        return _with_retries(
+            lambda: method(*args),
+            attempts=self._retries - 1,
+            backoff_base=self._backoff * 2,
+            key_for_error=key,
+        )
+
     def close(self) -> None:
-        """Flush cache, checkpoint WAL, stop daemon thread, and mark as closed."""
-        if not self._closed:
+        """Flush and close, rejecting active cache contexts and concurrent closes.
+
+        A failed final flush leaves the handle open and close may be retried.
+        Native mutation admission fences writes against the final flush.
+        """
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            if self._cache_lock_depth or self._cache_lock_transition:
+                raise E.DatabaseBusy("Cannot close KVault while cache is locked")
+            if self._closing:
+                raise RuntimeError("KVault close is already in progress")
+            self._closing = True
+            inner = self._inner
+            unlock_pending = self._cache_unlock_pending
+
+        try:
+            # Native callback checks run before any daemon join or stop request.
             try:
-                self._stop_daemon_thread()
-                self.flush_cache()
-                # Checkpoint WAL to main DB file
-                self.checkpoint()
-            finally:
+                if unlock_pending:
+                    inner.set_cache_locked(False)
+                    with self._lifecycle_lock:
+                        self._cache_unlock_pending = False
+                inner.finish_close()
+            except Exception as ex:
+                raise E.map_exception(ex) from ex
+            with self._lifecycle_lock:
                 self._closed = True
+                self._inner = None
+            self._stop_daemon_thread()
+        finally:
+            with self._lifecycle_lock:
+                self._closing = False
 
     def checkpoint(self) -> None:
         """
@@ -254,7 +349,7 @@ class KVault(Mapping):
         if self._closed:
             return
         try:
-            self._inner.checkpoint_wal()
+            self._native().checkpoint_wal()
         except Exception:
             pass  # Ignore checkpoint errors (non-critical)
 
@@ -269,20 +364,17 @@ class KVault(Mapping):
 
         k = _to_bytes_key(key)
 
-        def call():
-            return self._inner.get(k)
-
+        native = self._native()
         try:
-            return _with_retries(
-                call, attempts=self._retries, backoff_base=self._backoff, key_for_error=k
-            )
-        except E.NotFound:
-            raise KeyError(key)
+            return native.get(k)
+        except Exception as ex:
+            try:
+                return self._retry_error(ex, native.get, (k,), k)
+            except E.NotFound:
+                raise KeyError(key) from None
 
     def __setitem__(self, key: KeyType, value: ValueType) -> None:
         """Set value for key."""
-        if self._closed:
-            raise ValueError("Cannot operate on closed KVault")
         self.put(key, value)
 
     def __delitem__(self, key: KeyType) -> None:
@@ -306,7 +398,7 @@ class KVault(Mapping):
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
         try:
-            return int(self._inner.len())
+            return int(self._native().len())
         except Exception as ex:
             raise E.map_exception(ex)
 
@@ -318,55 +410,77 @@ class KVault(Mapping):
     # Mapping Protocol
     # ----------------------------
 
-    def keys(self, prefix: Optional[KeyType] = None, limit: int = 10000) -> Iterator[bytes]:
-        """
-        Iterate over keys, optionally with a prefix filter.
-
-        Parameters
-        ----------
-        prefix : bytes | str | None
-            If provided, only return keys starting with this prefix.
-        limit : int, default=10000
-            Maximum number of keys to return per batch.
-
-        Yields
-        ------
-        bytes
-            Key as bytes.
-        """
+    def _pages(self, prefix, limit, batch_size, *, items):
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
+        batch_size = operator.index(batch_size)
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if limit is not None:
+            limit = operator.index(limit)
+            if limit < 0:
+                raise ValueError("limit must be nonnegative or None")
+        prefix = _to_bytes_key(prefix) if prefix is not None else None
+        remaining = limit
+        after = None
 
-        prefix_bytes = _to_bytes_key(prefix) if prefix is not None else None
-
-        def call():
-            return self._inner.scan_keys(prefix_bytes, limit)
-
-        try:
-            keys_list = _with_retries(
-                call, attempts=self._retries, backoff_base=self._backoff, key_for_error=prefix_bytes
+        # Keyset pagination avoids both truncation and growing OFFSET scans.
+        while remaining is None or remaining > 0:
+            if self._closed:
+                raise ValueError("Cannot iterate a closed KVault")
+            size = batch_size if remaining is None else min(batch_size, remaining)
+            scanner = self._native().scan_items if items else self._native().scan_keys
+            page = _with_retries(
+                lambda: scanner(prefix, size, after),
+                attempts=self._retries,
+                backoff_base=self._backoff,
+                key_for_error=prefix,
             )
-            yield from keys_list
-        except Exception as ex:
-            raise E.map_exception(ex, key=prefix_bytes)
+            if not page:
+                break
+            yield page
+            after = page[-1][0] if items else page[-1]
+            if remaining is not None:
+                remaining -= len(page)
+            if len(page) < size:
+                break
 
-    def values(self) -> Iterator[bytes]:
-        """
-        Iterate over all values.
+    def keys(
+        self,
+        prefix: Optional[KeyType] = None,
+        limit: int | None = None,
+        *,
+        batch_size: int = 1024,
+    ) -> Iterator[bytes]:
+        """Iterate all matching keys by default; limit is an optional total cap.
 
-        Warning: This loads each value into memory. Not recommended for large blobs.
+        Pages use fresh snapshots and include this handle's buffered values.
+        Concurrent changes are not a single, iterator-wide snapshot.
         """
-        for key in self.keys():
-            yield self.get(key)
+        for page in self._pages(prefix, limit, batch_size, items=False):
+            yield from page
 
-    def items(self) -> Iterator[tuple[bytes, bytes]]:
-        """
-        Iterate over all (key, value) pairs.
+    def items(
+        self,
+        prefix: Optional[KeyType] = None,
+        limit: int | None = None,
+        *,
+        batch_size: int = 128,
+    ) -> Iterator[tuple[bytes, Any]]:
+        """Read key/value batches without an extra query for each key."""
+        for page in self._pages(prefix, limit, batch_size, items=True):
+            yield from page
 
-        Warning: This loads each value into memory. Not recommended for large blobs.
-        """
-        for key in self.keys():
-            yield key, self.get(key)
+    def values(
+        self,
+        prefix: Optional[KeyType] = None,
+        limit: int | None = None,
+        *,
+        batch_size: int = 128,
+    ) -> Iterator[Any]:
+        """Iterate all matching values, using bounded row batches."""
+        for _, value in self.items(prefix, limit, batch_size=batch_size):
+            yield value
 
     def get(self, key: KeyType, default: Any = None) -> Any:
         """
@@ -389,17 +503,14 @@ class KVault(Mapping):
 
         k = _to_bytes_key(key)
 
-        def call():
-            return self._inner.get(k)
-
+        native = self._native()
         try:
-            return _with_retries(
-                call, attempts=self._retries, backoff_base=self._backoff, key_for_error=k
-            )
-        except E.NotFound:
-            return default
-        except E.KohakuVaultError:
-            raise
+            return native.get(k)
+        except Exception as ex:
+            try:
+                return self._retry_error(ex, native.get, (k,), k)
+            except E.NotFound:
+                return default
 
     # ----------------------------
     # Core Operations
@@ -424,20 +535,45 @@ class KVault(Mapping):
 
         k = _to_bytes_key(key)
 
-        # Check if auto-pack is enabled
-        if not self.auto_pack_enabled():
-            # Auto-pack disabled: must be bytes-like
-            if not _is_bytes_like(value):
-                raise E.InvalidArgument("value must be bytes-like (or enable auto-pack)")
-            value_to_pass = bytes(value)
-        else:
-            # Auto-pack enabled: accept any object
-            value_to_pass = value
+        if isinstance(value, (bytearray, memoryview)):
+            value = bytes(value)
+        native = self._native()
+        try:
+            native.put(k, value)
+        except Exception as ex:
+            self._retry_error(ex, native.put, (k, value), k)
 
-        def call():
-            return self._inner.put(k, value_to_pass)
+    def put_many(self, items: list | tuple) -> None:
+        """Commit one explicit batch atomically; duplicate keys use the last value.
 
-        _with_retries(call, attempts=self._retries, backoff_base=self._backoff, key_for_error=k)
+        Pass a list or tuple of key/value pairs. The complete batch is serialized
+        before writing, so callers control its memory bound. This bypasses the
+        write-back cache and supersedes matching pending keys only on success.
+        A locked enabled cache rejects the batch. ``update()`` uses bounded batches.
+        """
+        if not isinstance(items, (list, tuple)):
+            raise E.InvalidArgument("put_many requires a list or tuple of key/value pairs")
+        native = self._native()
+        try:
+            native.put_many(items)
+        except Exception as ex:
+            raise E.map_exception(ex) from ex
+
+    def get_many(self, keys: list | tuple, default: Any = None) -> list[Any]:
+        """Read an explicit key batch in input order, retaining duplicates.
+
+        Missing keys yield ``default``; stored None remains None. Committed
+        lookups share one SQLite snapshot and this handle's captured pending
+        values take precedence. Concurrent cache mutations are not a combined
+        cache/database transaction. Results are decoded after releasing SQLite.
+        """
+        if not isinstance(keys, (list, tuple)):
+            raise E.InvalidArgument("get_many requires a list or tuple of keys")
+        native = self._native()
+        try:
+            return native.get_many(keys, default)
+        except Exception as ex:
+            raise E.map_exception(ex) from ex
 
     def put_file(
         self,
@@ -472,6 +608,13 @@ class KVault(Mapping):
             raise ValueError("Cannot operate on closed KVault")
 
         k = _to_bytes_key(key)
+        ch = (
+            self._chunk
+            if chunk_size is None
+            else _stream_size(chunk_size, "chunk_size", positive=True)
+        )
+        if size is not None:
+            size = _stream_size(size, "size")
 
         # bytes-like fast path
         if _is_bytes_like(reader):
@@ -486,18 +629,17 @@ class KVault(Mapping):
             # Fallback: buffer into BytesIO to know size
             try:
                 buf = io.BytesIO()
-                _stream_copy(reader, buf, chunk_size or self._chunk)
+                _stream_copy(reader, buf, ch)
                 return self.put(k, buf.getbuffer())
             except Exception as ex:
                 raise E.map_exception(ex, key=k)
 
-        size_int = int(inferred)
-        ch = int(chunk_size or self._chunk)
-
-        def call():
-            return self._inner.put_stream(k, reader, size_int, ch)
-
-        _with_retries(call, attempts=self._retries, backoff_base=self._backoff, key_for_error=k)
+        size_int = _stream_size(inferred, "size")
+        # A failed call may already have consumed input; never replay it.
+        try:
+            self._native().put_stream(k, reader, size_int, ch)
+        except Exception as ex:
+            raise E.map_exception(ex, key=k) from ex
 
     def get_to_file(
         self, key: KeyType, writer: BinaryIO, *, chunk_size: Optional[int] = None
@@ -532,14 +674,17 @@ class KVault(Mapping):
         if not _is_writer_like(writer):
             raise E.InvalidArgument("writer must be a file-like object with write()")
         k = _to_bytes_key(key)
-        ch = int(chunk_size or self._chunk)
-
-        def call():
-            return int(self._inner.get_to_file(k, writer, ch))
-
-        return _with_retries(
-            call, attempts=self._retries, backoff_base=self._backoff, key_for_error=k
+        ch = (
+            self._chunk
+            if chunk_size is None
+            else _stream_size(chunk_size, "chunk_size", positive=True)
         )
+
+        # The sink may have accepted bytes even when the native call fails.
+        try:
+            return int(self._native().get_to_file(k, writer, ch))
+        except Exception as ex:
+            raise E.map_exception(ex, key=k) from ex
 
     def delete(self, key: KeyType) -> bool:
         """
@@ -561,7 +706,7 @@ class KVault(Mapping):
         k = _to_bytes_key(key)
 
         def call():
-            return bool(self._inner.delete(k))
+            return bool(self._native().delete(k))
 
         return _with_retries(
             call, attempts=self._retries, backoff_base=self._backoff, key_for_error=k
@@ -587,15 +732,18 @@ class KVault(Mapping):
         k = _to_bytes_key(key)
 
         def call():
-            return bool(self._inner.exists(k))
+            return bool(self._native().exists(k))
 
         return _with_retries(
             call, attempts=self._retries, backoff_base=self._backoff, key_for_error=k
         )
 
-    def pop(self, key: KeyType, default: Any = None) -> Any:
+    def pop(self, key: KeyType, default: Any = _MISSING) -> Any:
         """
-        Remove and return value for key.
+        Atomically remove and return a value; missing without default raises KeyError.
+
+        Stored None is distinct from a missing key. SQL commits before decoding;
+        a decoding error does not restore the removed raw value. No automatic retry.
 
         Parameters
         ----------
@@ -609,38 +757,50 @@ class KVault(Mapping):
         bytes | Any
             Value as bytes, or default if not found.
         """
+        native = self._native()
         try:
-            value = self.get(key)
-            self.delete(key)
-            return value
-        except E.NotFound:
+            return native.pop(_to_bytes_key(key))
+        except KeyError:
+            if default is _MISSING:
+                raise KeyError(key) from None
             return default
+        except Exception as ex:
+            raise E.map_exception(ex, key=key) from ex
 
-    def setdefault(self, key: KeyType, default: ValueType) -> bytes:
+    def setdefault(self, key: KeyType, default: Any = None) -> Any:
         """
-        Get value for key, setting it to default if not present.
+        Return the decoded value, atomically inserting default (None) if absent.
+
+        An unused default is not serialized. Insertion commits directly and is
+        rejected under an enabled cache lock; existing pending values are readable.
 
         Parameters
         ----------
         key : bytes | str
             Key to retrieve or set.
-        default : bytes | bytearray | memoryview
-            Value to set if key doesn't exist.
+        default : Any, default=None
+            Auto-packable value to set if key doesn't exist.
 
         Returns
         -------
         bytes
             Existing or newly set value.
         """
-        if self.exists(key):
-            return self.get(key)
-        else:
-            self.put(key, default)
-            return bytes(default)
+        native = self._native()
+        if isinstance(default, (bytearray, memoryview)):
+            default = bytes(default)
+        try:
+            return native.setdefault(_to_bytes_key(key), default)
+        except Exception as ex:
+            raise E.map_exception(ex, key=key) from ex
 
-    def update(self, other: Union[Mapping, Iterator[tuple[KeyType, ValueType]]], **kwargs) -> None:
+    def update(self, other=(), **kwargs) -> None:
         """
-        Update vault with key-value pairs from another mapping or iterable.
+        Update from a mapping/iterable and keyword pairs in committed batches.
+
+        At most 1024 pairs are materialized per batch; each batch is atomic, not
+        the entire update. Earlier batches remain committed on a later error.
+        This bypasses cache buffering and rejects an enabled locked cache.
 
         Parameters
         ----------
@@ -649,27 +809,27 @@ class KVault(Mapping):
         **kwargs
             Additional key-value pairs.
         """
-        if isinstance(other, Mapping):
-            for key, value in other.items():
-                self[key] = value
-        else:
-            for key, value in other:
-                self[key] = value
-
-        for key, value in kwargs.items():
-            self[key] = value
+        self._native()
+        pairs = chain(other.items() if isinstance(other, Mapping) else other, kwargs.items())
+        while batch := list(islice(pairs, 1024)):
+            self.put_many(batch)
 
     def clear(self) -> None:
         """
-        Remove all keys from the vault.
+        Remove all committed and pending keys with one atomic SQL transaction.
+
+        Failure preserves pending data. This commits directly, even inside a
+        cache context, just like delete(). It never materializes every key.
 
         Warning: This deletes all data!
         """
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
 
-        for key in list(self.keys()):
-            self.delete(key)
+        try:
+            self._native().clear()
+        except Exception as ex:
+            raise E.map_exception(ex) from ex
 
     # ----------------------------
     # Cache Management
@@ -697,8 +857,12 @@ class KVault(Mapping):
         """
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
+        if flush_interval is not None and (
+            not math.isfinite(flush_interval) or flush_interval <= 0
+        ):
+            raise E.InvalidArgument("flush_interval must be finite and positive")
         try:
-            self._inner.enable_cache(cap_bytes, flush_threshold, flush_interval)
+            self._native().enable_cache(cap_bytes, flush_threshold, flush_interval)
         except Exception as ex:
             raise E.map_exception(ex)
 
@@ -721,7 +885,7 @@ class KVault(Mapping):
         self.flush_cache()
 
         try:
-            self._inner.disable_cache()
+            self._native().disable_cache()
         except Exception as ex:
             raise E.map_exception(ex)
 
@@ -737,7 +901,10 @@ class KVault(Mapping):
         if self._closed:
             return 0
         try:
-            return int(self._inner.flush_cache())
+            count = int(self._native().flush_cache())
+            if not self._cache_lock_depth:
+                self._background_flush_error = None
+            return count
         except Exception as ex:
             raise E.map_exception(ex)
 
@@ -790,7 +957,8 @@ class KVault(Mapping):
         """
         Context manager to prevent auto-flush during critical section.
 
-        Useful for atomic multi-key operations when using daemon thread.
+        Nested contexts defer flushing until the last context exits. This is
+        not a database transaction. Close is rejected while any context is active.
 
         Examples
         --------
@@ -800,22 +968,77 @@ class KVault(Mapping):
         ...     vault["config:part2"] = data2
         ... # Auto-flush deferred until here
         """
-        self._inner.set_cache_locked(True)
+        with self._lifecycle_lock:
+            if self._closed or self._closing:
+                raise ValueError("Cannot lock cache on a closing or closed KVault")
+            if self._cache_lock_transition:
+                raise RuntimeError("Cache lock transition is in progress")
+            inner = self._inner
+            first = self._cache_lock_depth == 0
+            if first:
+                self._cache_lock_transition = True
+            else:
+                self._cache_lock_depth += 1
+
+        if first:
+            try:
+                # Native transitions can wait; never hold the lifecycle mutex here.
+                inner.set_cache_locked(True)
+            except BaseException:
+                with self._lifecycle_lock:
+                    self._cache_lock_transition = False
+                raise
+            with self._lifecycle_lock:
+                self._cache_lock_depth = 1
+                self._cache_unlock_pending = False
+                self._cache_lock_transition = False
+
         try:
             yield
         finally:
-            self._inner.set_cache_locked(False)
+            with self._lifecycle_lock:
+                last = self._cache_lock_depth == 1
+                if last:
+                    self._cache_lock_transition = True
+                else:
+                    self._cache_lock_depth -= 1
+            if last:
+                unlocked = False
+                try:
+                    # Retain the captured native object throughout cleanup.
+                    inner.set_cache_locked(False)
+                    unlocked = True
+                finally:
+                    with self._lifecycle_lock:
+                        self._cache_lock_depth = 0
+                        # A later close or context can retry a failed native unlock.
+                        self._cache_unlock_pending = not unlocked
+                        self._cache_lock_transition = False
+
+    @property
+    def background_flush_error(self):
+        """Last daemon error, cleared by a successful unlocked manual flush.
+
+        Failure stops that daemon and retains pending writes. Retry explicitly,
+        then call enable_cache(flush_interval=...) to restart it if desired.
+        """
+        return self._background_flush_error
+
+    def reader_pool_stats(self) -> dict[str, int]:
+        """Return idle reader count and SQLite page-cache bytes (not total RSS)."""
+        count, cache_bytes = self._native().reader_pool_stats()
+        return {"idle_connections": count, "sqlite_cache_bytes": cache_bytes}
 
     def _start_daemon_thread(self, flush_interval: float) -> None:
         """Start background thread for auto-flushing cache after idle period."""
         # Stop existing daemon if any
         self._stop_daemon_thread()
 
-        self._daemon_stop.clear()
+        stop = threading.Event()
 
         def daemon_worker():
             last_flush = time.time()
-            while not self._daemon_stop.wait(0.5):  # Check every 500ms
+            while not stop.wait(0.5):  # Check every 500ms
                 if self._closed:
                     break
 
@@ -826,18 +1049,39 @@ class KVault(Mapping):
                         flushed = self.flush_cache()
                         if flushed > 0:
                             last_flush = time.time()
-                except Exception:
-                    pass  # Ignore errors in daemon
+                except Exception as ex:
+                    self._background_flush_error = ex
+                    try:
+                        warnings.warn(
+                            f"KVault background flush failed: {ex}; call flush_cache() to retry",
+                            RuntimeWarning,
+                            stacklevel=1,
+                        )
+                    finally:
+                        stop.set()
+                    return
 
-        self._daemon_thread = threading.Thread(target=daemon_worker, daemon=True)
-        self._daemon_thread.start()
+        thread = threading.Thread(target=daemon_worker, daemon=True)
+        with self._lifecycle_lock:
+            if self._closed or self._closing:
+                return
+            # A timed-out older worker must never reuse this worker's stop event.
+            self._daemon_stop.set()
+            self._daemon_stop = stop
+            self._daemon_thread = thread
+            thread.start()
 
     def _stop_daemon_thread(self) -> None:
-        """Stop the daemon thread if running."""
-        if self._daemon_thread and self._daemon_thread.is_alive():
+        """Stop the daemon without holding lifecycle state while joining it."""
+        with self._lifecycle_lock:
+            thread = self._daemon_thread
             self._daemon_stop.set()
-            self._daemon_thread.join(timeout=2.0)
-            self._daemon_thread = None
+        if thread is not None:
+            if thread is not threading.current_thread():
+                thread.join(timeout=2.0)
+            with self._lifecycle_lock:
+                if self._daemon_thread is thread:
+                    self._daemon_thread = None
 
     # ----------------------------
     # Header Format Management
@@ -861,7 +1105,7 @@ class KVault(Mapping):
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
         try:
-            self._inner.enable_headers()
+            self._native().enable_headers()
         except Exception as ex:
             raise E.map_exception(ex)
 
@@ -874,7 +1118,7 @@ class KVault(Mapping):
         """
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
-        self._inner.disable_headers()
+        self._native().disable_headers()
 
     def headers_enabled(self) -> bool:
         """
@@ -887,7 +1131,7 @@ class KVault(Mapping):
         """
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
-        return self._inner.headers_enabled()
+        return self._native().headers_enabled()
 
     # ----------------------------
     # Auto-Packing Management
@@ -924,7 +1168,7 @@ class KVault(Mapping):
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
         try:
-            self._inner.enable_auto_pack(use_pickle)
+            self._native().enable_auto_pack(use_pickle)
         except Exception as ex:
             raise E.map_exception(ex)
 
@@ -937,7 +1181,7 @@ class KVault(Mapping):
         """
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
-        self._inner.disable_auto_pack()
+        self._native().disable_auto_pack()
 
     def auto_pack_enabled(self) -> bool:
         """
@@ -950,7 +1194,7 @@ class KVault(Mapping):
         """
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
-        return self._inner.auto_pack_enabled()
+        return self._native().auto_pack_enabled()
 
     # ----------------------------
     # Maintenance
@@ -966,6 +1210,6 @@ class KVault(Mapping):
         if self._closed:
             raise ValueError("Cannot operate on closed KVault")
         try:
-            self._inner.optimize()
+            self._native().optimize()
         except Exception as ex:
             raise E.map_exception(ex)
