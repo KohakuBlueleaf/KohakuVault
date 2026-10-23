@@ -104,17 +104,18 @@ def test_failed_flush_rolls_back_and_preserves_buffer(tmp_path):
         col.extend([1, 2])
         col.enable_cache(cap_bytes=1024)
         col.extend([3, 4, 5])
-        with sqlite3.connect(path) as conn:
-            conn.execute(
-                "CREATE TRIGGER reject_length BEFORE UPDATE OF length ON kvault_col_columns BEGIN SELECT RAISE(ABORT, 'injected'); END"
-            )
+        from tests.test_kv_flush_isolation import _sql
+
+        _sql(
+            path,
+            "CREATE TRIGGER reject_length BEFORE UPDATE OF length ON kvault_col_columns BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
         with pytest.raises(RuntimeError, match="injected"):
             col.flush_cache()
         with ColumnVault(path, read_only=True) as reader:
             assert reader["numbers"][:] == [1, 2]
         assert col._pending_rows == 3
-        with sqlite3.connect(path) as conn:
-            conn.execute("DROP TRIGGER reject_length")
+        _sql(path, "DROP TRIGGER reject_length;")
         col.flush_cache()
         assert col[:] == [1, 2, 3, 4, 5]
 

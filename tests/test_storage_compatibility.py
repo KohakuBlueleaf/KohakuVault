@@ -94,14 +94,11 @@ def test_readonly_kv_opens_under_writer_lock_and_observes_commits(tmp_path):
     path = tmp_path / "kv.db"
     with KVault(path) as writer:
         writer["value"] = 1
-        conn = sqlite3.connect(path)
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+        from tests.test_cache_consistency import _sqlite_writer_lock
+
+        with _sqlite_writer_lock(path):
             reader = KVault(path, read_only=True)
             assert reader["value"] == 1
-        finally:
-            conn.rollback()
-            conn.close()
         with reader:
             writer["value"] = 2
             assert reader["value"] == 2
@@ -114,25 +111,25 @@ def test_vector_delete_and_update_are_atomic(tmp_path):
     path = tmp_path / "vectors.db"
     with VectorKVault(path, dimensions=4) as vectors:
         row_id = vectors.insert([1, 0, 0, 0], b"original")
-        with sqlite3.connect(path) as conn:
-            conn.execute(
-                "CREATE TRIGGER reject_delete BEFORE DELETE ON vec_kvault_values BEGIN SELECT RAISE(ABORT, 'injected delete'); END"
-            )
+        from tests.test_kv_flush_isolation import _sql
+
+        _sql(
+            path,
+            "CREATE TRIGGER reject_delete BEFORE DELETE ON vec_kvault_values BEGIN SELECT RAISE(ABORT, 'injected delete'); END;",
+        )
         with pytest.raises(Exception, match="injected delete"):
             vectors.delete(row_id)
         assert vectors.get_by_id(row_id)[1] == b"original"
-        with sqlite3.connect(path) as conn:
-            conn.execute("DROP TRIGGER reject_delete")
-            conn.execute(
-                "CREATE TRIGGER reject_update BEFORE UPDATE ON vec_kvault_values BEGIN SELECT RAISE(ABORT, 'injected update'); END"
-            )
+        _sql(
+            path,
+            "DROP TRIGGER reject_delete; CREATE TRIGGER reject_update BEFORE UPDATE ON vec_kvault_values BEGIN SELECT RAISE(ABORT, 'injected update'); END;",
+        )
         with pytest.raises(Exception, match="injected update"):
             vectors.update(row_id, vector=[0, 1, 0, 0], value=b"new")
         vector, value = vectors.get_by_id(row_id)
         np.testing.assert_array_equal(vector, [1, 0, 0, 0])
         assert value == b"original"
-        with sqlite3.connect(path) as conn:
-            conn.execute("DROP TRIGGER reject_update")
+        _sql(path, "DROP TRIGGER reject_update;")
         vectors.delete(row_id)
         assert vectors.count() == 0
 

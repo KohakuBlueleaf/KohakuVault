@@ -213,11 +213,11 @@ def _lock_scenario(path):
         assert not streamer.is_alive()
         vault["inside-lock"] = b"inside"
         assert flush_done.wait(5)
-        with sqlite3.connect(path) as observer:
-            visible = observer.execute(
-                "SELECT value FROM kv WHERE key=?", (b"inside-lock",)
-            ).fetchone()
-        observer.close()
+        # Do not open/close a second SQLite library against a live native WAL.
+        # POSIX locks are process-scoped; that library can unlink shared WAL/SHM
+        # files without knowing about the native writer's registered handles.
+        with KVault(path, read_only=True) as observer:
+            visible = observer.get("inside-lock")
         assert not errors, errors
         assert flushed == [0]
         assert visible is None, "data from the locked batch was committed before context exit"
