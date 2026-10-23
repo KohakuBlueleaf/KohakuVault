@@ -18,6 +18,7 @@ Use this index to navigate the guides that ship with the repository. Each page i
 - [DataPacker Reference](datapacker.md) – dtype strings, batch APIs, JSON-Schema validation, and how auto-pack builds on it.
 
 ## System Architecture & Releases
+- [Stable and nightly builds](releases.md) – versioning, CI gates, artifact provenance, and installation.
 - [Changes since 0.9.0](changes.md) – new features, breaking behavior, storage compatibility, and migration guidance.
 - [Architecture Deep Dive](architecture.md) – Python↔Rust layering, SQLite layout, cache design, and the auto-pack pipeline.
 

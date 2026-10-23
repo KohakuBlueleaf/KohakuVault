@@ -7,12 +7,65 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact commit or ref to build
+        default: main
+        type: string
+      channel:
+        description: Build only, or publish a nightly (never a stable manual release)
+        default: build
+        type: choice
+        options: [build, nightly]
+
+concurrency:
+  group: release-${{ inputs.channel || github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
+  meta:
+    if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      cargo_version: ${{ steps.version.outputs.cargo_version }}
+      python_version: ${{ steps.version.outputs.python_version }}
+      tag: ${{ steps.version.outputs.tag }}
+      nightly: ${{ steps.version.outputs.nightly }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Resolve source and require green CI for nightly
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ "$CHANNEL" = nightly ]; then
+            result=$(gh run list --workflow ci.yml --commit "$sha" --event push --limit 1 --json conclusion --jq '.[0].conclusion // "missing"')
+            test "$result" = success || { echo "::error::CI for $sha is $result"; exit 1; }
+          fi
+      - name: Resolve artifact version once for every platform
+        id: version
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          args=()
+          if [ "$CHANNEL" = nightly ]; then args+=(--nightly); fi
+          python scripts/release_version.py "${args[@]}" --github-output "$GITHUB_OUTPUT"
+
   build-wheels:
+    needs: meta
     name: Build cp${{ matrix.python-version }} for ${{ matrix.platform.target }} on ${{ matrix.platform.os }}
     runs-on: ${{ matrix.platform.os }}
     strategy:
@@ -39,11 +92,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.sha }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Stamp build checkout
+        env:
+          ARTIFACT_VERSION: ${{ needs.meta.outputs.cargo_version }}
+        run: python scripts/release_version.py --stamp "$ARTIFACT_VERSION"
+        shell: bash
 
       - name: Build wheels (Linux)
         if: runner.os == 'Linux'
@@ -62,6 +123,17 @@ jobs:
           target: ${{ matrix.platform.target }}
           manylinux: ${{ matrix.platform.manylinux }}
           args: ${{ matrix.platform.args }} --interpreter python --out dist
+
+      - name: Smoke-test native-host wheel
+        if: matrix.platform.target != 'aarch64-unknown-linux-gnu'
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.meta.outputs.python_version }}
+        run: |
+          python -m pip install dist/*.whl
+          python -c "import importlib.metadata, os; assert importlib.metadata.version('kohakuvault') == os.environ['EXPECTED_VERSION']"
+          python examples/kvault_demo.py
+          python examples/columnar_demo.py
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -83,6 +155,7 @@ jobs:
   #    started accepting them in late 2024.  Older pip / pip on
   #    desktop ignores them, so they don't pollute desktop installs.
   build-wheels-android:
+    needs: meta
     name: Build Android wheel for ${{ matrix.target }}
     runs-on: ubuntu-latest
     strategy:
@@ -103,11 +176,18 @@ jobs:
             android_abi: x86_64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.sha }}
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+
+      - name: Stamp build checkout
+        env:
+          ARTIFACT_VERSION: ${{ needs.meta.outputs.cargo_version }}
+        run: python scripts/release_version.py --stamp "$ARTIFACT_VERSION"
 
       - name: Set up Android NDK
         uses: nttld/setup-ndk@v1
@@ -208,11 +288,14 @@ jobs:
           retention-days: 7
 
   build-sdist:
+    needs: meta
     name: Build source distribution
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -221,6 +304,11 @@ jobs:
 
       - name: Install maturin
         run: pip install maturin
+
+      - name: Stamp build checkout
+        env:
+          ARTIFACT_VERSION: ${{ needs.meta.outputs.cargo_version }}
+        run: python scripts/release_version.py --stamp "$ARTIFACT_VERSION"
 
       - name: Build sdist
         run: maturin sdist --out dist
@@ -238,9 +326,9 @@ jobs:
     # to BOTH PyPI and the GH Release.  PyPI started accepting PEP 738
     # ``android_<api>_<abi>`` tags via warehouse PR #17559 on
     # 2025-02-10, and maturin >=1.12.4 emits exactly that format.
-    needs: [build-wheels, build-wheels-android, build-sdist]
+    needs: [meta, build-wheels, build-wheels-android, build-sdist]
     runs-on: ubuntu-latest
-    if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
+    if: needs.meta.outputs.nightly == 'true' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v'))
     environment:
       name: pypi
       url: https://pypi.org/p/kohakuvault
@@ -263,6 +351,31 @@ jobs:
 
       - name: List artifacts
         run: ls -lh dist/
+
+      - name: Write nightly provenance and migration warning
+        if: needs.meta.outputs.nightly == 'true'
+        env:
+          SOURCE_SHA: ${{ needs.meta.outputs.sha }}
+          ARTIFACT_VERSION: ${{ needs.meta.outputs.python_version }}
+        run: |
+          printf 'Automatic nightly build (not stable 1.0.0).\n\nVersion: %s\n\nSource commit: %s\n\nWARNING: legacy col_* columns require export/import; KV/vector formats are preserved. See docs/changes.md.\n' "$ARTIFACT_VERSION" "$SOURCE_SHA" > nightly-notes.md
+          sha256sum dist/* > dist/SHA256SUMS.txt
+
+      - name: Upload nightly artifacts as a dated prerelease
+        if: needs.meta.outputs.nightly == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          target_commitish: ${{ needs.meta.outputs.sha }}
+          name: Nightly ${{ needs.meta.outputs.python_version }}
+          prerelease: true
+          make_latest: false
+          body_path: nightly-notes.md
+          files: dist/*
+
+      - name: Remove checksum manifest from PyPI input
+        if: needs.meta.outputs.nightly == 'true'
+        run: rm dist/SHA256SUMS.txt
 
       - name: Upload all wheels + sdist to GitHub Release
         uses: softprops/action-gh-release@v2
