@@ -1,11 +1,11 @@
 // Allow PyO3-specific false positive warnings
 #![allow(clippy::useless_conversion)]
 
-//! KohakuVault - SQLite-backed storage with dual interfaces
+//! KohakuVault - SQLite-backed KV, column, text, and vector storage
 //!
 //! This module exports:
 //! - _KVault: Key-value storage with caching
-//! - _ColumnVault: Columnar storage with dynamic chunks
+//! - _ColumnVault: Buffer-oriented column storage with bounded blocks
 //! - DataPacker: Rust-based data serialization
 //! - CSB+Tree: Cache-sensitive B+Tree for ordered storage
 //! - _VectorKVault: Vector similarity search storage
@@ -25,14 +25,13 @@ mod tree;
 mod vector_utils;
 mod vkvault;
 
-// Initialize sqlite-vec extension globally
-// This must be called before any SQLite connections are opened
-#[allow(non_upper_case_globals)]
-static mut vec_initialized: bool = false;
+// Register sqlite-vec once before concurrent connection creation.
+static VEC_INIT: std::sync::Once = std::sync::Once::new();
+static VEC_INIT_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-fn init_sqlite_vec() {
-    unsafe {
-        if !vec_initialized {
+fn init_sqlite_vec() -> PyResult<()> {
+    VEC_INIT.call_once(|| {
+        let result = unsafe {
             sqlite3_auto_extension(Some(std::mem::transmute::<
                 *const (),
                 unsafe extern "C" fn(
@@ -40,16 +39,20 @@ fn init_sqlite_vec() {
                     *mut *const c_char,
                     *const rusqlite::ffi::sqlite3_api_routines,
                 ) -> i32,
-            >(sqlite3_vec_init as *const ())));
-            vec_initialized = true;
-        }
+            >(sqlite3_vec_init as *const ())))
+        };
+        VEC_INIT_RESULT.store(result, std::sync::atomic::Ordering::Release);
+    });
+    if VEC_INIT_RESULT.load(std::sync::atomic::Ordering::Acquire) != rusqlite::ffi::SQLITE_OK {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("sqlite-vec registration failed"));
     }
+    Ok(())
 }
 
 #[pymodule]
 fn _kvault(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize sqlite-vec extension before anything else
-    init_sqlite_vec();
+    init_sqlite_vec()?;
 
     m.add_class::<kv::_KVault>()?;
     m.add_class::<col::_ColumnVault>()?;
