@@ -40,11 +40,7 @@ impl _KVault {
             .transpose()
             .map_err(|_| VaultError::Py("iteration limit is too large".into()))?
             .unwrap_or(-1);
-        let fields = if include_values {
-            "key, value"
-        } else {
-            "key, X''"
-        };
+        let fields = if include_values { "key, value" } else { "key" };
         let mut sql = format!("SELECT {fields} FROM {} WHERE 1 = 1", self.table);
         let mut parameters = Vec::<Value>::new();
 
@@ -72,15 +68,30 @@ impl _KVault {
                 .unwrap_or_default()
         };
 
-        let mut rows = self.with_reader(|conn| {
+        // Keys-only rows share one empty payload instead of allocating per row.
+        let empty: SharedValue = Arc::new(Vec::new());
+        let rows: RawItems = self.with_reader(|conn| {
             let mut statement = conn.prepare_cached(&sql)?;
             let result = statement.query_map(params_from_iter(parameters), |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, Arc::new(row.get::<_, Vec<u8>>(1)?)))
+                let value = if include_values {
+                    Arc::new(row.get::<_, Vec<u8>>(1)?)
+                } else {
+                    Arc::clone(&empty)
+                };
+                Ok((row.get::<_, Vec<u8>>(0)?, value))
             })?;
-            Ok(result.collect::<Result<BTreeMap<_, _>, _>>()?)
+            Ok(result.collect::<Result<Vec<_>, _>>()?)
         })?;
-        rows.extend(pending);
-        Ok(rows.into_iter().take(limit.unwrap_or(usize::MAX)).collect())
+        // SQL already returns the page in key order; only cached writes need a merge.
+        if pending.is_empty() {
+            return Ok(rows);
+        }
+        let mut merged: BTreeMap<_, _> = rows.into_iter().collect();
+        merged.extend(pending);
+        Ok(merged
+            .into_iter()
+            .take(limit.unwrap_or(usize::MAX))
+            .collect())
     }
 
     pub(crate) fn scan_keys_page(
