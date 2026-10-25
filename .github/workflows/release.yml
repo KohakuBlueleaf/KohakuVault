@@ -358,7 +358,7 @@ jobs:
           SOURCE_SHA: ${{ needs.meta.outputs.sha }}
           ARTIFACT_VERSION: ${{ needs.meta.outputs.python_version }}
         run: |
-          printf 'Automatic nightly build (not stable 1.0.0).\n\nVersion: %s\n\nSource commit: %s\n\nWARNING: legacy col_* columns require export/import; KV/vector formats are preserved. See docs/changes.md.\n' "$ARTIFACT_VERSION" "$SOURCE_SHA" > nightly-notes.md
+          printf 'Automatic nightly build (not a stable release).\n\nVersion: %s\n\nSource commit: %s\n\nWARNING: legacy col_* columns require export/import; KV/vector formats are preserved. See docs/changes.md.\n' "$ARTIFACT_VERSION" "$SOURCE_SHA" > nightly-notes.md
           sha256sum dist/* > dist/SHA256SUMS.txt
 
       - name: Upload nightly artifacts as a dated prerelease

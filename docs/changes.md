@@ -8,6 +8,13 @@
 
 WAL and `synchronous=NORMAL` remain unchanged. Buffered acceptance, committed visibility and power-loss durability are different guarantees. Do not copy a live main database file without its committed WAL state; use a consistent backup.
 
+## New in 1.1.0
+
+- `TextVault.insert_many(items)` inserts an iterable of `(texts, value)` pairs in one transaction and returns the rowids in input order. Inputs are parsed and packed before the write starts; any failure inserts nothing.
+- KV `keys()` reads only the key column, and skips the cache merge when nothing is pending.
+
+1.1.0 changes no storage format; 1.0.0 databases open unchanged.
+
 ## New features
 
 - Buffer-oriented columns: NumPy/tensor `append_array`, `read_array`, `read_buffer`, variable `read_buffers`, indexed `take`, and `iter_batches`. Reads fetch requested BLOB ranges rather than whole growing chunks.

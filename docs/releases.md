@@ -2,7 +2,7 @@
 
 The tracked package version is read from `Cargo.toml`; `pyproject.toml` and Python
 `__version__` derive it rather than maintaining independent version strings.
-A tracked `1.0.0` does not itself publish a stable release.
+A tracked `1.1.0` does not itself publish a stable release.
 
 ## Nightly
 
@@ -19,8 +19,8 @@ gh workflow run nightly.yml --ref main -f force_rebuild=true
 Nightly requires successful push CI for the exact main commit. It skips an
 already published commit unless forced. The shared Release workflow checks CI
 again, pins every checkout to that SHA, and computes one version for all jobs.
-Only build checkouts are stamped: Cargo `1.0.0-dev.YYYYMMDDHHMMSS` becomes Python
-`1.0.0.devYYYYMMDDHHMMSS`. No version-bump commit or `v1.0.0` tag is created.
+Only build checkouts are stamped: Cargo `1.1.0-dev.YYYYMMDDHHMMSS` becomes Python
+`1.1.0.devYYYYMMDDHHMMSS`. No version-bump commit or `v1.1.0` tag is created.
 
 After all builds and native-host wheel smoke tests succeed, the workflow uploads
 the wheels/sdist and a SHA256 manifest to a dated `nightly-YYYYMMDD` GitHub
@@ -33,7 +33,7 @@ check the dispatched **Release** run and its publishing job too.
 Install a specific nightly for reproducibility:
 
 ```bash
-python -m pip install 'kohakuvault==1.0.0.devYYYYMMDDHHMMSS'
+python -m pip install 'kohakuvault==1.1.0.devYYYYMMDDHHMMSS'
 # Or opt into available pre-releases:
 python -m pip install --pre --upgrade kohakuvault
 ```
