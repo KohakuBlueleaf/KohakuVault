@@ -73,6 +73,18 @@ impl _TextVault {
         self.inner.insert(py, texts, value, metadata)
     }
 
+    /// Insert many documents in one transaction
+    ///
+    /// Args:
+    ///     items: Iterable of (texts, value) pairs, each as accepted by insert()
+    ///
+    /// Returns:
+    ///     list[int]: IDs of the inserted documents, in input order
+    #[pyo3(signature = (items))]
+    fn insert_many(&self, py: Python<'_>, items: &Bound<'_, PyAny>) -> PyResult<Vec<i64>> {
+        self.inner.insert_many(py, items)
+    }
+
     /// Search documents using FTS5 with BM25 ranking
     ///
     /// Args:

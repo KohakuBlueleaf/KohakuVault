@@ -4,7 +4,7 @@ use crate::textvault::core::TextVault;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 impl TextVault {
     /// Insert a document with text content and value
@@ -83,6 +83,86 @@ impl TextVault {
 
             Ok(doc_id)
         })
+    }
+
+    /// Insert many `(texts, value)` documents in one transaction
+    ///
+    /// Every input is parsed and packed before the database lock is taken; a
+    /// failure anywhere inserts nothing. Returns the rowids in input order.
+    pub fn insert_many(&self, py: Python<'_>, items: &Bound<'_, PyAny>) -> PyResult<Vec<i64>> {
+        let mut rows: Vec<(Vec<String>, Vec<u8>)> = Vec::new();
+        for item in items.try_iter()? {
+            let item = item?;
+            let (texts, value): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item
+                .extract()
+                .map_err(|_| PyValueError::new_err("insert_many expects (texts, value) pairs"))?;
+            rows.push((self.parse_text_input(&texts)?, self.pack_value(py, &value)?));
+        }
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        py.allow_threads(|| {
+            let mut conn = self.conn.lock();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to begin insert: {}", e)))?;
+            let placeholders = vec!["?"; self.columns.len()].join(", ");
+            let doc_sql = format!(
+                "INSERT INTO {} ({}, value_ref) VALUES ({}, ?)",
+                &self.table,
+                self.columns.join(", "),
+                placeholders
+            );
+            let value_sql =
+                format!("INSERT INTO {}_values (value) VALUES (?) RETURNING id", &self.table);
+            let mut ids = Vec::with_capacity(rows.len());
+            {
+                let mut value_stmt = tx.prepare(&value_sql).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to prepare value insert: {}", e))
+                })?;
+                let mut doc_stmt = tx.prepare(&doc_sql).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to prepare insert statement: {}", e))
+                })?;
+                for (text_values, value_bytes) in rows {
+                    let value_id: i64 = value_stmt
+                        .query_row(params![value_bytes], |row| row.get(0))
+                        .map_err(|e| {
+                            PyRuntimeError::new_err(format!("Failed to insert value: {}", e))
+                        })?;
+                    let mut param_values: Vec<rusqlite::types::Value> = text_values
+                        .into_iter()
+                        .map(rusqlite::types::Value::Text)
+                        .collect();
+                    param_values.push(rusqlite::types::Value::Integer(value_id));
+                    doc_stmt
+                        .execute(rusqlite::params_from_iter(param_values))
+                        .map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "Failed to insert into FTS5 table: {}",
+                                e
+                            ))
+                        })?;
+                    ids.push(tx.last_insert_rowid());
+                }
+            }
+            tx.commit()
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to commit insert: {}", e)))?;
+            Ok(ids)
+        })
+    }
+
+    /// Pack one value with the active auto-packer, or require bytes without one
+    fn pack_value(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+        let auto_pack_guard = self.auto_packer.lock();
+        if let Some(ref packer) = *auto_pack_guard {
+            let (serialized_bytes, encoding) = packer.serialize(py, value)?;
+            drop(auto_pack_guard);
+            Ok(self.encode_value(&serialized_bytes, encoding))
+        } else {
+            drop(auto_pack_guard);
+            self.extract_bytes(value)
+        }
     }
 
     /// Parse text input based on column configuration

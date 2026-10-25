@@ -11,7 +11,7 @@ Features:
 - Auto-packing for arbitrary Python values
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from ._kvault import _TextVault
 import kohakuvault.errors as E
@@ -93,6 +93,21 @@ class TextVault:
         """
         try:
             return self._vault.insert(texts, value, metadata)
+        except Exception as ex:
+            raise E.map_exception(ex)
+
+    def insert_many(self, items: Iterable[Tuple[TextInput, Any]]) -> List[int]:
+        """Insert many documents atomically in one transaction.
+
+        Args:
+            items: Iterable of ``(texts, value)`` pairs, each as accepted by insert()
+
+        Returns:
+            IDs of the inserted documents, in input order. If any pair cannot be
+            parsed, packed, or written, no document is inserted.
+        """
+        try:
+            return self._vault.insert_many(items)
         except Exception as ex:
             raise E.map_exception(ex)
 

@@ -135,6 +135,19 @@ doc_id = tv.insert(
 )
 ```
 
+### Insert Many
+
+`insert_many` writes an iterable of `(texts, value)` pairs in one transaction and
+returns their IDs in input order. All values are packed before the write begins,
+and if any pair is invalid or any row fails, nothing is inserted:
+
+```python
+ids = tv.insert_many([
+    ("first document", {"n": 1}),
+    ("second document", {"n": 2}),
+])
+```
+
 ### Get by ID
 
 ```python
