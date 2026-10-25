@@ -1,10 +1,12 @@
 """Tests for TextVault.insert_many - atomic batch inserts"""
 
-import sqlite3
+import subprocess
+import sys
 
 import pytest
 
 from kohakuvault import TextVault
+from tests.test_kv_flush_isolation import _DEADLINE, _sql
 
 
 @pytest.fixture
@@ -13,13 +15,28 @@ def db_path(tmp_path):
 
 
 def _row_counts(path, table="text_vault"):
-    conn = sqlite3.connect(path)
-    try:
-        docs = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-        values = conn.execute(f"SELECT count(*) FROM {table}_values").fetchone()[0]
-        return docs, values
-    finally:
-        conn.close()
+    # Count from a subprocess so Python sqlite3 never shares the native writer's locks.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); t = sys.argv[2]; "
+                "print(c.execute(f'SELECT count(*) FROM {t}').fetchone()[0], "
+                "c.execute(f'SELECT count(*) FROM {t}_values').fetchone()[0]); c.close()"
+            ),
+            str(path),
+            table,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_DEADLINE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    docs, values = result.stdout.split()
+    return int(docs), int(values)
 
 
 def test_insert_many_returns_ids_in_order_and_matches_insert(db_path):
@@ -83,14 +100,12 @@ def test_unpackable_value_inserts_nothing(db_path):
 def test_failed_write_rolls_back_the_batch(db_path):
     tv = TextVault(db_path)
     tv.insert("existing row", b"v")
-    conn = sqlite3.connect(db_path)
-    conn.execute(
+    _sql(
+        db_path,
         "CREATE TRIGGER reject AFTER INSERT ON text_vault_values "
         "WHEN (SELECT count(*) FROM text_vault_values) > 2 "
-        "BEGIN SELECT RAISE(ABORT, 'rejected'); END"
+        "BEGIN SELECT RAISE(ABORT, 'rejected'); END;",
     )
-    conn.commit()
-    conn.close()
     with pytest.raises(Exception, match="rejected"):
         tv.insert_many([("one", b"1"), ("two", b"2")])
     assert _row_counts(db_path) == (1, 1)
