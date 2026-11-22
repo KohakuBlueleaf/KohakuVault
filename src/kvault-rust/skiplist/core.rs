@@ -294,7 +294,7 @@ where
     }
 
     pub fn clear(&mut self) {
-        self.head = Box::new(Node::new_head());
+        *self.head = Node::new_head();
         self.max_level.store(0, AtomicOrdering::Release);
         self.len.store(0, AtomicOrdering::Release);
     }

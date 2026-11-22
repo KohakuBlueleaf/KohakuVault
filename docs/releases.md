@@ -2,7 +2,7 @@
 
 The tracked package version is read from `Cargo.toml`; `pyproject.toml` and Python
 `__version__` derive it rather than maintaining independent version strings.
-A tracked `1.1.0` does not itself publish a stable release.
+A tracked `1.2.0` does not itself publish a stable release.
 
 ## Nightly
 

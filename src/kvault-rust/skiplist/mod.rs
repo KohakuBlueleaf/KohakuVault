@@ -16,8 +16,10 @@
 //! - No deletion (would require epoch-based GC)
 
 pub mod core;
+#[cfg(feature = "python")]
 pub mod python;
 
+#[cfg(feature = "python")]
 pub use python::register_skiplist_types;
 
 #[cfg(test)]

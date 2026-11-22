@@ -10,12 +10,13 @@
 //! - Metadata table management
 
 pub mod meta;
-pub(crate) mod read_pool;
+pub mod read_pool;
 
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use rusqlite::blob::Blob;
 use rusqlite::{Connection, OpenFlags};
@@ -43,8 +44,21 @@ pub enum VaultError {
 
     #[error("Column error: {0}")]
     Column(String),
+
+    #[error("Invalid argument: {0}")]
+    Invalid(String),
+
+    #[error("Read-only vault: {0}")]
+    ReadOnly(String),
+
+    #[error("Closed vault")]
+    Closed,
+
+    #[error("Codec error: {0}")]
+    Codec(String),
 }
 
+#[cfg(feature = "python")]
 impl From<VaultError> for PyErr {
     fn from(e: VaultError) -> Self {
         pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
@@ -119,7 +133,7 @@ pub fn open_connection(
 }
 
 /// Open an existing database without schema writes or journal-mode changes.
-pub(crate) fn open_readonly_connection(
+pub fn open_readonly_connection(
     path: &str,
     mmap_size: u64,
     cache_kb: i64,
@@ -133,7 +147,7 @@ pub(crate) fn open_readonly_connection(
 }
 
 /// Build a reader pool only for ordinary filesystem databases.
-pub(crate) fn reader_pool(path: &str) -> Option<read_pool::ReadPool> {
+pub fn reader_pool(path: &str) -> Option<read_pool::ReadPool> {
     if path == ":memory:" || path.starts_with("file:") {
         return None;
     }

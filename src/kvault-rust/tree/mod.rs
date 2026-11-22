@@ -10,14 +10,20 @@
 //! - Cache-aligned nodes for optimal CPU cache performance
 //! - PyO3 bindings for Python integration
 
-mod arena;
-mod csbtree;
-mod iterator;
-mod node;
+pub mod arena;
+pub mod csbtree;
+pub mod iterator;
+pub mod node;
+#[cfg(feature = "python")]
 pub(crate) mod pyobject_key;
+#[cfg(feature = "python")]
 pub(crate) mod python;
 
+pub use csbtree::CSBPlusTree;
+pub use iterator::{Iter, RangeIter};
+
 // Re-export Python types
+#[cfg(feature = "python")]
 pub use python::register_tree_types;
 
 #[cfg(test)]

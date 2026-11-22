@@ -8,6 +8,12 @@
 
 WAL and `synchronous=NORMAL` remain unchanged. Buffered acceptance, committed visibility and power-loss durability are different guarantees. Do not copy a live main database file without its committed WAL state; use a consistent backup.
 
+## New in 1.2.0
+
+- Pure-Rust library crate support (`crate-type = ["cdylib", "rlib"]`): the `python` Cargo feature is now optional (`default = ["python", "schema-validation"]`), allowing Rust crates to depend on `kohakuvault` with `default-features = false` and zero Python linkage.
+- Public pure-Rust APIs exposed at crate root: `KVault` (`KVaultOptions`, caching, atomic `put_many`/`get_many`, keyset scans, MessagePack header encoding), `ColumnVault` (fixed-width & variable-width bounded BLOB blocks, `ensure`, `take_fixed`, read-only snapshots), `TextVault` (FTS5 BM25 search, `insert_many`, newest-first `tail`, read-only mode), plus `CSBPlusTree` and `LockFreeSkipList`.
+- 1.2.0 changes no storage format or Python API; 1.0.0 and 1.1.0 databases open unchanged.
+
 ## New in 1.1.0
 
 - `TextVault.insert_many(items)` inserts an iterable of `(texts, value)` pairs in one transaction and returns the rowids in input order. Inputs are parsed and packed before the write starts; any failure inserts nothing.

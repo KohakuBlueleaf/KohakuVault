@@ -11,6 +11,12 @@ pub struct NodeArena<K, V> {
     free_list: Vec<NodeId>,
 }
 
+impl<K, V> Default for NodeArena<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<K, V> NodeArena<K, V> {
     /// Create a new empty arena
     pub fn new() -> Self {

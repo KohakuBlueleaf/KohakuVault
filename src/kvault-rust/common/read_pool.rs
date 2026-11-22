@@ -5,7 +5,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::time::Duration;
 
 /// Retain a small number of idle readers without serializing active reads.
-pub(crate) struct ReadPool {
+pub struct ReadPool {
     path: String,
     idle: Mutex<Option<Vec<Connection>>>,
     cache_kb: i64,
@@ -14,21 +14,18 @@ pub(crate) struct ReadPool {
 }
 
 impl ReadPool {
-    pub(crate) fn new(path: String, cache_kb: i64) -> Self {
+    pub fn new(path: String, cache_kb: i64) -> Self {
         Self { path, idle: Mutex::new(Some(Vec::new())), cache_kb, mmap_size: 0, idle_limit: 8 }
     }
 
-    pub(crate) fn configured(mut self, cache_kb: i64, mmap_size: u64, idle_limit: usize) -> Self {
+    pub fn configured(mut self, cache_kb: i64, mmap_size: u64, idle_limit: usize) -> Self {
         self.cache_kb = cache_kb;
         self.mmap_size = mmap_size;
         self.idle_limit = idle_limit;
         self
     }
 
-    pub(crate) fn read<T, E>(
-        &self,
-        operation: impl FnOnce(&Connection) -> Result<T, E>,
-    ) -> Result<T, E>
+    pub fn read<T, E>(&self, operation: impl FnOnce(&Connection) -> Result<T, E>) -> Result<T, E>
     where
         E: From<rusqlite::Error>,
     {
@@ -36,10 +33,7 @@ impl ReadPool {
     }
 
     /// A single SELECT already owns its SQLite snapshot until its statement ends.
-    pub(crate) fn query<T, E>(
-        &self,
-        operation: impl FnOnce(&Connection) -> Result<T, E>,
-    ) -> Result<T, E>
+    pub fn query<T, E>(&self, operation: impl FnOnce(&Connection) -> Result<T, E>) -> Result<T, E>
     where
         E: From<rusqlite::Error>,
     {
@@ -103,7 +97,7 @@ impl ReadPool {
     }
 
     /// SQLite page-cache allocation of idle connections, not total process RSS.
-    pub(crate) fn stats(&self) -> (usize, i64) {
+    pub fn stats(&self) -> (usize, i64) {
         let guard = self.idle.lock();
         let idle = guard.as_deref().unwrap_or(&[]);
         let bytes = idle
@@ -127,13 +121,13 @@ impl ReadPool {
         (idle.len(), bytes)
     }
 
-    pub(crate) fn clear(&self) {
+    pub fn clear(&self) {
         if let Some(idle) = self.idle.lock().as_mut() {
             idle.clear();
         }
     }
 
-    pub(crate) fn close(&self) {
+    pub fn close(&self) {
         // Leased readers finish normally but cannot be returned to a closed pool.
         let retired = self.idle.lock().take();
         drop(retired);

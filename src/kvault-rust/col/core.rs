@@ -12,7 +12,7 @@ use crate::common::read_pool::ReadPool;
 
 pub(crate) const FORMAT_VERSION: i64 = 1;
 pub(crate) const MAX_BLOCK_BYTES: usize = 512 << 20;
-pub(crate) type ColumnInfo = (i64, String, usize, usize, usize);
+pub type ColumnInfo = (i64, String, usize, usize, usize);
 
 #[derive(Clone)]
 pub(crate) struct Meta {

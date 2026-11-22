@@ -94,6 +94,7 @@ impl KvCache {
         std::mem::take(&mut self.map)
     }
 
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(crate) fn keys(&self) -> Vec<Vec<u8>> {
         let pending = self.map.keys();
         let inflight = self.inflight.iter().flat_map(|batch| batch.map.keys());

@@ -9,12 +9,21 @@
 //! - Flexible multi-column schema
 //! - Auto-packing for arbitrary Python values
 
+#[cfg(feature = "python")]
 mod core;
+pub mod native;
+#[cfg(feature = "python")]
 mod ops;
+#[cfg(feature = "python")]
 mod search;
 
-use core::TextVault;
+pub use native::{escape_fts5_query, TextRecord, TextSearchHit, TextVault};
+
+#[cfg(feature = "python")]
+use core::TextVault as PyTextVaultCore;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::PyDict;
 
 /// TextVault - Full-text search with arbitrary values
@@ -29,11 +38,13 @@ use pyo3::types::PyDict;
 /// doc_id = tv.insert({"title": "Hello", "body": "World"}, document_bytes)
 /// results = tv.search("hello", k=10)
 /// ```
+#[cfg(feature = "python")]
 #[pyclass(name = "_TextVault")]
 pub struct _TextVault {
-    inner: TextVault,
+    inner: PyTextVaultCore,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl _TextVault {
     /// Create or open a TextVault
@@ -50,7 +61,7 @@ impl _TextVault {
         table: &str,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        py.allow_threads(|| Ok(Self { inner: TextVault::new(path, table, columns)? }))
+        py.allow_threads(|| Ok(Self { inner: PyTextVaultCore::new(path, table, columns)? }))
     }
 
     /// Insert a document with text content and value
@@ -340,6 +351,7 @@ impl _TextVault {
 }
 
 /// Register TextVault types with Python module
+#[cfg(feature = "python")]
 pub fn register_textvault_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<_TextVault>()?;
     Ok(())

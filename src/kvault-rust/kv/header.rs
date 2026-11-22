@@ -1,7 +1,7 @@
 //! KVault value header system for encoding type detection
 //!
 //! Header format (10 bytes total):
-//! ```
+//! ```text
 //! |magic_k(2)|version(1)|encoding(1)|flags(1)|reserved(3)|magic_q(2)|data...|
 //! ```
 //!

@@ -10,35 +10,56 @@
 //! - Optional header system for encoding type detection
 //! - Auto-packing for arbitrary Python objects
 
+#[cfg(feature = "python")]
 pub(crate) mod autopacker;
+#[cfg(feature = "python")]
 mod batch;
 mod cache;
+#[cfg(feature = "python")]
 mod encoding;
-pub(crate) mod header;
+pub mod header;
+#[cfg(feature = "python")]
 mod mapping;
+pub mod native;
+#[cfg(feature = "python")]
 mod ops;
+#[cfg(feature = "python")]
 mod scan;
+#[cfg(feature = "python")]
 mod stream;
 
+pub use header::{EncodingType, Header, HeaderFlags, HEADER_SIZE};
+pub use native::{KVault, KVaultOptions};
+
+#[cfg(feature = "python")]
 pub(crate) use autopacker::AutoPacker;
 
+#[cfg(feature = "python")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "python")]
 use std::sync::{Arc, Mutex, RwLock};
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::PyBytes;
+#[cfg(feature = "python")]
 use rusqlite::{params, Connection};
 
+#[cfg(feature = "python")]
 use crate::common::read_pool::ReadPool;
+#[cfg(feature = "python")]
 use crate::common::{
     checkpoint_wal, meta::MetaTable, open_connection, open_readonly_connection, reader_pool,
     VaultError,
 };
 
+#[cfg(feature = "python")]
 use self::cache::KvCache;
 
 /// Main KVault struct exposed to Python.
 /// Provides a dict-like interface for key-value storage.
+#[cfg(feature = "python")]
 #[pyclass]
 pub struct _KVault {
     pub(crate) conn: parking_lot::Mutex<Option<Connection>>,
@@ -55,6 +76,7 @@ pub struct _KVault {
 }
 
 // Python-exposed methods (single #[pymethods] block required by PyO3)
+#[cfg(feature = "python")]
 #[pymethods]
 impl _KVault {
     /// Create a new KVault instance.
@@ -512,6 +534,7 @@ impl _KVault {
 }
 
 // Helper methods (not exposed to Python)
+#[cfg(feature = "python")]
 impl _KVault {
     pub(crate) fn connection(
         &self,
@@ -601,6 +624,7 @@ impl _KVault {
     }
 }
 
+#[cfg(feature = "python")]
 impl _KVault {
     pub(crate) fn flush_cache_native(&self) -> Result<usize, VaultError> {
         self.ensure_open()?;
